@@ -43,6 +43,19 @@ extern SD_HandleTypeDef hsd;
 #ifndef BSP_SD_USE_4BIT_BUS
 #define BSP_SD_USE_4BIT_BUS 0
 #endif
+
+static uint8_t BSP_SD_ReinitAlternateEdge(void)
+{
+  if (HAL_SD_DeInit(&hsd) != HAL_OK)
+  {
+    return MSD_ERROR;
+  }
+
+  hsd.Init.ClockEdge = (hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_RISING) ?
+                       SDIO_CLOCK_EDGE_FALLING : SDIO_CLOCK_EDGE_RISING;
+
+  return (HAL_SD_Init(&hsd) == HAL_OK) ? MSD_OK : MSD_ERROR;
+}
 /* USER CODE END BeforeInitSection */
 /**
   * @brief  Initializes the SD card device.
@@ -109,14 +122,21 @@ __weak void BSP_SD_DetectIT(void)
   */
 __weak uint8_t BSP_SD_ReadBlocks(uint32_t *pData, uint32_t ReadAddr, uint32_t NumOfBlocks, uint32_t Timeout)
 {
-  uint8_t sd_state = MSD_OK;
-
-  if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)pData, ReadAddr, NumOfBlocks, Timeout) != HAL_OK)
+  if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)pData, ReadAddr, NumOfBlocks, Timeout) == HAL_OK)
   {
-    sd_state = MSD_ERROR;
+    return MSD_OK;
   }
 
-  return sd_state;
+  /* Creality 4.2.x boards have enough clock-path variation that some MCU/card
+   * combinations need the opposite SDIO sampling edge. Reinitialize the card
+   * to flush the receive FIFO, switch edge, and retry the block once. */
+  if (BSP_SD_ReinitAlternateEdge() == MSD_OK &&
+      HAL_SD_ReadBlocks(&hsd, (uint8_t *)pData, ReadAddr, NumOfBlocks, Timeout) == HAL_OK)
+  {
+    return MSD_OK;
+  }
+
+  return MSD_ERROR;
 }
 
 /* USER CODE BEGIN BeforeWriteBlocksSection */
@@ -132,14 +152,18 @@ __weak uint8_t BSP_SD_ReadBlocks(uint32_t *pData, uint32_t ReadAddr, uint32_t Nu
   */
 __weak uint8_t BSP_SD_WriteBlocks(uint32_t *pData, uint32_t WriteAddr, uint32_t NumOfBlocks, uint32_t Timeout)
 {
-  uint8_t sd_state = MSD_OK;
-
-  if (HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, WriteAddr, NumOfBlocks, Timeout) != HAL_OK)
+  if (HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, WriteAddr, NumOfBlocks, Timeout) == HAL_OK)
   {
-    sd_state = MSD_ERROR;
+    return MSD_OK;
   }
 
-  return sd_state;
+  if (BSP_SD_ReinitAlternateEdge() == MSD_OK &&
+      HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, WriteAddr, NumOfBlocks, Timeout) == HAL_OK)
+  {
+    return MSD_OK;
+  }
+
+  return MSD_ERROR;
 }
 
 /* USER CODE BEGIN BeforeReadDMABlocksSection */

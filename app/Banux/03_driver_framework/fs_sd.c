@@ -71,6 +71,61 @@ static int build_fatfs_path(VfsNode_t *node, char *buf, uint16_t maxLen)
     return 0;
 }
 
+static int resolve_file_path(const char *vfsPath, VfsNode_t **parentOut,
+                             char *fatPath, uint16_t fatPathLen)
+{
+    char path[VFS_MAX_PATH_LEN];
+    char parentPath[VFS_MAX_PATH_LEN];
+    char *slash;
+    const char *name;
+    VfsNode_t *parent;
+    VfsNode_t *cur;
+    size_t len;
+
+    if (!vfsPath || !parentOut || !fatPath || fatPathLen == 0) return -1;
+    len = strlen(vfsPath);
+    if (len == 0 || len >= sizeof(path)) return -1;
+    memcpy(path, vfsPath, len + 1);
+
+    slash = strrchr(path, '/');
+    if (slash) {
+        name = slash + 1;
+        if (slash == path) {
+            strcpy(parentPath, "/");
+        } else {
+            *slash = '\0';
+            strncpy(parentPath, path, sizeof(parentPath) - 1);
+            parentPath[sizeof(parentPath) - 1] = '\0';
+        }
+        parent = Vfs_FindNode(parentPath);
+    } else {
+        name = path;
+        parent = Vfs_GetCwd();
+    }
+
+    if (!parent || (parent->type != VFS_NODE_DIR && parent->type != VFS_NODE_DEV) ||
+        name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        strlen(name) >= VFS_MAX_NAME_LEN) {
+        return -1;
+    }
+
+    cur = parent;
+    while (cur && cur != s_sdMountNode) cur = cur->parent;
+    if (cur != s_sdMountNode) return -1;
+
+    if (build_fatfs_path(parent, fatPath, fatPathLen) != 0) return -1;
+    len = strlen(fatPath);
+    if (len > 0 && fatPath[len - 1] != '/') {
+        if (len + 1 >= fatPathLen) return -1;
+        fatPath[len++] = '/';
+        fatPath[len] = '\0';
+    }
+    if (len + strlen(name) >= fatPathLen) return -1;
+    strcat(fatPath, name);
+    *parentOut = parent;
+    return 0;
+}
+
 /*===========================================================================
  * 文件读取回调 (FILE 节点)
  *===========================================================================*/
@@ -153,6 +208,97 @@ static int sd_dir_load(VfsNode_t *node, void *userData)
         }
     }
     f_closedir(&dir);
+    return 0;
+}
+
+int SdFs_Touch(const char *vfsPath)
+{
+    FIL file;
+    FRESULT fres;
+    char path[VFS_MAX_PATH_LEN];
+    VfsNode_t *parent;
+
+    if (!s_sdMountNode ||
+        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    fres = f_open(&file, path, FA_OPEN_ALWAYS | FA_WRITE);
+    if (fres != FR_OK) return -(int)fres;
+    fres = f_close(&file);
+    if (fres != FR_OK) return -(int)fres;
+    (void)Vfs_RefreshDir(parent);
+    return 0;
+}
+
+int SdFs_WriteFile(const char *vfsPath, const uint8_t *data, uint32_t len)
+{
+    FIL file;
+    FRESULT fres;
+    UINT written = 0;
+    char path[VFS_MAX_PATH_LEN];
+    VfsNode_t *parent;
+
+    if ((!data && len > 0) || !s_sdMountNode ||
+        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    fres = f_open(&file, path, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fres != FR_OK) return -(int)fres;
+    if (len > 0) {
+        fres = f_write(&file, data, (UINT)len, &written);
+    }
+    if (fres == FR_OK) fres = f_sync(&file);
+    if (f_close(&file) != FR_OK && fres == FR_OK) fres = FR_DISK_ERR;
+    if (fres != FR_OK || written != (UINT)len) return -(int)FR_DISK_ERR;
+
+    (void)Vfs_RefreshDir(parent);
+    return 0;
+}
+
+int SdFs_Mkdir(const char *vfsPath)
+{
+    FRESULT fres;
+    char path[VFS_MAX_PATH_LEN];
+    VfsNode_t *parent;
+
+    if (!s_sdMountNode ||
+        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    fres = f_mkdir(path);
+    if (fres != FR_OK) return -(int)fres;
+    (void)Vfs_RefreshDir(parent);
+    return 0;
+}
+
+int SdFs_Remove(const char *vfsPath)
+{
+    FRESULT fres;
+    char path[VFS_MAX_PATH_LEN];
+    VfsNode_t *parent;
+    VfsNode_t *target;
+    VfsNode_t *cur;
+
+    if (!s_sdMountNode ||
+        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    target = Vfs_FindNode(vfsPath);
+    if (target && target->type == VFS_NODE_DIR) {
+        cur = Vfs_GetCwd();
+        while (cur) {
+            if (cur == target) return -(int)FR_DENIED;
+            cur = cur->parent;
+        }
+    }
+
+    fres = f_unlink(path);
+    if (fres != FR_OK) return -(int)fres;
+    (void)Vfs_RefreshDir(parent);
     return 0;
 }
 

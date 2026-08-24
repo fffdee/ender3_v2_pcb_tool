@@ -46,8 +46,10 @@ void MX_SDIO_SD_Init(void)
    * 若此处为 4B，则卡仍处于 1-bit 时外设已切 4-bit，SD_FindSCR 读 SCR 数据阶段超时
    * (hsd.ErrorCode=0x08 DATA_TIMEOUT)。等 HAL_SD_ConfigWideBusOperation 成功后再切 4-bit。 */
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
-  hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd.Init.ClockDiv = 8;  /* 64MHz 下 SDIO_CK = 64/(ClockDiv+2)：div=8 -> 6.4MHz，优先保证量产板时序余量 */
+  /* Polling reads can be interrupted by the 2 Mbaud UART. Hardware flow
+   * control lets SDIO pause the card clock before the receive FIFO overruns. */
+  hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_ENABLE;
+  hsd.Init.ClockDiv = 8;
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */

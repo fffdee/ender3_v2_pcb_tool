@@ -30,6 +30,9 @@ static bool                 g_WelcomeShown = FALSE;
 
 // Current IO interface
 static const ShellIO_t     *g_IO = NULL;
+static ShellInputHandler_t  g_InputHandler = NULL;
+static void                *g_InputUserData = NULL;
+static bool                 g_IgnoreNextLf = FALSE;
 
 /*******************************************************************************
  * Tab Completion
@@ -145,6 +148,9 @@ bool Shell_Init(void)
     g_CmdLen = 0;
     g_CmdLine[0] = '\0';
     g_IO = NULL;
+    g_InputHandler = NULL;
+    g_InputUserData = NULL;
+    g_IgnoreNextLf = FALSE;
     g_WelcomeShown = FALSE;
     
     // Register default help module
@@ -221,7 +227,16 @@ void Shell_Process(void)
     // Process received data
     for(i = 0; i < len; i++)
     {
-        Shell_ProcessChar((char)buf[i]);
+        if (g_IgnoreNextLf) {
+            g_IgnoreNextLf = FALSE;
+            if (buf[i] == '\n') continue;
+        }
+        if (g_InputHandler) {
+            ShellInputHandler_t handler = g_InputHandler;
+            handler(buf[i], g_InputUserData);
+        } else {
+            Shell_ProcessChar((char)buf[i]);
+        }
     }
 }
 
@@ -237,7 +252,16 @@ void Shell_InputChar(char c)
         g_WelcomeShown = TRUE;
     }
     
-    Shell_ProcessChar(c);
+    if (g_IgnoreNextLf) {
+        g_IgnoreNextLf = FALSE;
+        if (c == '\n') return;
+    }
+    if (g_InputHandler) {
+        ShellInputHandler_t handler = g_InputHandler;
+        handler((uint8_t)c, g_InputUserData);
+    } else {
+        Shell_ProcessChar(c);
+    }
 }
 
 void Shell_InputData(uint8_t *data, uint16_t len)
@@ -248,6 +272,27 @@ void Shell_InputData(uint8_t *data, uint16_t len)
     {
         Shell_InputChar((char)data[i]);
     }
+}
+
+bool Shell_BeginInputMode(ShellInputHandler_t handler, void *userData)
+{
+    if (!handler || g_InputHandler) {
+        return FALSE;
+    }
+    g_InputHandler = handler;
+    g_InputUserData = userData;
+    return TRUE;
+}
+
+void Shell_EndInputMode(void)
+{
+    g_InputHandler = NULL;
+    g_InputUserData = NULL;
+    g_CmdLen = 0;
+    g_CmdLine[0] = '\0';
+    g_HistoryNav = -1;
+    g_IgnoreNextLf = TRUE;
+    Shell_Prompt();
 }
 
 static void Shell_SendRaw(const char *str)
@@ -313,7 +358,9 @@ static void Shell_ProcessChar(char c)
                 g_HistoryNav = -1;  /* 重置浏览位置 */
                 Shell_Execute();
             }
-            Shell_Prompt();
+            if (!g_InputHandler) {
+                Shell_Prompt();
+            }
             break;
             
         case '\b':

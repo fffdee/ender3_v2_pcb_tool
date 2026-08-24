@@ -566,6 +566,7 @@ HAL_StatusTypeDef HAL_SD_ReadBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint3
 {
   SDIO_DataInitTypeDef config;
   uint32_t errorstate;
+  uint32_t transferflags;
   uint32_t tickstart = HAL_GetTick();
   uint32_t count, data, dataremaining;
   uint32_t add = BlockAdd;
@@ -633,7 +634,15 @@ HAL_StatusTypeDef HAL_SD_ReadBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint3
 
     /* Poll on SDIO flags */
     dataremaining = config.DataLength;
-    while(!__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DATAEND | SDIO_FLAG_STBITERR))
+    transferflags = SDIO_FLAG_RXOVERR | SDIO_FLAG_DCRCFAIL |
+                    SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DATAEND;
+    /* Some F1-compatible MCUs assert STBITERR in 1-bit mode while valid data
+       is already in the FIFO. STBITERR is meaningful only for a wide bus. */
+    if(hsd->Init.BusWide != SDIO_BUS_WIDE_1B)
+    {
+      transferflags |= SDIO_FLAG_STBITERR;
+    }
+    while(!__HAL_SD_GET_FLAG(hsd, transferflags))
     {
       if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_RXFIFOHF) && (dataremaining > 0U))
       {
@@ -687,7 +696,8 @@ HAL_StatusTypeDef HAL_SD_ReadBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint3
     }
 
     /* Get error state */
-    if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_DTIMEOUT) || (__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_STBITERR)))
+    if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_DTIMEOUT) ||
+       ((hsd->Init.BusWide != SDIO_BUS_WIDE_1B) && __HAL_SD_GET_FLAG(hsd, SDIO_FLAG_STBITERR)))
     {
       /* Clear all the static flags */
       __HAL_SD_CLEAR_FLAG(hsd, SDIO_STATIC_FLAGS);
@@ -777,6 +787,7 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
 {
   SDIO_DataInitTypeDef config;
   uint32_t errorstate;
+  uint32_t transferflags;
   uint32_t tickstart = HAL_GetTick();
   uint32_t count, data, dataremaining;
   uint32_t add = BlockAdd;
@@ -844,7 +855,14 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
 
     /* Write block(s) in polling mode */
     dataremaining = config.DataLength;
-    while(!__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_TXUNDERR | SDIO_FLAG_DCRCFAIL | SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DATAEND | SDIO_FLAG_STBITERR))
+    transferflags = SDIO_FLAG_TXUNDERR | SDIO_FLAG_DCRCFAIL |
+                    SDIO_FLAG_DTIMEOUT | SDIO_FLAG_DATAEND;
+    /* STBITERR is a wide-bus start-bit consistency check. */
+    if(hsd->Init.BusWide != SDIO_BUS_WIDE_1B)
+    {
+      transferflags |= SDIO_FLAG_STBITERR;
+    }
+    while(!__HAL_SD_GET_FLAG(hsd, transferflags))
     {
       if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_TXFIFOHE) && (dataremaining > 0U))
       {
@@ -898,7 +916,8 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
     }
 
     /* Get error state */
-    if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_DTIMEOUT) || (__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_STBITERR)))
+    if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_DTIMEOUT) ||
+       ((hsd->Init.BusWide != SDIO_BUS_WIDE_1B) && __HAL_SD_GET_FLAG(hsd, SDIO_FLAG_STBITERR)))
     {
       /* Clear all the static flags */
       __HAL_SD_CLEAR_FLAG(hsd, SDIO_STATIC_FLAGS);

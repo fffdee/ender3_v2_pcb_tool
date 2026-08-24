@@ -301,7 +301,7 @@ typedef struct
 #define SDMMC_CARD_LOCKED                             0x02000000U
 
 #ifndef SDMMC_DATATIMEOUT /*Hardware Data Timeout (ms) */
-#define SDMMC_DATATIMEOUT                  ((uint32_t)0xFFFFFFFFU)
+#define SDMMC_DATATIMEOUT                  ((uint32_t)0x02000000U)
 #endif /* SDMMC_DATATIMEOUT */
 
 #ifndef SDMMC_SWDATATIMEOUT /*Software Data Timeout (ms) */

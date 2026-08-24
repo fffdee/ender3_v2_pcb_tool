@@ -21,6 +21,8 @@
 extern "C" {
 #endif
 
+#include "type.h"
+
 /**
  * @brief  将 SD 卡文件系统挂载到 VFS /sd
  * @return 0 成功；<0 失败（FATFS 未挂载或节点创建失败）
@@ -32,6 +34,18 @@ int  SdFs_Mount(void);
  * @brief  移除 /sd 挂载点（卸载文件系统）
  */
 void SdFs_Unmount(void);
+
+/** Create an empty SD file if it does not already exist. */
+int SdFs_Touch(const char *vfsPath);
+
+/** Replace an SD file with the supplied bytes. */
+int SdFs_WriteFile(const char *vfsPath, const uint8_t *data, uint32_t len);
+
+/** Create one directory on the SD filesystem. */
+int SdFs_Mkdir(const char *vfsPath);
+
+/** Remove one SD file or an empty directory. */
+int SdFs_Remove(const char *vfsPath);
 
 #ifdef __cplusplus
 }

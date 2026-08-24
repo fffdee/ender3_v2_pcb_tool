@@ -50,6 +50,8 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
+#define SD_READY_TIMEOUT_MS  2000U
+
 /* Private variables ---------------------------------------------------------*/
 /* Disk status */
 static volatile DSTATUS Stat = STA_NOINIT;
@@ -64,6 +66,8 @@ DRESULT SD_read (BYTE, BYTE*, DWORD, UINT);
 #if _USE_IOCTL == 1
   DRESULT SD_ioctl (BYTE, BYTE, void*);
 #endif  /* _USE_IOCTL == 1 */
+
+static DRESULT SD_WaitCardReady(void);
   
 const Diskio_drvTypeDef  SD_Driver =
 {
@@ -80,6 +84,22 @@ const Diskio_drvTypeDef  SD_Driver =
 };
 
 /* Private functions ---------------------------------------------------------*/
+
+static DRESULT SD_WaitCardReady(void)
+{
+  uint32_t tickstart = HAL_GetTick();
+
+  do
+  {
+    if(BSP_SD_GetCardState() == MSD_OK)
+    {
+      return RES_OK;
+    }
+    HAL_Delay(1U);
+  } while((HAL_GetTick() - tickstart) < SD_READY_TIMEOUT_MS);
+
+  return RES_ERROR;
+}
 
 /**
   * @brief  Initializes a Drive
@@ -127,20 +147,12 @@ DSTATUS SD_status(BYTE lun)
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
-  uint32_t timeout = 100000;
 
   if(BSP_SD_ReadBlocks((uint32_t*)buff, 
                        (uint32_t) (sector), 
                        count, SD_DATATIMEOUT) == MSD_OK)
   {
-    while(BSP_SD_GetCardState()!= MSD_OK)
-    {
-      if (timeout-- == 0)
-      {
-        return RES_ERROR;
-      }
-    }
-    res = RES_OK;
+    res = SD_WaitCardReady();
   }
   
   return res;
@@ -158,20 +170,12 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
-  uint32_t timeout = 100000;
 
   if(BSP_SD_WriteBlocks((uint32_t*)buff, 
                         (uint32_t)(sector), 
                         count, SD_DATATIMEOUT) == MSD_OK)
   {
-    while(BSP_SD_GetCardState()!= MSD_OK)
-    {
-      if (timeout-- == 0)
-      {
-        return RES_ERROR;
-      }
-    }    
-    res = RES_OK;
+    res = SD_WaitCardReady();
   }
   
   return res;
@@ -197,7 +201,7 @@ DRESULT SD_ioctl(BYTE lun, BYTE cmd, void *buff)
   {
   /* Make sure that no pending write process */
   case CTRL_SYNC :
-    res = RES_OK;
+    res = SD_WaitCardReady();
     break;
   
   /* Get number of sectors on the disk (DWORD) */

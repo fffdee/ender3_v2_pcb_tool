@@ -130,12 +130,12 @@ static int sdio_drv_init(void *priv)
             (unsigned long)hsd.SdCard.CardType,
             (unsigned long)hsd.State);
         /* 打印外设寄存器区分根因：
-         * STA.DTIMEOUT=1(bit19) 且 RXACT=0 -> D0 上完全没有数据信号（硬件/接线问题）
-         * STA.DCRCFAIL=1(bit17)  -> 有数据但 CRC 错（宽度不匹配或信号质量）
-         * CLKCR.WIDBUS(bit13)    -> 1=4-bit / 0=1-bit；CLKDIV[7:0] 为分频 */
-        DBG("[SDIO] STA=0x%08lX CLKCR=0x%08lX DCTRL=0x%08lX\n",
+         * STA.DTIMEOUT(bit3) / DCRCFAIL(bit1) / RXOVERR(bit5) 为数据错误；
+         * CLKCR.NEGEDGE(bit13) 为采样沿，WIDBUS[12:11] 为总线宽度。 */
+        DBG("[SDIO] STA=0x%08lX CLKCR=0x%08lX DCTRL=0x%08lX edge=%s\n",
             (unsigned long)SDIO->STA, (unsigned long)SDIO->CLKCR,
-            (unsigned long)SDIO->DCTRL);
+            (unsigned long)SDIO->DCTRL,
+            (hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_FALLING) ? "falling" : "rising");
         /* 仍尝试读取卡信息，便于诊断 */
         BSP_SD_GetCardInfo(&p->cardInfo);
         return -1;
@@ -149,10 +149,12 @@ static int sdio_drv_init(void *priv)
         p->freeSectors  = freClust * fs->csize;
     }
 
-    DBG("[SDIO] mounted ok, type=%s, total=%lu MB, free=%lu MB\n",
+    DBG("[SDIO] mounted ok, type=%s, total=%lu MB, free=%lu MB, edge=%s, bus=%s\n",
         sd_type_name(p->cardInfo.CardType),
         (unsigned long)(p->totalSectors / 2048u),
-        (unsigned long)(p->freeSectors  / 2048u));
+        (unsigned long)(p->freeSectors  / 2048u),
+        (hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_FALLING) ? "falling" : "rising",
+        ((SDIO->CLKCR & SDIO_CLKCR_WIDBUS) == 0u) ? "1-bit" : "4-bit");
     return 0;
 }
 

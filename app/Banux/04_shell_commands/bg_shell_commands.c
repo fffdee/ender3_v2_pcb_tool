@@ -22,7 +22,10 @@
 #include "vfs.h"        /* 虚拟文件系统API */
 #include "drv_fs.h"     /* 驱动文件系统API */
 #include "drv_device.h" /* 驱动设备管理 */
+#include "fs_sd.h"      /* SD file create/write API */
 #include "app_bl.h"     /* APP 侧 boot 联动：app_bl_enter_boot() */
+
+#define APP_VERSION_STRING "1.0.5"
 
 /*============================================================================
  * sys module - System information
@@ -63,9 +66,17 @@ static int sys_reboot(int argc, char *argv[])
     return 0;
 }
 
+static int sys_version(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    Shell_Printf("Firmware version: %s\r\n", APP_VERSION_STRING);
+    return 0;
+}
+
 static const ShellOpt_t sys_opts[] = {
     OPT("i", "info",    NULL,   "Show system info",     sys_info),
     OPT("m", "mem",     NULL,   "Show memory status",   sys_mem),
+    OPT("v", "version", NULL,   "Show firmware version", sys_version),
     OPT("r", "reset",   NULL,   "Software reset system", sys_reboot),
     OPT("b", "reboot",  NULL,   "Reboot system",        sys_reboot),
     OPT_END()
@@ -293,6 +304,341 @@ static const ShellOpt_t cat_opts[] = {
 };
 
 DEFINE_MODULE(cat, "Display file contents", MOD_CAT_SYSTEM, cat_opts);
+
+/*============================================================================
+ * SD text file creation and line editor
+ *===========================================================================*/
+
+#define EDITOR_BUFFER_SIZE  2048u
+
+typedef enum {
+    EDITOR_COMMAND_MODE = 0,
+    EDITOR_APPEND_MODE
+} EditorMode_t;
+
+typedef struct {
+    char path[VFS_MAX_PATH_LEN];
+    uint8_t data[EDITOR_BUFFER_SIZE];
+    uint32_t length;
+    char line[SHELL_CMD_MAX_LEN];
+    uint16_t lineLen;
+    EditorMode_t mode;
+    bool dirty;
+    bool skipLf;
+} EditorState_t;
+
+static EditorState_t s_editor;
+
+static void editor_prompt(void)
+{
+    Shell_Print((s_editor.mode == EDITOR_APPEND_MODE) ? "insert> " : "vim> ");
+}
+
+static void editor_print(void)
+{
+    uint32_t start = 0;
+    uint32_t lineNo = 1;
+
+    Shell_Printf("\r\n--- %s (%lu bytes)%s ---\r\n", s_editor.path,
+                 (unsigned long)s_editor.length, s_editor.dirty ? " [modified]" : "");
+    while (start < s_editor.length) {
+        uint32_t end = start;
+        while (end < s_editor.length && s_editor.data[end] != '\n') end++;
+        Shell_Printf("%3lu | ", (unsigned long)lineNo++);
+        if (end > start) {
+            Shell_WriteRaw(&s_editor.data[start], (uint16_t)(end - start));
+        }
+        Shell_Print("\r\n");
+        start = (end < s_editor.length) ? end + 1u : end;
+    }
+    if (s_editor.length == 0) Shell_Print("(empty)\r\n");
+}
+
+static int editor_delete_line(uint32_t wanted)
+{
+    uint32_t lineNo = 1;
+    uint32_t start = 0;
+    uint32_t end;
+
+    if (wanted == 0) return -1;
+    while (start < s_editor.length && lineNo < wanted) {
+        while (start < s_editor.length && s_editor.data[start] != '\n') start++;
+        if (start < s_editor.length) start++;
+        lineNo++;
+    }
+    if (start >= s_editor.length || lineNo != wanted) return -1;
+
+    end = start;
+    while (end < s_editor.length && s_editor.data[end] != '\n') end++;
+    if (end < s_editor.length) end++;
+    memmove(&s_editor.data[start], &s_editor.data[end], s_editor.length - end);
+    s_editor.length -= end - start;
+    s_editor.dirty = TRUE;
+    return 0;
+}
+
+static int editor_save(void)
+{
+    int ret = SdFs_WriteFile(s_editor.path, s_editor.data, s_editor.length);
+    if (ret != 0) {
+        Shell_Printf("vim: write failed (%d)\r\n", ret);
+        return ret;
+    }
+    s_editor.dirty = FALSE;
+    Shell_Printf("%s: %lu bytes written\r\n", s_editor.path,
+                 (unsigned long)s_editor.length);
+    return 0;
+}
+
+static void editor_exit(void)
+{
+    Shell_Print("\r\n");
+    memset(&s_editor, 0, sizeof(s_editor));
+    Shell_EndInputMode();
+}
+
+static void editor_process_line(void)
+{
+    char *line = s_editor.line;
+
+    line[s_editor.lineLen] = '\0';
+    s_editor.lineLen = 0;
+
+    if (s_editor.mode == EDITOR_APPEND_MODE) {
+        size_t len;
+
+        if (strcmp(line, ".") == 0) {
+            s_editor.mode = EDITOR_COMMAND_MODE;
+            editor_prompt();
+            return;
+        }
+        len = strlen(line);
+        if (s_editor.length + len + 1u >= EDITOR_BUFFER_SIZE) {
+            Shell_Print("vim: buffer full\r\n");
+            editor_prompt();
+            return;
+        }
+        memcpy(&s_editor.data[s_editor.length], line, len);
+        s_editor.length += (uint32_t)len;
+        s_editor.data[s_editor.length++] = '\n';
+        s_editor.dirty = TRUE;
+        editor_prompt();
+        return;
+    }
+
+    if (strcmp(line, ":p") == 0 || strcmp(line, "p") == 0) {
+        editor_print();
+    } else if (strcmp(line, ":a") == 0 || strcmp(line, "a") == 0 ||
+               strcmp(line, "i") == 0) {
+        s_editor.mode = EDITOR_APPEND_MODE;
+    } else if (strcmp(line, ":c") == 0) {
+        s_editor.length = 0;
+        s_editor.dirty = TRUE;
+        s_editor.mode = EDITOR_APPEND_MODE;
+    } else if (strncmp(line, ":d ", 3) == 0) {
+        uint32_t lineNo = (uint32_t)strtoul(line + 3, NULL, 10);
+        if (editor_delete_line(lineNo) != 0) {
+            Shell_Printf("vim: line %lu not found\r\n", (unsigned long)lineNo);
+        }
+    } else if (strcmp(line, ":w") == 0) {
+        (void)editor_save();
+    } else if (strcmp(line, ":wq") == 0) {
+        if (editor_save() == 0) {
+            editor_exit();
+            return;
+        }
+    } else if (strcmp(line, ":q!") == 0) {
+        editor_exit();
+        return;
+    } else if (strcmp(line, ":q") == 0) {
+        if (s_editor.dirty) {
+            Shell_Print("vim: unsaved changes (use :q! or :wq)\r\n");
+        } else {
+            editor_exit();
+            return;
+        }
+    } else if (line[0] != '\0') {
+        Shell_Print("vim: unknown command\r\n");
+    }
+    editor_prompt();
+}
+
+static void editor_input(uint8_t byte, void *userData)
+{
+    (void)userData;
+
+    if (byte == '\n' && s_editor.skipLf) {
+        s_editor.skipLf = FALSE;
+        return;
+    }
+    if (byte == '\r' || byte == '\n') {
+        Shell_Print("\r\n");
+        s_editor.skipLf = (byte == '\r') ? TRUE : FALSE;
+        editor_process_line();
+        return;
+    }
+    s_editor.skipLf = FALSE;
+
+    if (byte == 0x03u) {
+        Shell_Print("^C\r\n");
+        editor_exit();
+        return;
+    }
+    if (byte == 0x1Bu && s_editor.mode == EDITOR_APPEND_MODE) {
+        s_editor.lineLen = 0;
+        s_editor.mode = EDITOR_COMMAND_MODE;
+        Shell_Print("\r\n");
+        editor_prompt();
+        return;
+    }
+    if (byte == '\b' || byte == 0x7Fu) {
+        if (s_editor.lineLen > 0) {
+            s_editor.lineLen--;
+            Shell_Print("\b \b");
+        }
+        return;
+    }
+    if (byte >= 0x20u && s_editor.lineLen < (uint16_t)(sizeof(s_editor.line) - 1u)) {
+        s_editor.line[s_editor.lineLen++] = (char)byte;
+        Shell_WriteRaw(&byte, 1);
+    }
+}
+
+static int cmd_touch(int argc, char *argv[])
+{
+    int i;
+
+    if (argc < 1) {
+        Shell_Print("Usage: touch <file> [file...]\r\n");
+        return -1;
+    }
+    for (i = 0; i < argc; i++) {
+        int ret = SdFs_Touch(argv[i]);
+        if (ret != 0) {
+            Shell_Printf("touch: %s: create failed (%d)\r\n", argv[i], ret);
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static const ShellOpt_t touch_opts[] = {
+    OPT("", "", "<file> [file...]", "Create SD file", cmd_touch),
+    OPT_END()
+};
+
+DEFINE_MODULE(touch, "Create SD file", MOD_CAT_SYSTEM, touch_opts);
+
+static int cmd_mkdir(int argc, char *argv[])
+{
+    int i;
+
+    if (argc < 1) {
+        Shell_Print("Usage: mkdir <directory> [directory...]\r\n");
+        return -1;
+    }
+    for (i = 0; i < argc; i++) {
+        int ret = SdFs_Mkdir(argv[i]);
+        if (ret != 0) {
+            Shell_Printf("mkdir: %s: create failed (%d)\r\n", argv[i], ret);
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static const ShellOpt_t mkdir_opts[] = {
+    OPT("", "", "<directory> [directory...]", "Create SD directory", cmd_mkdir),
+    OPT_END()
+};
+
+DEFINE_MODULE(mkdir, "Create SD directory", MOD_CAT_SYSTEM, mkdir_opts);
+
+static int cmd_rm(int argc, char *argv[])
+{
+    int i;
+
+    if (argc < 1) {
+        Shell_Print("Usage: rm <path> [path...]\r\n");
+        return -1;
+    }
+    for (i = 0; i < argc; i++) {
+        int ret = SdFs_Remove(argv[i]);
+        if (ret != 0) {
+            Shell_Printf("rm: %s: remove failed (%d)\r\n", argv[i], ret);
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static const ShellOpt_t rm_opts[] = {
+    OPT("", "", "<path> [path...]", "Remove SD file or empty directory", cmd_rm),
+    OPT_END()
+};
+
+DEFINE_MODULE(rm, "Remove SD file or empty directory", MOD_CAT_SYSTEM, rm_opts);
+
+static int cmd_vim(int argc, char *argv[])
+{
+    FsNode_t *node;
+    uint32_t offset = 0;
+
+    if (argc < 1) {
+        Shell_Print("Usage: vim <file>\r\n");
+        return -1;
+    }
+
+    node = DrvFs_FindNode(argv[0]);
+    if (!node) {
+        int ret = SdFs_Touch(argv[0]);
+        if (ret != 0) {
+            Shell_Printf("vim: %s: create failed (%d)\r\n", argv[0], ret);
+            return ret;
+        }
+        node = DrvFs_FindNode(argv[0]);
+    }
+    if (!node || node->type != FS_NODE_FILE) {
+        Shell_Printf("vim: %s: not an SD file\r\n", argv[0]);
+        return -1;
+    }
+    if (node->fileSize >= EDITOR_BUFFER_SIZE) {
+        Shell_Printf("vim: file too large (max %u bytes)\r\n", EDITOR_BUFFER_SIZE - 1u);
+        return -1;
+    }
+
+    memset(&s_editor, 0, sizeof(s_editor));
+    strncpy(s_editor.path, argv[0], sizeof(s_editor.path) - 1);
+    while (offset < node->fileSize) {
+        uint16_t chunk = (uint16_t)(node->fileSize - offset);
+        int n;
+        if (chunk > 128u) chunk = 128u;
+        n = DrvFs_ReadFile(node, (char *)&s_editor.data[offset], chunk, offset);
+        if (n <= 0) {
+            Shell_Printf("vim: read failed at %lu\r\n", (unsigned long)offset);
+            return -1;
+        }
+        offset += (uint32_t)n;
+    }
+    s_editor.length = offset;
+
+    if (!Shell_BeginInputMode(editor_input, &s_editor)) {
+        Shell_Print("vim: shell input is busy\r\n");
+        return -1;
+    }
+
+    editor_print();
+    Shell_Print("Commands: :p :a i :c :d N :w :q :q! :wq\r\n");
+    editor_prompt();
+    return 0;
+}
+
+static const ShellOpt_t vim_opts[] = {
+    OPT("", "", "<file>", "Edit SD text file", cmd_vim),
+    OPT_END()
+};
+
+DEFINE_MODULE(vim, "Edit SD text file", MOD_CAT_SYSTEM, vim_opts);
 
 /*============================================================================
  * run module - Execute UTF-8 command script
@@ -744,6 +1090,10 @@ void Shell_RegisterAllModules(void)
     REGISTER_MODULE(pwd);
     REGISTER_MODULE(cd);
     REGISTER_MODULE(cat);
+    REGISTER_MODULE(touch);
+    REGISTER_MODULE(mkdir);
+    REGISTER_MODULE(rm);
+    REGISTER_MODULE(vim);
     REGISTER_MODULE(run);
     REGISTER_MODULE(echo);    /* 写入参数值 */
     REGISTER_MODULE(tree);

@@ -64,6 +64,9 @@ typedef uint16_t (*ShellIO_Recv_t)(uint8_t *data, uint16_t maxLen);
  */
 typedef uint16_t (*ShellIO_Available_t)(void);
 
+/** Raw input byte handler used by interactive commands such as editors. */
+typedef void (*ShellInputHandler_t)(uint8_t byte, void *userData);
+
 /**
  * @brief  Shell IO interface structure
  */
@@ -163,6 +166,10 @@ void Shell_InputChar(char c);
  * @param  len: Length
  */
 void Shell_InputData(uint8_t *data, uint16_t len);
+
+/** Enter/leave interactive raw input mode. */
+bool Shell_BeginInputMode(ShellInputHandler_t handler, void *userData);
+void Shell_EndInputMode(void);
 
 /**
  * @brief  Execute one complete shell command line
