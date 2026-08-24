@@ -47,7 +47,7 @@ void MX_SDIO_SD_Init(void)
    * (hsd.ErrorCode=0x08 DATA_TIMEOUT)。等 HAL_SD_ConfigWideBusOperation 成功后再切 4-bit。 */
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd.Init.ClockDiv = 4;  /* 64MHz 下 SDIO_CK = 64/(ClockDiv+2)：div=4 -> 10.7MHz，为数据阶段留足时序余量 */
+  hsd.Init.ClockDiv = 8;  /* 64MHz 下 SDIO_CK = 64/(ClockDiv+2)：div=8 -> 6.4MHz，优先保证量产板时序余量 */
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */
@@ -76,11 +76,16 @@ void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
     PC12     ------> SDIO_CK
     PD2     ------> SDIO_CMD
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
-                          |GPIO_PIN_12;
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.Pull = GPIO_PULLUP;   /* SDIO CMD/DAT 线建议上拉，官方 BSP 标准配置 */
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
     GPIO_InitStruct.Pin = GPIO_PIN_2;

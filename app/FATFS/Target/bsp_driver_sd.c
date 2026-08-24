@@ -40,6 +40,9 @@ extern SD_HandleTypeDef hsd;
 
 /* USER CODE BEGIN BeforeInitSection */
 /* can be used to modify / undefine following code or add code */
+#ifndef BSP_SD_USE_4BIT_BUS
+#define BSP_SD_USE_4BIT_BUS 0
+#endif
 /* USER CODE END BeforeInitSection */
 /**
   * @brief  Initializes the SD card device.
@@ -55,6 +58,7 @@ __weak uint8_t BSP_SD_Init(void)
   }
   /* HAL SD initialization */
   sd_state = HAL_SD_Init(&hsd);
+#if BSP_SD_USE_4BIT_BUS
   /* Configure SD Bus width (4 bits mode selected) */
   if (sd_state == MSD_OK)
   {
@@ -64,6 +68,7 @@ __weak uint8_t BSP_SD_Init(void)
       sd_state = MSD_ERROR;
     }
   }
+#endif
 
   return sd_state;
 }

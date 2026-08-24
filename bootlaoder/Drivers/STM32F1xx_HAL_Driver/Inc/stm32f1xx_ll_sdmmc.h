@@ -712,8 +712,11 @@ typedef struct
                                              SDIO_CMD_WAITINT  | SDIO_CMD_WAITPEND |\
                                              SDIO_CMD_CPSMEN   | SDIO_CMD_SDIOSUSPEND))
 
-/* SDIO Initialization Frequency (400KHz max) */
-#define SDIO_INIT_CLK_DIV     ((uint8_t)0x76)    /* 48MHz / (SDMMC_INIT_CLK_DIV + 2) < 400KHz */
+/* SDIO Initialization Frequency (400KHz max)
+ * System clock is 64MHz (SDIOCLK=PCLK2=64MHz):
+ *   f_init = 64MHz / (SDIO_INIT_CLK_DIV + 2)
+ *   0x9F(159) -> 64MHz / 161 = 397.5KHz < 400KHz */
+#define SDIO_INIT_CLK_DIV     ((uint8_t)0x9F)
 
 /* SDIO Data Transfer Frequency (25MHz max) */
 #define SDIO_TRANSFER_CLK_DIV ((uint8_t)0x4)
