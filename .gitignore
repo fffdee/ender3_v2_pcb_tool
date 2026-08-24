@@ -1,0 +1,8 @@
+# Keil/MDK build outputs
+/app/MDK-ARM/ender3 v2/
+/bootlaoder/MDK-ARM/ender3 v2/
+
+# Generated build logs/listings
+/app/MDK-ARM/build_out.txt
+/app/MDK-ARM/startup_stm32f103xe.lst
+/bootlaoder/MDK-ARM/startup_stm32f103xe.lst

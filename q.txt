@@ -1,0 +1,63 @@
+========== APP ==========
+clk: SYSCLK=0x03D09000
+UPGRADE: listening ENTER_BOOT (UART1 @2000000 / UART3 @115200) [diag]
+[DrvFs] Creating /driver directory...
+[DrvFs] /driver created (bus subdirs created on demand)
+[DrvDev] Register start: dev=20000094
+[DrvDev] Device name: 'sd'
+[DrvDev] Calling init for device 'sd'...
+[SDIO] f_mount failed: 3, device not registered
+[SDIO] hsd.ErrorCode=0x00000008, CardType=1, State=1
+[SDIO] STA=0x00000200 CLKCR=0x00000104 DCTRL=0x00000033
+[DrvDev] ERROR: Device 'sd' init failed, NOT registered
+[DrvInit] WARNING: SDIO device register failed (-6), SD card may not be present
+[DrvDev] Register start: dev=200000f0
+[DrvDev] Device name: 'uart1'
+[DrvDev] Getting bus directory (bus=5)...
+[DrvDev] Bus dir: 20000e20
+[DrvDev] Creating device node...
+[DrvDev] Device node created: 20000ebc
+[DrvDev] Creating params (params=0801255c)...
+[CreateParams] Start: dev=200000f0, devNode=20000ebc, params=0801255c
+[CreateParams] First param: 0801255c
+[CreateParams] Param[0]: name=08012cac
+[CreateParams] Param[0] name='baud'
+[CreateParams] Calling DrvFs_CreateParam...
+[CreateParams] Param[0] created: 20000f58
+[CreateParams] Param[1]: name=08012cb4
+[CreateParams] Param[1] name='rx_avail'
+[CreateParams] Calling DrvFs_CreateParam...
+[CreateParams] Param[1] created: 20000ff4
+[CreateParams] All 2 params created
+[DrvDev] Params created
+[DrvDev] Device 'uart1' registered successfully
+[DrvDev] Register start: dev=20000128
+[DrvDev] Device name: 'uart3'
+[DrvDev] Getting bus directory (bus=5)...
+[DrvDev] Bus dir: 20000e20
+[DrvDev] Creating device node...
+[DrvDev] Device node created: 20001090
+[DrvDev] Creating params (params=0801255c)...
+[CreateParams] Start: dev=20000128, devNode=20001090, params=0801255c
+[CreateParams] First param: 0801255c
+[CreateParams] Param[0]: name=08012cac
+[CreateParams] Param[0] name='baud'
+[CreateParams] Calling DrvFs_CreateParam...
+[CreateParams] Param[0] created: 2000112c
+[CreateParams] Param[1]: name=08012cb4
+[CreateParams] Param[1] name='rx_avail'
+[CreateParams] Calling DrvFs_CreateParam...
+[CreateParams] Param[1] created: 200011c8
+[CreateParams] All 2 params created
+[DrvDev] Params created
+[DrvDev] Device 'uart3' registered successfully
+[DrvInit] Platform devices registered
+UPGRADE: Shell IO = UART1+UART3
+[DrvInit] Registering Shell command modules...
+[DrvInit] Shell command modules registered OK
+
+[APP] Banux Shell ready: help -a / ls / drivers / boot
+UPGRADE: entering main loop
+
+BG Card Shell v2.0
+IO:UART1+UART3
