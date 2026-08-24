@@ -58,7 +58,7 @@ static int sys_mem(int argc, char *argv[])
 static int sys_reboot(int argc, char *argv[])
 {
     (void)argc; (void)argv;
-    Shell_Print("System rebooting...\r\n");
+    Shell_Print("System resetting...\r\n");
     NVIC_SystemReset();
     return 0;
 }
@@ -66,6 +66,7 @@ static int sys_reboot(int argc, char *argv[])
 static const ShellOpt_t sys_opts[] = {
     OPT("i", "info",    NULL,   "Show system info",     sys_info),
     OPT("m", "mem",     NULL,   "Show memory status",   sys_mem),
+    OPT("r", "reset",   NULL,   "Software reset system", sys_reboot),
     OPT("b", "reboot",  NULL,   "Reboot system",        sys_reboot),
     OPT_END()
 };
@@ -293,6 +294,238 @@ static const ShellOpt_t cat_opts[] = {
 
 DEFINE_MODULE(cat, "Display file contents", MOD_CAT_SYSTEM, cat_opts);
 
+/*============================================================================
+ * run module - Execute UTF-8 command script
+ *===========================================================================*/
+
+#define SCRIPT_READ_BUF_SIZE    64u
+#define SCRIPT_MAX_DEPTH        2u
+
+typedef struct {
+    uint32_t codepoint;
+    uint32_t minCodepoint;
+    uint8_t  remaining;
+} Utf8Parser_t;
+
+static uint8_t s_scriptDepth = 0;
+
+static void utf8_parser_reset(Utf8Parser_t *parser)
+{
+    parser->codepoint = 0;
+    parser->minCodepoint = 0;
+    parser->remaining = 0;
+}
+
+static int utf8_parser_feed(Utf8Parser_t *parser, uint8_t byte)
+{
+    if (parser->remaining == 0) {
+        if (byte < 0x80u) {
+            return 1;
+        }
+        if (byte >= 0xC2u && byte <= 0xDFu) {
+            parser->codepoint = (uint32_t)(byte & 0x1Fu);
+            parser->minCodepoint = 0x80u;
+            parser->remaining = 1;
+            return 0;
+        }
+        if (byte >= 0xE0u && byte <= 0xEFu) {
+            parser->codepoint = (uint32_t)(byte & 0x0Fu);
+            parser->minCodepoint = 0x800u;
+            parser->remaining = 2;
+            return 0;
+        }
+        if (byte >= 0xF0u && byte <= 0xF4u) {
+            parser->codepoint = (uint32_t)(byte & 0x07u);
+            parser->minCodepoint = 0x10000u;
+            parser->remaining = 3;
+            return 0;
+        }
+        return -1;
+    }
+
+    if ((byte & 0xC0u) != 0x80u) {
+        return -1;
+    }
+
+    parser->codepoint = (parser->codepoint << 6) | (uint32_t)(byte & 0x3Fu);
+    parser->remaining--;
+    if (parser->remaining != 0) {
+        return 0;
+    }
+
+    if (parser->codepoint < parser->minCodepoint) {
+        return -1;
+    }
+    if (parser->codepoint >= 0xD800u && parser->codepoint <= 0xDFFFu) {
+        return -1;
+    }
+    if (parser->codepoint > 0x10FFFFu) {
+        return -1;
+    }
+
+    return 1;
+}
+
+static int script_execute_line(char *line, uint16_t *lineLen, uint32_t lineNo)
+{
+    char *cmd;
+    char *end;
+    int ret;
+
+    line[*lineLen] = '\0';
+    cmd = line;
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
+
+    end = cmd + strlen(cmd);
+    while (end > cmd && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+    }
+    *end = '\0';
+
+    *lineLen = 0;
+    if (cmd[0] == '\0') {
+        return 0;
+    }
+
+    ret = Shell_ExecuteLine(cmd);
+    if (ret != 0) {
+        Shell_Printf("run: line %lu failed (%d): %s\r\n",
+                     (unsigned long)lineNo, ret, cmd);
+        return ret;
+    }
+    return 0;
+}
+
+static int cmd_run(int argc, char *argv[])
+{
+    FsNode_t *node;
+    Utf8Parser_t parser;
+    uint8_t buf[SCRIPT_READ_BUF_SIZE];
+    char line[SHELL_CMD_MAX_LEN];
+    uint32_t offset = 0;
+    uint32_t lineNo = 1;
+    uint16_t lineLen = 0;
+    bool skipLf = FALSE;
+    int ret = 0;
+
+    if (argc < 1) {
+        Shell_Print("run: missing script file\r\n");
+        Shell_Print("Usage: run <utf8-file>\r\n");
+        return -1;
+    }
+
+    if (s_scriptDepth >= SCRIPT_MAX_DEPTH) {
+        Shell_Print("run: nested script limit reached\r\n");
+        return -2;
+    }
+
+    node = DrvFs_FindNode(argv[0]);
+    if (!node) {
+        Shell_Printf("run: %s: No such file\r\n", argv[0]);
+        return -3;
+    }
+    if (node->type != FS_NODE_FILE) {
+        Shell_Printf("run: %s: Not a file\r\n", argv[0]);
+        return -4;
+    }
+
+    utf8_parser_reset(&parser);
+    s_scriptDepth++;
+
+    while (offset < node->fileSize) {
+        uint16_t toRead = (uint16_t)sizeof(buf);
+        int n;
+        int i;
+        int start = 0;
+
+        if ((node->fileSize - offset) < toRead) {
+            toRead = (uint16_t)(node->fileSize - offset);
+        }
+
+        n = DrvFs_ReadFile(node, (char *)buf, toRead, offset);
+        if (n < 0) {
+            Shell_Printf("run: read error at offset %lu\r\n", (unsigned long)offset);
+            ret = -5;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        if (offset == 0 && n >= 3 &&
+            buf[0] == 0xEFu && buf[1] == 0xBBu && buf[2] == 0xBFu) {
+            start = 3;
+        }
+
+        for (i = start; i < n; i++) {
+            uint8_t byte = buf[i];
+            int utf8 = utf8_parser_feed(&parser, byte);
+
+            if (utf8 < 0) {
+                Shell_Printf("run: invalid UTF-8 at line %lu, offset %lu\r\n",
+                             (unsigned long)lineNo,
+                             (unsigned long)(offset + (uint32_t)i));
+                ret = -6;
+                break;
+            }
+
+            if (byte == '\r' || byte == '\n') {
+                if (byte == '\n' && skipLf) {
+                    skipLf = FALSE;
+                    continue;
+                }
+
+                ret = script_execute_line(line, &lineLen, lineNo);
+                if (ret != 0) {
+                    break;
+                }
+                lineNo++;
+                skipLf = (byte == '\r') ? TRUE : FALSE;
+                continue;
+            }
+
+            skipLf = FALSE;
+            if (lineLen >= (uint16_t)(sizeof(line) - 1)) {
+                Shell_Printf("run: line %lu too long\r\n", (unsigned long)lineNo);
+                ret = -7;
+                break;
+            }
+            line[lineLen++] = (char)byte;
+        }
+
+        if (ret != 0) {
+            break;
+        }
+        offset += (uint32_t)n;
+    }
+
+    if (ret == 0 && parser.remaining != 0) {
+        Shell_Printf("run: truncated UTF-8 sequence at line %lu\r\n",
+                     (unsigned long)lineNo);
+        ret = -8;
+    }
+
+    if (ret == 0 && lineLen > 0) {
+        ret = script_execute_line(line, &lineLen, lineNo);
+    }
+
+    s_scriptDepth--;
+
+    if (ret == 0) {
+        Shell_Printf("run: %s done\r\n", argv[0]);
+    }
+    return ret;
+}
+
+static const ShellOpt_t run_opts[] = {
+    OPT("", "", "<utf8-file>", "Execute UTF-8 command script", cmd_run),
+    OPT_END()
+};
+
+DEFINE_MODULE(run, "Execute command script", MOD_CAT_SYSTEM, run_opts);
+
 /*
  * echo命令 - 写入参数值
  * 用法: echo <value> > <parameter>
@@ -511,6 +744,7 @@ void Shell_RegisterAllModules(void)
     REGISTER_MODULE(pwd);
     REGISTER_MODULE(cd);
     REGISTER_MODULE(cat);
+    REGISTER_MODULE(run);
     REGISTER_MODULE(echo);    /* 写入参数值 */
     REGISTER_MODULE(tree);
 #endif /* VFS_EN */

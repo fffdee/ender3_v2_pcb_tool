@@ -165,6 +165,13 @@ void Shell_InputChar(char c);
 void Shell_InputData(uint8_t *data, uint16_t len);
 
 /**
+ * @brief  Execute one complete shell command line
+ * @param  line: Null-terminated command line
+ * @return 0 on success, non-zero on parse/command/handler error
+ */
+int Shell_ExecuteLine(const char *line);
+
+/**
  * @brief  Output string
  */
 void Shell_Print(const char *str);

@@ -60,6 +60,7 @@ static const char *g_CatNames[MOD_CAT_MAX] = {
  ******************************************************************************/
 static void Shell_ProcessChar(char c);
 static void Shell_Execute(void);
+int Shell_ExecuteLine(const char *line);
 static int  Shell_ParseArgs(char *line, char *argv[], int max);
 static void Shell_Prompt(void);
 static void Shell_Welcome(void);
@@ -352,8 +353,17 @@ static void Shell_ProcessChar(char c)
 
 static void Shell_Execute(void)
 {
+    (void)Shell_ExecuteLine(g_CmdLine);
+    g_CmdLen = 0;
+    g_CmdLine[0] = '\0';
+}
+
+int Shell_ExecuteLine(const char *line)
+{
+    char cmdLine[SHELL_CMD_MAX_LEN];
     char *argv[SHELL_CMD_MAX_ARGS];
-    int argc = Shell_ParseArgs(g_CmdLine, argv, SHELL_CMD_MAX_ARGS);
+    int argc;
+    int ret = 0;
     uint16_t i;
     const ShellModule_t *mod = NULL;
     const ShellOpt_t *defaultOpt = NULL;
@@ -361,6 +371,18 @@ static void Shell_Execute(void)
     bool isLong = FALSE;
     const ShellOpt_t *opt = NULL;
 
+    if (line == NULL) {
+        return -1;
+    }
+    if (strlen(line) >= sizeof(cmdLine)) {
+        Shell_Print("Command too long\r\n");
+        return -2;
+    }
+
+    strncpy(cmdLine, line, sizeof(cmdLine) - 1);
+    cmdLine[sizeof(cmdLine) - 1] = '\0';
+
+    argc = Shell_ParseArgs(cmdLine, argv, SHELL_CMD_MAX_ARGS);
     if(argc == 0) goto done;
     // Find module
     for(i = 0; i < g_ModuleCount; i++)
@@ -376,6 +398,7 @@ static void Shell_Execute(void)
     {
         Shell_Printf("Unknown module: %s\r\n", argv[0]);
         Shell_Print("Type 'help -a' for available modules\r\n");
+        ret = -3;
         goto done;
     }
 
@@ -391,7 +414,7 @@ static void Shell_Execute(void)
         // If has default option, call it directly (like 'ls', 'pwd')
         if(defaultOpt && defaultOpt->handler)
         {
-            int ret = defaultOpt->handler(0, NULL);
+            ret = defaultOpt->handler(0, NULL);
             if(ret != 0)
             {
                 Shell_Printf("Error: %d\r\n", ret);
@@ -411,7 +434,7 @@ static void Shell_Execute(void)
     {
         if(defaultOpt && defaultOpt->handler)
         {
-            int ret = defaultOpt->handler(argc - 1, &argv[1]);
+            ret = defaultOpt->handler(argc - 1, &argv[1]);
             if(ret != 0)
             {
                 Shell_Printf("Error: %d\r\n", ret);
@@ -421,6 +444,7 @@ static void Shell_Execute(void)
         // No default option, this is invalid
         Shell_Printf("Invalid option: %s\r\n", optStr);
         Shell_Printf("Use '%s' to see options\r\n", mod->name);
+        ret = -4;
         goto done;
     }
     
@@ -456,13 +480,14 @@ static void Shell_Execute(void)
     {
         Shell_Printf("Unknown option: %s\r\n", argv[1]);
         Shell_ShowModuleHelp(mod);
+        ret = -5;
         goto done;
     }
     
     // Call handler function
     if(opt->handler)
     {
-        int ret = opt->handler(argc - 2, &argv[2]);
+        ret = opt->handler(argc - 2, &argv[2]);
         if(ret != 0)
         {
             Shell_Printf("Error: %d\r\n", ret);
@@ -470,8 +495,7 @@ static void Shell_Execute(void)
     }
     
 done:
-    g_CmdLen = 0;
-    g_CmdLine[0] = '\0';
+    return ret;
 }
 
 static int Shell_ParseArgs(char *line, char *argv[], int max)
@@ -481,11 +505,11 @@ static int Shell_ParseArgs(char *line, char *argv[], int max)
     
     while(*p && argc < max)
     {
-        while(*p == ' ') p++;
+        while(*p == ' ' || *p == '\t') p++;
         if(*p == '\0') break;
         
         argv[argc++] = p;
-        while(*p && *p != ' ') p++;
+        while(*p && *p != ' ' && *p != '\t') p++;
         if(*p) *p++ = '\0';
     }
     
