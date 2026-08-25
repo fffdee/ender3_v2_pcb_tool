@@ -26,9 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_bl.h"
-#include "drv_init.h"       /* Banux: 驱动框架初始化 */
-#include "bg_shell.h"       /* Banux: Shell 核心 */
-#include "shell_io_uart.h"  /* Banux: Shell UART IO */
+#include "Banux.h"
+#include "driver_init.h"
+#include "shell_io_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -103,7 +103,6 @@ int main(void)
   MX_GPIO_Init();
   MX_SDIO_SD_Init();
   MX_USART3_Init();
-  MX_FATFS_Init();
   MX_USART1_Init();
   /* USER CODE BEGIN 2 */
 
@@ -113,31 +112,19 @@ int main(void)
   app_log_u32("clk: SYSCLK=", HAL_RCC_GetSysClockFreq());
   app_log("UPGRADE: listening ENTER_BOOT (UART1 @2000000 / UART3 @115200) [diag]\r\n");
 
-  /* 启动 UART 中断接收，嗅探上位机的 ENTER_BOOT 帧 */
-  app_bl_init();
-
-  /* ─── Banux Shell 接入 ───
-   * 顺序不能乱：
-   *   1. DrvFramework_Init()        VFS 驱动文件系统
-   *   1.5 DrvFramework_RegisterDevices() 注册平台设备驱动（SDIO SD 卡挂载
-   *        FatFs + /driver/uart/uart1、uart3 节点），须在框架 Init 之后
-   *   2. Shell_Init()               先初始化 Shell（内部注册 help 模块）
-   *   3. Shell_SetIO()              挂载 IO（UART1 @2M，经 app_bl 镜像转发）
-   *   4. DrvFramework_RegisterAll() 注册命令模块（必须在 Shell_Init 之后，
-   *                                  否则模块注册表会被 Shell_Init 清空）
-   */
-  DrvFramework_Init();
-  DrvFramework_RegisterDevices();
-  Shell_Init();
-  if (!Shell_SetIO(ShellIO_UartAll_Get())) {
-      app_log("UPGRADE: Shell_SetIO FAILED\r\n");
-  } else {
-      app_log("UPGRADE: Shell IO = ");
-      app_log(Shell_GetIOName());
-      app_log("\r\n");
+  {
+    const BanuxConfig_t banuxConfig = {
+      app_log,
+      ShellIO_UartAll_Get(),
+      MX_FATFS_Init,
+      BanuxDriver_RegisterAll,
+      app_bl_init,
+      app_bl_poll
+    };
+    if (Banux_Init(&banuxConfig) != 0) {
+      app_log("UPGRADE: Banux_Init FAILED\r\n");
+    }
   }
-  DrvFramework_RegisterAll();
-  Shell_Print("\r\n[APP] Banux Shell ready: help -a / ls / drivers / boot\r\n");
   app_log("UPGRADE: entering main loop\r\n");
 
   /* USER CODE END 2 */
@@ -149,8 +136,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    app_bl_poll();   /* UART 嗅探（ENTER_BOOT 帧/"boot"），同时转发字节到 Shell 镜像缓冲 */
-    Shell_Process(); /* 从镜像缓冲取数据，处理 Shell 命令 */
+    Banux_Process();
   }
   /* USER CODE END 3 */
 }
