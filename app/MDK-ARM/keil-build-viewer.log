@@ -29,19 +29,15 @@
 [name] IRAM [base addr] 0x20000000 [size] 0x00010000 [type] 1 [off-chip] 0 [is pack] 1 [ID] 2 
 [name] IROM [base addr] 0x08008000 [size] 0x00070000 [type] 2 [off-chip] 0 [is pack] 1 [ID] 3 
 
-Note: source file '../Banux/02_system_components/event/component_manifest.c' - object file renamed from 'ender3 v2\event_component_manifest.o' to 'ender3 v2\event_component_manifest.o'.
-'event_component_manifest.c' rename to 'event_component_manifest.o'
-Note: source file '../Banux/03_application_components/firmware_upgrade/component_manifest.c' - object file renamed from 'ender3 v2\upgrade_component_manifest.o' to 'ender3 v2\upgrade_component_manifest.o'.
-'upgrade_component_manifest.c' rename to 'upgrade_component_manifest.o'
 
 [map file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.map
 
 [region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x0000E738 [memory type] 2 [memory ID] 3
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x0000F15C [memory type] 2 [memory ID] 3
 
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x00009230 [memory type] 1 [memory ID] 2
-		[ZI block] addr: 0x200003F4, size: 0x00008E3C (36412)
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000A078 [memory type] 1 [memory ID] 2
+		[ZI block] addr: 0x200003FC, size: 0x00009C7C (40060)
 
 
 [object name max length] 28
@@ -75,6 +71,8 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 [object name] ff_gen_drv.o                  [path] ../Banux/02_system_components/fatfs/src/ff_gen_drv.c
 [object name] fs_sd.o                       [path] ../Banux/01_driver/sd/fs_sd.c
 [object name] gpio.o                        [path] ../Core/Src/gpio.c
+[object name] internal_flash_diskio.o       [path] ../Banux/01_driver/internal_flash/internal_flash_diskio.c
+[object name] internal_flash_fs.o           [path] ../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c
 [object name] main.o                        [path] ../Core/Src/main.c
 [object name] sd_diskio.o                   [path] ../Banux/02_system_components/fatfs/src/drivers/sd_diskio.c
 [object name] sdio.o                        [path] ../Core/Src/sdio.c
@@ -119,6 +117,7 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 [old name] bg_shell_commands.c           [type] 1   [path] ../Banux/02_system_components/command_line/bg_shell_commands.c
 [old name] shell_io_uart.c               [type] 1   [path] ../Banux/02_system_components/command_line/shell_io_uart.c
 [old name] drv_sdio.c                    [type] 1   [path] ../Banux/01_driver/sd/drv_sdio.c
+[old name] internal_flash_diskio.c       [type] 1   [path] ../Banux/01_driver/internal_flash/internal_flash_diskio.c
 [old name] fs_sd.c                       [type] 1   [path] ../Banux/01_driver/sd/fs_sd.c
 [old name] drv_uart.c                    [type] 1   [path] ../Banux/01_driver/uart/drv_uart.c
 [old name] drv_eeprom.c                  [type] 1   [path] ../Banux/01_driver/eeprom/drv_eeprom.c
@@ -129,6 +128,7 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 [old name] command_parser.c              [type] 1   [path] ../Banux/02_system_components/command_parser/command_parser.c
 [old name] drv_timer1ms.c                [type] 1   [path] ../Banux/01_driver/timer/drv_timer1ms.c
 [old name] driver_init.c                 [type] 1   [path] ../Banux/01_driver/driver_init.c
+[old name] internal_flash_fs.c           [type] 1   [path] ../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c
 [old name] bsp_driver_sd.c               [type] 1   [path] ../Banux/02_system_components/fatfs/target/bsp_driver_sd.c
 [old name] fatfs.c                       [type] 1   [path] ../Banux/02_system_components/fatfs/app/fatfs.c
 [old name] stm32f1xx_hal_gpio_ex.c       [type] 1   [path] ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_gpio_ex.c
@@ -155,45 +155,47 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 
 [record region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x0000E7C0 [type] 2 [ID] 3
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x00009230 [type] 1 [ID] 2
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x0000F0A0 [type] 2 [ID] 3
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x00009E78 [type] 1 [ID] 2
 ------------------------------------------------------------------------------------------------------------------------------------
                                    FILE(s)                                   |         RAM (byte)       |       FLASH (byte)       |
 ------------------------------------------------------------------------------------------------------------------------------------
 ../Core/Src/app_bl.c():                                                      |         608              |        2031              |
-../Banux/00_core/Banux.c():                                                  |          16              |         300              |
-../Banux/00_core/banux_component.c():                                        |         129              |         313  [-12]       |
+../Banux/00_core/Banux.c():                                                  |          16              |         304              |
+../Banux/00_core/banux_component.c():                                        |         129              |         321              |
 ../Banux/00_core/banux_debug.c():                                            |           4              |          64              |
 ../Banux/02_system_components/file_io/banux_io.c():                          |           0              |         384              |
 ../Banux/00_core/banux_scheduler.c():                                        |           0              |          14              |
 ../Banux/02_system_components/event/bg_event.c():                            |         259              |          39              |
 ../Banux/02_system_components/command_line/bg_shell.c():                     |        2636              |        4286              |
-../Banux/02_system_components/command_line/bg_shell_commands.c():            |        2252              |        7162              |
-../Banux/02_system_components/fatfs/target/bsp_driver_sd.c():                |           0              |         242              |
+../Banux/02_system_components/command_line/bg_shell_commands.c():            |        2252              |        7191              |
+../Banux/02_system_components/fatfs/target/bsp_driver_sd.c():                |         512  [+512]      |         542  [+188]      |
 ../Banux/02_system_components/command_parser/command_parser.c():             |         584              |        1983              |
-../Banux/02_system_components/fatfs/src/diskio.c():                          |           0              |         148              |
+../Banux/02_system_components/fatfs/src/diskio.c():                          |           0              |         160              |
 ../Banux/01_driver/driver_init.c():                                          |           0              |         405              |
 ../Banux/02_system_components/driver_framework/core/drv_device.c():          |         104              |        1911              |
 ../Banux/01_driver/eeprom/drv_eeprom.c():                                    |          60              |        1965              |
 ../Banux/02_system_components/driver_framework/core/drv_fs.c():              |          44              |         520              |
 ../Banux/02_system_components/driver_framework/drv_init.c():                 |           0              |         296              |
-../Banux/01_driver/sd/drv_sdio.c():                                          |         616              |        1465              |
+../Banux/01_driver/sd/drv_sdio.c():                                          |         616              |        1615              |
 ../Banux/01_driver/stepper/drv_stepper.c():                                  |         452              |        3211              |
 ../Banux/01_driver/timer/drv_timer1ms.c():                                   |          56              |         262              |
 ../Banux/01_driver/uart/drv_uart.c():                                        |         144              |         509              |
 ../Banux/02_system_components/event/component_manifest.c():                  |           0              |          62              |
-../Banux/02_system_components/fatfs/app/fatfs.c():                           |         565              |         116              |
-../Banux/02_system_components/fatfs/src/ff.c():                              |          32              |        7218              |
-../Banux/02_system_components/fatfs/src/ff_gen_drv.c():                      |          12              |          70              |
-../Banux/01_driver/sd/fs_sd.c():                                             |        1128              |        1504              |
+../Banux/02_system_components/fatfs/app/fatfs.c():                           |        1130              |         137              |
+../Banux/02_system_components/fatfs/src/ff.c():                              |          36              |        7222              |
+../Banux/02_system_components/fatfs/src/ff_gen_drv.c():                      |          16              |          70              |
+../Banux/01_driver/sd/fs_sd.c():                                             |        1140              |        1948              |
 ../Core/Src/gpio.c():                                                        |           0              |         128              |
+../Banux/01_driver/internal_flash/internal_flash_diskio.c():                 |        2049              |         853              |
+../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c():       |           0              |         342              |
 ../Core/Src/main.c():                                                        |           0              |         430              |
-../Banux/02_system_components/fatfs/src/drivers/sd_diskio.c():               |           1              |         277              |
+../Banux/02_system_components/fatfs/src/drivers/sd_diskio.c():               |         513              |         589              |
 ../Core/Src/sdio.c():                                                        |         132              |         252              |
 ../Banux/02_system_components/command_line/shell_io_uart.c():                |           0              |         242              |
 startup_stm32f103xe.s():                                                     |        4608              |         368              |
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal.c():                       |          12              |         176              |
-../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_cortex.c():                |           0              |         198              |
+../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_cortex.c():                |           0              |         232              |
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_dma.c():                   |           0              |         374              |
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash.c():                 |          32              |         392              |
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash_ex.c():              |           0              |         240              |
@@ -212,15 +214,15 @@ startup_stm32f103xe.s():                                                     |  
 [memory print mode]: 0
 LR_IROM1
         RAM 1             [0x20000000 | 0x00010000 (65536)]
-                [zi start] 1   [zi end] 28
-                RW_IRAM1  [0x20000000]|■□□□□□□□□□□□□□□□□□□□□□□□□□□□______________________| (  36.5 KB /  64.0 KB )  57.1%  
+                [zi start] 1   [zi end] 31
+                RW_IRAM1  [0x20000000]|■□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□___________________| (  40.1 KB /  64.0 KB )  62.7%  [+512]
  
         FLASH 1           [0x08008000 | 0x00070000 (458752)]
-                ER_IROM1  [0x08008000]|■■■■■■____________________________________________| (  57.8 KB / 448.0 KB )  12.9%  [-136]
+                ER_IROM1  [0x08008000]|■■■■■■____________________________________________| (  60.3 KB / 448.0 KB )  13.5%  [+188]
  
 [htm file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
 Maximum Stack Usage =       1376 bytes + Unknown(Functions without stacksize, Cycles, Untraceable Function Pointers)
  
 =============================================================================================================================
 
-run time: 0.177 s
+run time: 0.173 s

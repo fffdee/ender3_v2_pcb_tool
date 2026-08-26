@@ -2,7 +2,7 @@
 
 本文档面向 Ender-3 V2 主板 APP 开发，描述当前工程中已经接入并通过编译的 Banux 功能。
 
-- 固件版本：`1.0.14`
+- 固件版本：`1.0.18`
 - Banux 框架版本：`V2.0.1`
 - MCU：STM32F103RET6
 - APP 起始地址：`0x08008000`
@@ -24,6 +24,7 @@ app/Banux/
 ├── 01_driver/                  具体硬件驱动（依赖框架）
 │   ├── driver_init.c/.h        Ender-3 V2 驱动注册入口
 │   ├── eeprom/                 BL24C16A EEPROM
+│   ├── internal_flash/         20 KB 内部 Flash 块设备
 │   ├── sd/                     SDIO 和 FatFs/VFS 挂载适配
 │   ├── stepper/                X/Y/Z/E 步进电机与限位
 │   ├── timer/                  SysTick 1 ms 时基
@@ -34,6 +35,7 @@ app/Banux/
 │   ├── command_line/           Shell、命令模块和 UART IO
 │   ├── command_parser/         UTF-8 脚本与非阻塞定时调度
 │   ├── event/                  发布/订阅消息系统
+│   ├── internal_flash_fs/      独立 20 KB Flash FAT 系统组件
 │   ├── fatfs/                  FatFs 核心、Cube 适配层与 SD diskio
 │   │   ├── app/                MX_FATFS_Init 和逻辑盘对象
 │   │   ├── target/             STM32F1 SDIO BSP 与 ffconf
@@ -51,7 +53,7 @@ app/Banux/
 
 ## 2. 系统架构
 
-Banux 的系统组件按职责拆分为六部分：
+Banux 的主要系统组件按职责拆分如下：
 
 1. 文件读写系统：向应用提供 `banux_read()`、`banux_write()` 等统一接口。
 2. 命令行系统：处理 UART 输入、命令注册、参数拆分和交互输出。
@@ -59,6 +61,8 @@ Banux 的系统组件按职责拆分为六部分：
 4. 消息订阅系统：提供事件发布/订阅接口。
 5. VFS 系统：维护目录、设备、参数和文件节点。
 6. 驱动框架：提供通用设备模型并挂载到 `/driver/<bus>/<device>`。
+7. FatFs：提供 SD 和内部 Flash 的 FAT12/FAT16/FAT32 文件系统支持。
+8. 内部 Flash 文件系统：可裁剪的 20 KB 独立逻辑卷，挂载到 `/flash`。
 
 具体硬件驱动不是系统组件。它们位于 `01_driver`，只依赖驱动框架公开的 `DrvDevice_t`、`DrvFs_*` 和 VFS 接口。移植 Banux 到其他主板时，可以完整复用 `00_core` 与 `02_system_components`，替换 `01_driver` 即可。
 
@@ -112,8 +116,21 @@ while (1) {
 - `DrvFramework_Init()` 必须早于任何设备注册。
 - `Shell_Init()` 必须早于 `Shell_RegisterAllModules()`，否则 Shell 初始化会清空模块表。
 - SDIO 驱动注册成功后才会创建 `/sd` 挂载点。
+- `BANUX_INTERNAL_FLASH_FS_EN` 使能后始终创建 `/flash`，不依赖 SD 是否存在。
 
 文件系统统一使用 `app/Banux/02_system_components/fatfs` 中的 STM32Cube/Elm-Chan FatFs；工程不再保留 Banux 外部或第二套 FAT32 实现。
+
+FatFs 使用两个相互独立的逻辑卷：SD 固定为 `0:` 并挂载 `/sd`；内部 Flash 固定为 `1:` 并挂载 `/flash`。两者可以同时使用，SD 初始化失败不会改变 Flash 的卷号或挂载路径。Flash 区域为 `0x0807A000..0x0807EFFF`，位于 APP 升级区和 Bootloader 配置页之间。内部 Flash 擦写寿命有限，只适合配置、小脚本和低频文件更新，不适合作为连续日志盘。
+
+可通过驱动属性确认 SD 状态：
+
+```text
+cat /driver/sdio/sd/backend
+cat /driver/sdio/sd/size_kb
+cat /driver/sdio/sd/free_kb
+```
+
+`backend` 固定返回 `sd`。内部 Flash 组件首次使用会自动格式化；Bootloader 常规 APP 升级只擦除到 `0x08078000`，不会清除 `/flash`。使用 Keil 全片擦除下载则会清空它。
 
 ## 4. 组件管理
 
@@ -620,6 +637,17 @@ run /sd/config/startup.txt
 rm /sd/config/startup.txt
 ```
 
+内部 Flash 组件使能后可同时使用 `/flash`：
+
+```text
+ls /flash
+mkdir /flash/config
+touch /flash/config/startup.txt
+vim /flash/config/startup.txt
+cat /flash/config/startup.txt
+rm /flash/config/startup.txt
+```
+
 `rm` 删除目录时要求目录为空。不要删除当前工作目录或它的父目录。
 
 ## 11. UART 驱动
@@ -798,6 +826,8 @@ cat /driver/sdio/sd/mount
 ### 15.5 SD 文件操作后复位或死机
 
 当前工程为 FatFs 调用预留 `0x1000` 字节主栈，并把扇区缓冲、`FIL`、`DIR` 和 `FILINFO` 放在静态工作区。VFS 动态目录只在首次访问时枚举；`touch`、`mkdir`、`vim` 和 `rm` 成功后只增量更新对应节点，不再清空整棵子树。脚本解析器也会按路径重新取得文件节点，避免目录刷新后继续使用失效指针。
+
+SD diskio 对所有读写使用 4 字节对齐的 512 字节中转缓冲，并逐扇区调用 STM32 HAL。Polling 写扇区期间只暂停 UART1/UART3 中断，避免 2 Mbaud 串口抢占造成 SDIO TX FIFO 下溢，SysTick 仍保持运行。SDIO 固定使用 rising 采样沿和较低总线时钟，不再因瞬态读错在运行中切换边沿。部分卡会在数据实际写入后让 STM32 SDIO 报数据 CRC 错误；驱动会等待卡就绪并回读比较该扇区，内容一致时按成功处理。目录枚举会拒绝非法 8.3 项并输出 `[FatFsVfs] skipped corrupt directory entry` 诊断；该日志表示介质上已有坏目录项，需要在电脑上运行 FAT 修复或重新格式化。
 
 建议依次验证：
 

@@ -25,7 +25,8 @@
 
 #include "ff.h"
 #include "ff_gen_drv.h"
-#include "sd_diskio.h" /* defines SD_Driver as external */
+#include "sd_diskio.h"
+#include "internal_flash_diskio.h"
 
 /* USER CODE BEGIN Includes */
 
@@ -35,6 +36,9 @@ extern uint8_t retSD; /* Return value for SD */
 extern char SDPath[4]; /* SD logical drive path */
 extern FATFS SDFatFS; /* File system object for SD logical drive */
 extern FIL SDFile; /* File object for SD */
+extern uint8_t retFlash;
+extern char FlashPath[4];
+extern FATFS FlashFatFS;
 
 void MX_FATFS_Init(void);
 

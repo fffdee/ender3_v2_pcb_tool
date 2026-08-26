@@ -585,11 +585,11 @@ static int cmd_touch(int argc, char *argv[])
 }
 
 static const ShellOpt_t touch_opts[] = {
-    OPT("", "", "<file> [file...]", "Create SD file", cmd_touch),
+    OPT("", "", "<file> [file...]", "Create filesystem file", cmd_touch),
     OPT_END()
 };
 
-DEFINE_MODULE(touch, "Create SD file", MOD_CAT_SYSTEM, touch_opts);
+DEFINE_MODULE(touch, "Create filesystem file", MOD_CAT_SYSTEM, touch_opts);
 
 static int cmd_mkdir(int argc, char *argv[])
 {
@@ -610,11 +610,11 @@ static int cmd_mkdir(int argc, char *argv[])
 }
 
 static const ShellOpt_t mkdir_opts[] = {
-    OPT("", "", "<directory> [directory...]", "Create SD directory", cmd_mkdir),
+    OPT("", "", "<directory> [directory...]", "Create filesystem directory", cmd_mkdir),
     OPT_END()
 };
 
-DEFINE_MODULE(mkdir, "Create SD directory", MOD_CAT_SYSTEM, mkdir_opts);
+DEFINE_MODULE(mkdir, "Create filesystem directory", MOD_CAT_SYSTEM, mkdir_opts);
 
 static int cmd_rm(int argc, char *argv[])
 {
@@ -635,11 +635,11 @@ static int cmd_rm(int argc, char *argv[])
 }
 
 static const ShellOpt_t rm_opts[] = {
-    OPT("", "", "<path> [path...]", "Remove SD file or empty directory", cmd_rm),
+    OPT("", "", "<path> [path...]", "Remove file or empty directory", cmd_rm),
     OPT_END()
 };
 
-DEFINE_MODULE(rm, "Remove SD file or empty directory", MOD_CAT_SYSTEM, rm_opts);
+DEFINE_MODULE(rm, "Remove file or empty directory", MOD_CAT_SYSTEM, rm_opts);
 
 static int cmd_vim(int argc, char *argv[])
 {
@@ -661,7 +661,7 @@ static int cmd_vim(int argc, char *argv[])
         node = DrvFs_FindNode(argv[0]);
     }
     if (!node || node->type != FS_NODE_FILE) {
-        Shell_Printf("vim: %s: not an SD file\r\n", argv[0]);
+        Shell_Printf("vim: %s: not a filesystem file\r\n", argv[0]);
         return -1;
     }
     if (node->fileSize >= EDITOR_BUFFER_SIZE) {
@@ -696,11 +696,11 @@ static int cmd_vim(int argc, char *argv[])
 }
 
 static const ShellOpt_t vim_opts[] = {
-    OPT("", "", "<file>", "Edit SD text file", cmd_vim),
+    OPT("", "", "<file>", "Edit filesystem text file", cmd_vim),
     OPT_END()
 };
 
-DEFINE_MODULE(vim, "Edit SD text file", MOD_CAT_SYSTEM, vim_opts);
+DEFINE_MODULE(vim, "Edit filesystem text file", MOD_CAT_SYSTEM, vim_opts);
 
 /*============================================================================
  * run module - Execute UTF-8 command script

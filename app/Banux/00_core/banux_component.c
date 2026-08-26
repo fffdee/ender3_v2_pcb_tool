@@ -8,6 +8,7 @@ BANUX_COMPONENT_DECLARE(g_banux_component_file_io);
 BANUX_COMPONENT_DECLARE(g_banux_component_shell);
 BANUX_COMPONENT_DECLARE(g_banux_component_command_parser);
 BANUX_COMPONENT_DECLARE(g_banux_component_fatfs);
+BANUX_COMPONENT_DECLARE(g_banux_component_internal_flash_fs);
 BANUX_COMPONENT_DECLARE(g_banux_component_event_bus);
 BANUX_COMPONENT_DECLARE(g_banux_component_firmware_upgrade);
 
@@ -18,6 +19,7 @@ static const BanuxComponentDescriptor_t *const g_static_components[] = {
     &g_banux_component_shell,
     &g_banux_component_command_parser,
     &g_banux_component_fatfs,
+    &g_banux_component_internal_flash_fs,
     &g_banux_component_event_bus,
     &g_banux_component_firmware_upgrade
 };

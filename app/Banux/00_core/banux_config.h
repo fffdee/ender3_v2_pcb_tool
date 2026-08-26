@@ -41,6 +41,10 @@ extern "C" {
 #define TIMER1MS_EN                 COMMAND_PARSER_EN /* SysTick 1 ms 驱动 */
 #endif
 
+#ifndef BANUX_INTERNAL_FLASH_FS_EN
+#define BANUX_INTERNAL_FLASH_FS_EN  BANUX_FATFS_EN /* 独立挂载 20 KB Flash FAT12 */
+#endif
+
 #ifndef STEPPER_LIMIT_ACTIVE_HIGH
 #define STEPPER_LIMIT_ACTIVE_HIGH   1   /* Creality NC endstop: open/high means hit */
 #endif

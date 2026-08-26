@@ -47,6 +47,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include <string.h>
 #include "ff_gen_drv.h"
+#include "debug.h"
+#include "sdio.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -55,6 +57,13 @@
 /* Private variables ---------------------------------------------------------*/
 /* Disk status */
 static volatile DSTATUS Stat = STA_NOINIT;
+#if defined(__CC_ARM)
+__align(4) static BYTE s_sectorBuffer[512];
+#elif defined(__GNUC__)
+static BYTE s_sectorBuffer[512] __attribute__((aligned(4)));
+#else
+static BYTE s_sectorBuffer[512];
+#endif
 
 /* Private function prototypes -----------------------------------------------*/
 DSTATUS SD_initialize (BYTE);
@@ -146,16 +155,19 @@ DSTATUS SD_status(BYTE lun)
   */
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
-  DRESULT res = RES_ERROR;
-
-  if(BSP_SD_ReadBlocks((uint32_t*)buff, 
-                       (uint32_t) (sector), 
-                       count, SD_DATATIMEOUT) == MSD_OK)
-  {
-    res = SD_WaitCardReady();
+  if (!buff || count == 0U) return RES_PARERR;
+  while (count-- > 0U) {
+    if (BSP_SD_ReadBlocks((uint32_t *)s_sectorBuffer, (uint32_t)sector,
+                          1U, SD_DATATIMEOUT) != MSD_OK ||
+        SD_WaitCardReady() != RES_OK) {
+      DBG("[SD diskio] read failed: sector=%lu\n", (unsigned long)sector);
+      return RES_ERROR;
+    }
+    memcpy(buff, s_sectorBuffer, sizeof(s_sectorBuffer));
+    buff += sizeof(s_sectorBuffer);
+    sector++;
   }
-  
-  return res;
+  return RES_OK;
 }
 
 /**
@@ -169,16 +181,24 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 #if _USE_WRITE == 1
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
-  DRESULT res = RES_ERROR;
-
-  if(BSP_SD_WriteBlocks((uint32_t*)buff, 
-                        (uint32_t)(sector), 
-                        count, SD_DATATIMEOUT) == MSD_OK)
-  {
-    res = SD_WaitCardReady();
+  if (!buff || count == 0U) return RES_PARERR;
+  while (count-- > 0U) {
+    memcpy(s_sectorBuffer, buff, sizeof(s_sectorBuffer));
+    if (BSP_SD_WriteBlocks((uint32_t *)s_sectorBuffer, (uint32_t)sector,
+                           1U, SD_DATATIMEOUT) != MSD_OK ||
+        SD_WaitCardReady() != RES_OK) {
+      DBG("[SD diskio] write failed: sector=%lu error=0x%08lX "
+          "state=%lu STA=0x%08lX DCTRL=0x%08lX edge=%s\n",
+          (unsigned long)sector, (unsigned long)hsd.ErrorCode,
+          (unsigned long)hsd.State, (unsigned long)SDIO->STA,
+          (unsigned long)SDIO->DCTRL,
+          hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_FALLING ? "falling" : "rising");
+      return RES_ERROR;
+    }
+    buff += sizeof(s_sectorBuffer);
+    sector++;
   }
-  
-  return res;
+  return RES_OK;
 }
 #endif /* _USE_WRITE == 1 */
 

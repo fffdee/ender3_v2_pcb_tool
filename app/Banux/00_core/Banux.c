@@ -6,6 +6,7 @@
 #include "banux_scheduler.h"
 #include "drv_init.h"
 #include "bg_event.h"
+#include "internal_flash_fs.h"
 
 static BanuxCallback_t g_setup_callback;
 static BanuxCallback_t g_loop_callback;
@@ -46,6 +47,8 @@ int Banux_Init(const BanuxConfig_t *config)
         ret = config->driverInit();
         if (ret != 0) return -3;
     }
+
+    (void)InternalFlashFs_Init();
 
     if (!Shell_Init()) return -4;
     if (!Shell_SetIO(config->shellIo)) return -5;

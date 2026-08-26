@@ -3,7 +3,7 @@
  * @file     drv_sdio.h
  * @brief    SDIO(SD 卡 / FatFs) 设备驱动接入驱动框架
  *****************************************************************************
- * 注册后设备节点：/driver/sdio/sd
+ * 注册后设备节点：/driver/sdio/sd（只代表物理 SD 卡）
  *   - init  检测 SD 卡并挂载 FatFs
  *   - read  读取 block 参数指定块（整块）
  *   - write 写入 block 参数指定块（整块）
