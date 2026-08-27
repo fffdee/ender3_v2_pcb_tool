@@ -94,6 +94,12 @@ typedef enum {
     EVT_SHELL_CMD_RECEIVED  = 0x0100,   /* Shell 收到完整命令 */
     EVT_SHELL_IO_SWITCH     = 0x0101,   /* Shell IO 通道切换 */
 
+    /* ---- G-code application events (0x0120 ~ 0x013F) ---- */
+    EVT_GCODE_COMMAND       = 0x0120,
+    EVT_GCODE_COMPLETE      = 0x0121,
+    EVT_GCODE_ERROR         = 0x0122,
+    EVT_GCODE_STOP          = 0x0123,
+
     /* ---- 用户自定义事件 (0x0200 ~ 0x02FF) ---- */
     EVT_USER_BASE           = 0x0200,   /* 应用层自定义事件起始 */
 

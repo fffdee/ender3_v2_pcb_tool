@@ -29,10 +29,16 @@ typedef struct {
     uint32_t pulseUs;
 } DrvStepperCommand_t;
 
+typedef struct {
+    int32_t steps[DRV_STEPPER_COUNT];
+    uint32_t pulseUs;
+} DrvStepperMoveCommand_t;
+
 #define DRV_STEPPER_IOCTL_ENABLE       1u
 #define DRV_STEPPER_IOCTL_DIRECTION    2u
 #define DRV_STEPPER_IOCTL_STEP         3u
 #define DRV_STEPPER_IOCTL_POSITION     4u
+#define DRV_STEPPER_IOCTL_STOP         5u
 
 int DrvStepper_Register(void);
 int DrvStepper_EnableAll(int enabled);

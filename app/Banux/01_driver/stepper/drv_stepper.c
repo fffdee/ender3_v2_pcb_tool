@@ -155,6 +155,62 @@ int DrvStepper_Step(DrvStepperAxis_t axis, uint32_t count, uint32_t pulseUs)
     return 0;
 }
 
+static int stepper_move_group(const DrvStepperMoveCommand_t *command)
+{
+    uint32_t counts[DRV_STEPPER_COUNT];
+    uint32_t accumulators[DRV_STEPPER_COUNT] = {0u, 0u, 0u, 0u};
+    uint8_t stepped[DRV_STEPPER_COUNT];
+    uint32_t maximum = 0u;
+    uint32_t tick;
+    uint32_t axis;
+    uint32_t pulseUs;
+
+    if (!command || !s_enabled || s_busy) return -1;
+    pulseUs = command->pulseUs ? command->pulseUs : STEPPER_DEFAULT_US;
+    if (pulseUs < STEPPER_MIN_PULSE_US || pulseUs > STEPPER_MAX_PULSE_US) return -1;
+
+    for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
+        int32_t steps = command->steps[axis];
+        if (steps == (int32_t)0x80000000u) return -1;
+        counts[axis] = (uint32_t)(steps < 0 ? -steps : steps);
+        if (counts[axis] > maximum) maximum = counts[axis];
+    }
+    if (maximum == 0u || maximum > (STEPPER_MAX_MOVE_US / (2u * pulseUs))) return -1;
+
+    for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
+        if (counts[axis] > 0u) {
+            s_steppers[axis].direction = command->steps[axis] > 0 ? 1u : 0u;
+            HAL_GPIO_WritePin(s_steppers[axis].dirPort, s_steppers[axis].dirPin,
+                              s_steppers[axis].direction ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        }
+    }
+
+    s_busy = 1u;
+    for (tick = 0u; tick < maximum; tick++) {
+        memset(stepped, 0, sizeof(stepped));
+        for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
+            accumulators[axis] += counts[axis];
+            if (counts[axis] > 0u && accumulators[axis] >= maximum) {
+                accumulators[axis] -= maximum;
+                HAL_GPIO_WritePin(s_steppers[axis].stepPort,
+                                  s_steppers[axis].stepPin, GPIO_PIN_SET);
+                stepped[axis] = 1u;
+            }
+        }
+        stepper_delay_us(pulseUs);
+        for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
+            if (stepped[axis]) {
+                HAL_GPIO_WritePin(s_steppers[axis].stepPort,
+                                  s_steppers[axis].stepPin, GPIO_PIN_RESET);
+                s_steppers[axis].position += s_steppers[axis].direction ? 1 : -1;
+            }
+        }
+        stepper_delay_us(pulseUs);
+    }
+    s_busy = 0u;
+    return 0;
+}
+
 int32_t DrvStepper_GetPosition(DrvStepperAxis_t axis)
 {
     return stepper_axis_valid(axis) ? s_steppers[axis].position : 0;
@@ -247,6 +303,37 @@ static int stepper_drv_write(void *priv, const uint8_t *buf, uint32_t len)
         return -1;
     }
     return (int)sizeof(command);
+}
+
+static int stepper_group_init(void *priv)
+{
+    (void)priv;
+    stepper_gpio_init();
+    return 0;
+}
+
+static int stepper_group_write(void *priv, const uint8_t *buf, uint32_t len)
+{
+    DrvStepperMoveCommand_t command;
+    (void)priv;
+
+    if (!buf || len != sizeof(command)) return -1;
+    memcpy(&command, buf, sizeof(command));
+    if (stepper_move_group(&command) != 0) return -1;
+    return (int)sizeof(command);
+}
+
+static int stepper_group_ioctl(void *priv, uint32_t cmd, void *arg)
+{
+    (void)priv;
+    if (cmd == DRV_STEPPER_IOCTL_ENABLE && arg) {
+        return DrvStepper_EnableAll(*(int *)arg);
+    }
+    if (cmd == DRV_STEPPER_IOCTL_STOP) {
+        DrvStepper_EnableAll(0);
+        return 0;
+    }
+    return -1;
 }
 
 static int get_enable(char *buf, uint16_t maxLen, void *userData)
@@ -416,6 +503,21 @@ static DrvDevice_t s_stepperDevices[DRV_STEPPER_COUNT] = {
     STEPPER_DEVICE("stepper_e", "E stepper driver", &s_steppers[DRV_STEPPER_E], stepper_params),
 };
 
+static DrvDevice_t s_stepperGroupDevice = {
+    .name = "stepper_group",
+    .desc = "coordinated X/Y/Z/E stepper driver",
+    .bus = DRV_BUS_GPIO,
+    .init = stepper_group_init,
+    .deinit = NULL,
+    .open = NULL,
+    .close = NULL,
+    .read = NULL,
+    .write = stepper_group_write,
+    .ioctl = stepper_group_ioctl,
+    .params = NULL,
+    .privData = NULL
+};
+
 int DrvStepper_Register(void)
 {
     uint32_t i;
@@ -427,6 +529,11 @@ int DrvStepper_Register(void)
             DBG("[Stepper] register %s failed: %d\n", s_steppers[i].axisName, ret);
             return -1;
         }
+    }
+    if (DrvDevice_Register(&s_stepperGroupDevice) != 0) {
+        DrvStepper_EnableAll(0);
+        DBG("[Stepper] register coordinated group failed\n");
+        return -1;
     }
     return 0;
 }

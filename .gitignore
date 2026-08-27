@@ -6,3 +6,7 @@
 /app/MDK-ARM/build_out.txt
 /app/MDK-ARM/startup_stm32f103xe.lst
 /bootlaoder/MDK-ARM/startup_stm32f103xe.lst
+
+# Python cache
+__pycache__/
+*.py[cod]

@@ -2,13 +2,17 @@
 
 本文档面向 Ender-3 V2 主板 APP 开发，描述当前工程中已经接入并通过编译的 Banux 功能。
 
-- 固件版本：`1.0.18`
+- 固件版本：`1.0.19`
 - Banux 框架版本：`V2.0.1`
 - MCU：STM32F103RET6
 - APP 起始地址：`0x08008000`
 - Shell 提示符：`banux$ `
 
 > 本文档以当前 Keil 工程实际链接内容为准。仓库中存在但未加入当前工程的代码，不等于运行时已经启用；请使用 `banux -i` 查看最终状态。
+
+## 组件详细文档
+
+系统组件和应用组件的运行逻辑、调用链、API、Shell 用法及诊断说明统一收录在 [components/README.md](components/README.md)。本指南保留总体架构和常用操作，组件开发与维护应同时查阅对应的详细文档。
 
 ## 1. 目录结构
 
@@ -45,6 +49,8 @@ app/Banux/
 │       ├── vfs/                VFS 核心
 │       └── drv_init.c/.h       纯框架初始化
 ├── 03_application_components/  应用组件
+│   ├── gcode/                  G-code 解析与步进驱动适配
+│   └── firmware_upgrade/       可裁剪固件升级组件
 ├── 04_application/             产品应用层
 └── app_version.h              产品固件版本
 ```
@@ -167,8 +173,9 @@ banux -i
 | 系统 | `shell` | 当前启用 |
 | 系统 | `command_parser` | 当前启用，使用 1 ms 非阻塞调度 |
 | 系统 | `fatfs` | 当前启用 |
-| 系统 | `event_bus` | 描述符已链接，当前配置禁用 |
+| 系统 | `event_bus` | 当前启用，支持命名订阅和订阅树 |
 | 应用 | `firmware_upgrade` | 描述符已链接，当前配置禁用 |
+| 应用 | `gcode` | 当前启用，初始化后注册 `gcode` 命令 |
 
 Bootloader/APP 现有升级通道不等同于 `03_application_components/firmware_upgrade` 组件。后者显示 `disabled` 不代表 `boot` 命令不可用。
 
@@ -179,25 +186,54 @@ Bootloader/APP 现有升级通道不等同于 `03_application_components/firmwar
 ```c
 #include "banux_component.h"
 
-BANUX_COMPONENT_DEFINE(g_banux_component_example,
-                       "example",
-                       "1.0.0",
-                       BANUX_COMPONENT_APPLICATION,
-                       EXAMPLE_COMPONENT_EN,
-                       "example application component");
+BANUX_COMPONENT_DEFINE_EX(g_banux_component_example,
+                          "example",
+                          "1.0.0",
+                          BANUX_COMPONENT_APPLICATION,
+                          EXAMPLE_COMPONENT_EN,
+                          "example application component",
+                          Example_Init,
+                          Example_Process);
 ```
 
-组件初始化完成后更新状态：
+应用组件由 core 在驱动和 Shell 就绪后统一调用 `init`。返回 `0` 时自动进入
+`ready`，否则进入 `failed`；`process` 在每次 `Banux_Process()` 中调用。无需在
+应用组件里手工修改状态。
+
+### 4.3 消息订阅树
+
+运行时使用命名订阅，名称必须是静态字符串：
+
+```c
+BG_Event_SubscribeNamed(EVT_GCODE_STOP,
+                        on_stop,
+                        "motion.emergency_stop");
+```
+
+查询当前订阅关系：
+
+```text
+event -t
+```
+
+输出按 topic 分组：
+
+```text
+Subscription tree: 1 active
++-- EVT_GCODE_STOP [0x0123]
+    +-- gcode.emergency_stop
+```
+
+也可通过 `BG_Event_GetSubscriberCount()` 和
+`BG_Event_GetSubscription()` 在调试器或应用中读取同一份运行时注册表。取消订阅
+后对应节点立即从树中消失。
+
+组件初始化函数示例：
 
 ```c
 int Example_Init(void)
 {
-    int ret = example_hardware_init();
-
-    BanuxComponent_SetState("example", ret == 0
-                            ? BANUX_COMPONENT_READY
-                            : BANUX_COMPONENT_FAILED);
-    return ret;
+    return example_hardware_init();
 }
 ```
 
@@ -529,6 +565,8 @@ DrvEeprom_Write(0, data, sizeof(data));
 | E | PB3 | PB4 | 无 |
 
 四路驱动共用 `PC3` 低电平使能。任意轴修改 `enable` 都会影响全部四路电机。
+`/driver/gpio/stepper_group` 提供 X/Y/Z/E 同步运动的二进制写接口，应用层通过
+`banux_write()` 提交 `DrvStepperMoveCommand_t`，驱动内部使用 DDA 同步发脉冲。
 
 PB3、PB4 和 PA15 原本属于 JTAG 相关引脚。驱动初始化会关闭 JTAG 并保留 SWD 调试。
 
@@ -589,9 +627,50 @@ cat /driver/gpio/stepper_x/limit
 - 上电初始化时 STEP 拉低，共享 EN 拉高，电机默认禁用。
 - 单次命令最多 100000 步。
 - 单次阻塞运动最长 5 秒。
-- 当前脉冲生成是阻塞式软件延时，不适合多轴同步插补。
+- 多轴直线运动使用同步 DDA，但执行期间仍是阻塞式软件脉冲。
 - 当前限位只提供状态，不会自动停止步进命令。
 - 操作前应先确认机械方向和限位状态。
+
+### 9.5 G-code 应用组件
+
+组件目录：`03_application_components/gcode`。应用层不直接访问 GPIO，而是通过
+`banux_write("/driver/gpio/stepper_group", ...)` 和 `banux_ioctl()` 对接步进驱动。
+
+当前支持：
+
+| 指令 | 功能 |
+| --- | --- |
+| `G0` / `G1` | X/Y/Z/E 同步直线脉冲，支持 `F` 进给速度 |
+| `G90` / `G91` | 绝对/相对坐标模式 |
+| `G92` | 设置一个或多个轴的软件坐标 |
+| `M17` | 使能全部步进电机 |
+| `M18` / `M84` | 关闭全部步进电机 |
+| `M114` | 打印当前位置、进给速度和模式 |
+
+单行执行：
+
+```text
+gcode M17
+gcode G90
+gcode G1 X10.000 Y5.000 F1200
+gcode M114
+gcode M84
+```
+
+执行 SD 或内部 Flash 中的文件：
+
+```text
+gcode -f /sd/test.gcode
+gcode -f /flash/test.gcode
+gcode -s
+```
+
+文件支持 UTF-8 BOM、空行、`;` 行尾注释、`(...)` 注释、`N` 行号和 `*` XOR
+校验。遇到未知参数、校验失败或未支持的 G/M 指令会停止文件执行并报告行号。
+
+默认步数为 X/Y=`80 step/mm`、Z=`400 step/mm`、E=`95 step/mm`，可通过
+`GCODE_X_STEPS_PER_MM` 等构建宏覆盖。执行运动前必须先发送 `M17`。当前没有
+加热器和温度驱动，因此温控、风扇和回零指令不会伪实现，而是返回 unsupported。
 
 ## 10. SDIO 与 SD 文件系统
 
@@ -750,6 +829,8 @@ int Example_Register(void)
 #define BANUX_IO_EN               1
 #define COMMAND_PARSER_EN         1
 #define TIMER1MS_EN               COMMAND_PARSER_EN
+#define BG_EVENT_EN               1
+#define BANUX_GCODE_EN            1
 #define STEPPER_LIMIT_ACTIVE_HIGH 1
 ```
 
@@ -760,6 +841,7 @@ int Example_Register(void)
 - 关闭 `BANUX_IO_EN` 后，API 保留但返回 `BANUX_IO_ERR_DISABLED`。
 - 关闭 `COMMAND_PARSER_EN` 后，`run`、`delay` 和异步解析器为空实现。
 - `TIMER1MS_EN` 默认跟随 `COMMAND_PARSER_EN`，也可以单独启用 1 ms 驱动。
+- `BANUX_GCODE_EN` 依赖 `BANUX_IO_EN`、步进驱动和 Shell。
 - `banux -i` 中的组件状态由组件描述符和运行时初始化共同决定。
 
 当前 `00_core/banux_config.h` 还保留了一些其他产品使用的通用开关。是否真正启用应同时检查 Keil 工程源文件和 `banux -i`，不要只根据宏名判断。

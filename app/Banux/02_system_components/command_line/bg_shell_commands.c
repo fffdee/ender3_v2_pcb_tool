@@ -28,6 +28,7 @@
 #include "banux_component.h"
 #include "banux_io.h"
 #include "command_parser.h"
+#include "bg_event.h"
 
 /*============================================================================
  * sys module - System information
@@ -145,6 +146,54 @@ static const ShellOpt_t banux_opts[] = {
 };
 
 DEFINE_MODULE(banux, "Banux framework management", MOD_CAT_SYSTEM, banux_opts);
+
+#if BG_EVENT_EN
+static int event_tree(int argc, char *argv[])
+{
+    BG_EventSubscriptionInfo_t current;
+    BG_EventSubscriptionInfo_t candidate;
+    uint8_t count = BG_Event_GetSubscriberCount();
+    uint8_t i;
+    uint8_t j;
+    uint8_t seen;
+
+    (void)argc;
+    (void)argv;
+    Shell_Printf("\r\nSubscription tree: %u active\r\n", (unsigned int)count);
+    for (i = 0u; i < count; i++) {
+        if (BG_Event_GetSubscription(i, &current) != 0) continue;
+        seen = 0u;
+        for (j = 0u; j < i; j++) {
+            if (BG_Event_GetSubscription(j, &candidate) == 0 &&
+                candidate.topic == current.topic) {
+                seen = 1u;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        Shell_Printf("+-- %s [0x%04X]\r\n",
+                     BG_Event_GetTopicName(current.topic),
+                     (unsigned int)current.topic);
+        for (j = i; j < count; j++) {
+            if (BG_Event_GetSubscription(j, &candidate) == 0 &&
+                candidate.topic == current.topic) {
+                Shell_Printf("    +-- %s\r\n",
+                             candidate.name ? candidate.name : "unnamed");
+            }
+        }
+    }
+    Shell_Print("\r\n");
+    return 0;
+}
+
+static const ShellOpt_t event_opts[] = {
+    OPT("t", "tree", NULL, "Show topic subscription tree", event_tree),
+    OPT_END()
+};
+
+DEFINE_MODULE(event, "Event subscription diagnostics", MOD_CAT_SYSTEM, event_opts);
+#endif
 
 /*============================================================================
  * VFS 文件系统命令模块
@@ -1148,6 +1197,9 @@ void Shell_RegisterAllModules(void)
 {
     REGISTER_MODULE(sys);
     REGISTER_MODULE(banux);
+#if BG_EVENT_EN
+    REGISTER_MODULE(event);
+#endif
 
 #if VFS_EN
     /* 文件系统导航命令 */

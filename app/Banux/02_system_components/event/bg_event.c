@@ -15,6 +15,7 @@
  */
 
 #include "bg_event.h"
+#include "banux_component.h"
 #include <string.h>
 
 #if BG_EVENT_EN  /* 整个文件受 BG_EVENT_EN 控制 */
@@ -39,6 +40,7 @@ extern const BG_EventStaticSub_t __stop_bg_evt_sub  __attribute__((weak));
 typedef struct {
     uint16_t            topic;      /* 订阅的话题 (或 BG_EVT_TOPIC_ANY) */
     BG_EventCallback_t  callback;   /* 回调函数, NULL = 空槽 */
+    const char         *name;
 } BG_EventSubscriber_t;
 
 /* 订阅表 (静态分配) */
@@ -60,6 +62,7 @@ void BG_Event_Init(void)
     s_sub_count = 0;
     s_publishing = 0;
     s_initialized = 1;
+    BanuxComponent_SetState("event_bus", BANUX_COMPONENT_READY);
 
 #if defined(__ARMCC_VERSION) && (__ARMCC_VERSION < 6000000)
     /* AC5: 无 __start_/__stop_ 段符号, BG_EVT_SUB 静态注册已禁用,
@@ -74,7 +77,7 @@ void BG_Event_Init(void)
         if (&__start_bg_evt_sub != NULL) {
             for (p = &__start_bg_evt_sub; p < &__stop_bg_evt_sub; p++) {
                 if (p->callback != (BG_EventCallback_t)0) {
-                    BG_Event_Subscribe(p->topic, p->callback);
+                    BG_Event_SubscribeNamed(p->topic, p->callback, p->name);
                 }
             }
         }
@@ -83,6 +86,12 @@ void BG_Event_Init(void)
 }
 
 int BG_Event_Subscribe(BG_EventTopic_t topic, BG_EventCallback_t callback)
+{
+    return BG_Event_SubscribeNamed(topic, callback, "runtime");
+}
+
+int BG_Event_SubscribeNamed(BG_EventTopic_t topic, BG_EventCallback_t callback,
+                            const char *name)
 {
     uint8_t i;
 
@@ -101,6 +110,7 @@ int BG_Event_Subscribe(BG_EventTopic_t topic, BG_EventCallback_t callback)
         if (s_subscribers[i].callback == NULL) {
             s_subscribers[i].topic = (uint16_t)topic;
             s_subscribers[i].callback = callback;
+            s_subscribers[i].name = name ? name : "unnamed";
             return 0;
         }
     }
@@ -112,6 +122,7 @@ int BG_Event_Subscribe(BG_EventTopic_t topic, BG_EventCallback_t callback)
 
     s_subscribers[s_sub_count].topic = (uint16_t)topic;
     s_subscribers[s_sub_count].callback = callback;
+    s_subscribers[s_sub_count].name = name ? name : "unnamed";
     s_sub_count++;
     return 0;
 }
@@ -126,6 +137,7 @@ int BG_Event_Unsubscribe(BG_EventTopic_t topic, BG_EventCallback_t callback)
         if (s_subscribers[i].callback == callback &&
             s_subscribers[i].topic == (uint16_t)topic) {
             s_subscribers[i].callback = NULL;
+            s_subscribers[i].name = NULL;
             s_subscribers[i].topic = 0;
             return 0;
         }
@@ -165,7 +177,94 @@ int BG_Event_Publish(BG_EventTopic_t topic, const void *data, uint8_t size)
 
 uint8_t BG_Event_GetSubscriberCount(void)
 {
-    return s_sub_count;
+    uint8_t i;
+    uint8_t active = 0u;
+    for (i = 0u; i < s_sub_count; i++) {
+        if (s_subscribers[i].callback) active++;
+    }
+    return active;
+}
+
+int BG_Event_GetSubscription(uint8_t index, BG_EventSubscriptionInfo_t *info)
+{
+    uint8_t i;
+    uint8_t active = 0u;
+
+    if (!info) return -1;
+    for (i = 0u; i < s_sub_count; i++) {
+        if (!s_subscribers[i].callback) continue;
+        if (active++ == index) {
+            info->topic = (BG_EventTopic_t)s_subscribers[i].topic;
+            info->callback = s_subscribers[i].callback;
+            info->name = s_subscribers[i].name;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+const char *BG_Event_GetTopicName(BG_EventTopic_t topic)
+{
+    switch (topic) {
+        case EVT_BTN_CLICK: return "EVT_BTN_CLICK";
+        case EVT_BTN_DOUBLE_CLICK: return "EVT_BTN_DOUBLE_CLICK";
+        case EVT_BTN_LONG_PRESS: return "EVT_BTN_LONG_PRESS";
+        case EVT_BTN_LONG_RELEASE: return "EVT_BTN_LONG_RELEASE";
+        case EVT_BTN_REPEAT: return "EVT_BTN_REPEAT";
+        case EVT_BTN_RAW_DOWN: return "EVT_BTN_RAW_DOWN";
+        case EVT_BTN_RAW_UP: return "EVT_BTN_RAW_UP";
+        case EVT_ENCODER_CW: return "EVT_ENCODER_CW";
+        case EVT_ENCODER_CCW: return "EVT_ENCODER_CCW";
+        case EVT_ENCODER_CLICK: return "EVT_ENCODER_CLICK";
+        case EVT_AUDIO_LINE_IN: return "EVT_AUDIO_LINE_IN";
+        case EVT_AUDIO_MIC_IN: return "EVT_AUDIO_MIC_IN";
+        case EVT_AUDIO_GUITAR_IN: return "EVT_AUDIO_GUITAR_IN";
+        case EVT_AUDIO_HP_OUT: return "EVT_AUDIO_HP_OUT";
+        case EVT_AUDIO_VOLUME_CHG: return "EVT_AUDIO_VOLUME_CHG";
+        case EVT_AUDIO_CLIP: return "EVT_AUDIO_CLIP";
+        case EVT_SYS_BATTERY_LOW: return "EVT_SYS_BATTERY_LOW";
+        case EVT_SYS_BATTERY_CHG: return "EVT_SYS_BATTERY_CHG";
+        case EVT_SYS_USB_CONNECT: return "EVT_SYS_USB_CONNECT";
+        case EVT_SYS_USB_DISCONNECT: return "EVT_SYS_USB_DISCONNECT";
+        case EVT_SYS_BT_CONNECT: return "EVT_SYS_BT_CONNECT";
+        case EVT_SYS_BT_DISCONNECT: return "EVT_SYS_BT_DISCONNECT";
+        case EVT_SYS_BT_STREAMING: return "EVT_SYS_BT_STREAMING";
+        case EVT_SYS_BT_SUSPENDED: return "EVT_SYS_BT_SUSPENDED";
+        case EVT_SYS_POWER_ON: return "EVT_SYS_POWER_ON";
+        case EVT_SYS_POWER_OFF: return "EVT_SYS_POWER_OFF";
+        case EVT_SYS_RUN_STATE: return "EVT_SYS_RUN_STATE";
+        case EVT_SYS_SUB_STATE: return "EVT_SYS_SUB_STATE";
+        case EVT_SYS_IDLE_ENTER: return "EVT_SYS_IDLE_ENTER";
+        case EVT_SYS_IDLE_EXIT: return "EVT_SYS_IDLE_EXIT";
+        case EVT_SYS_TRANSFER_ENTER: return "EVT_SYS_TRANSFER_ENTER";
+        case EVT_SYS_TRANSFER_EXIT: return "EVT_SYS_TRANSFER_EXIT";
+        case EVT_MIDI_NOTE_ON: return "EVT_MIDI_NOTE_ON";
+        case EVT_MIDI_NOTE_OFF: return "EVT_MIDI_NOTE_OFF";
+        case EVT_MIDI_CC: return "EVT_MIDI_CC";
+        case EVT_MIDI_PITCH_BEND: return "EVT_MIDI_PITCH_BEND";
+        case EVT_MIDI_PROGRAM_CHG: return "EVT_MIDI_PROGRAM_CHG";
+        case EVT_LOOPER_REC_START: return "EVT_LOOPER_REC_START";
+        case EVT_LOOPER_REC_STOP: return "EVT_LOOPER_REC_STOP";
+        case EVT_LOOPER_PLAY_START: return "EVT_LOOPER_PLAY_START";
+        case EVT_LOOPER_PLAY_STOP: return "EVT_LOOPER_PLAY_STOP";
+        case EVT_LOOPER_OVERDUB: return "EVT_LOOPER_OVERDUB";
+        case EVT_LOOPER_UNDO: return "EVT_LOOPER_UNDO";
+        case EVT_BLE_CONNECTED: return "EVT_BLE_CONNECTED";
+        case EVT_BLE_DISCONNECTED: return "EVT_BLE_DISCONNECTED";
+        case EVT_BLE_DATA_RECEIVED: return "EVT_BLE_DATA_RECEIVED";
+        case EVT_BLE_CCCD_ENABLED: return "EVT_BLE_CCCD_ENABLED";
+        case EVT_UART_DATA_RECEIVED: return "EVT_UART_DATA_RECEIVED";
+        case EVT_UART_TX_COMPLETE: return "EVT_UART_TX_COMPLETE";
+        case EVT_UART_ERROR: return "EVT_UART_ERROR";
+        case EVT_SHELL_CMD_RECEIVED: return "EVT_SHELL_CMD_RECEIVED";
+        case EVT_SHELL_IO_SWITCH: return "EVT_SHELL_IO_SWITCH";
+        case EVT_GCODE_COMMAND: return "EVT_GCODE_COMMAND";
+        case EVT_GCODE_COMPLETE: return "EVT_GCODE_COMPLETE";
+        case EVT_GCODE_ERROR: return "EVT_GCODE_ERROR";
+        case EVT_GCODE_STOP: return "EVT_GCODE_STOP";
+        case BG_EVT_TOPIC_ANY: return "ANY";
+        default: return "UNKNOWN";
+    }
 }
 
 #endif /* BG_EVENT_EN */

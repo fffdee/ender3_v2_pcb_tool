@@ -41,6 +41,23 @@ extern "C" {
 #define TIMER1MS_EN                 COMMAND_PARSER_EN /* SysTick 1 ms 驱动 */
 #endif
 
+#ifndef BANUX_GCODE_EN
+#define BANUX_GCODE_EN              1
+#endif
+
+#ifndef GCODE_X_STEPS_PER_MM
+#define GCODE_X_STEPS_PER_MM        80
+#endif
+#ifndef GCODE_Y_STEPS_PER_MM
+#define GCODE_Y_STEPS_PER_MM        80
+#endif
+#ifndef GCODE_Z_STEPS_PER_MM
+#define GCODE_Z_STEPS_PER_MM        400
+#endif
+#ifndef GCODE_E_STEPS_PER_MM
+#define GCODE_E_STEPS_PER_MM        95
+#endif
+
 #ifndef BANUX_INTERNAL_FLASH_FS_EN
 #define BANUX_INTERNAL_FLASH_FS_EN  BANUX_FATFS_EN /* 独立挂载 20 KB Flash FAT12 */
 #endif
