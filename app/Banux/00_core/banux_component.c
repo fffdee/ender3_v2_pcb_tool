@@ -8,8 +8,10 @@ BANUX_COMPONENT_DECLARE(g_banux_component_file_io);
 BANUX_COMPONENT_DECLARE(g_banux_component_shell);
 BANUX_COMPONENT_DECLARE(g_banux_component_command_parser);
 BANUX_COMPONENT_DECLARE(g_banux_component_fatfs);
+BANUX_COMPONENT_DECLARE(g_banux_component_internal_flash_fs);
 BANUX_COMPONENT_DECLARE(g_banux_component_event_bus);
 BANUX_COMPONENT_DECLARE(g_banux_component_firmware_upgrade);
+BANUX_COMPONENT_DECLARE(g_banux_component_gcode);
 
 static const BanuxComponentDescriptor_t *const g_static_components[] = {
     &g_banux_component_vfs,
@@ -18,8 +20,10 @@ static const BanuxComponentDescriptor_t *const g_static_components[] = {
     &g_banux_component_shell,
     &g_banux_component_command_parser,
     &g_banux_component_fatfs,
+    &g_banux_component_internal_flash_fs,
     &g_banux_component_event_bus,
-    &g_banux_component_firmware_upgrade
+    &g_banux_component_firmware_upgrade,
+    &g_banux_component_gcode
 };
 
 static BanuxComponentInfo_t g_components[BANUX_COMPONENT_MAX];
@@ -39,6 +43,39 @@ void BanuxComponent_Init(void)
         g_components[i].state = g_static_components[i]->enabled
                               ? BANUX_COMPONENT_REGISTERED
                               : BANUX_COMPONENT_DISABLED;
+    }
+}
+
+int BanuxComponent_StartType(BanuxComponentType_t type)
+{
+    uint8_t i;
+    int failures = 0;
+
+    for (i = 0u; i < g_component_count; i++) {
+        const BanuxComponentDescriptor_t *descriptor = g_components[i].descriptor;
+        int result;
+
+        if (descriptor->type != type || !descriptor->enabled || !descriptor->init) {
+            continue;
+        }
+        result = descriptor->init();
+        g_components[i].state = result == 0
+                              ? BANUX_COMPONENT_READY
+                              : BANUX_COMPONENT_FAILED;
+        if (result != 0) failures++;
+    }
+    return failures ? -failures : 0;
+}
+
+void BanuxComponent_ProcessAll(void)
+{
+    uint8_t i;
+
+    for (i = 0u; i < g_component_count; i++) {
+        const BanuxComponentDescriptor_t *descriptor = g_components[i].descriptor;
+        if (g_components[i].state == BANUX_COMPONENT_READY && descriptor->process) {
+            descriptor->process();
+        }
     }
 }
 

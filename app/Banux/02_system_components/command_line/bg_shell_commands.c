@@ -28,6 +28,7 @@
 #include "banux_component.h"
 #include "banux_io.h"
 #include "command_parser.h"
+#include "bg_event.h"
 
 /*============================================================================
  * sys module - System information
@@ -145,6 +146,54 @@ static const ShellOpt_t banux_opts[] = {
 };
 
 DEFINE_MODULE(banux, "Banux framework management", MOD_CAT_SYSTEM, banux_opts);
+
+#if BG_EVENT_EN
+static int event_tree(int argc, char *argv[])
+{
+    BG_EventSubscriptionInfo_t current;
+    BG_EventSubscriptionInfo_t candidate;
+    uint8_t count = BG_Event_GetSubscriberCount();
+    uint8_t i;
+    uint8_t j;
+    uint8_t seen;
+
+    (void)argc;
+    (void)argv;
+    Shell_Printf("\r\nSubscription tree: %u active\r\n", (unsigned int)count);
+    for (i = 0u; i < count; i++) {
+        if (BG_Event_GetSubscription(i, &current) != 0) continue;
+        seen = 0u;
+        for (j = 0u; j < i; j++) {
+            if (BG_Event_GetSubscription(j, &candidate) == 0 &&
+                candidate.topic == current.topic) {
+                seen = 1u;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        Shell_Printf("+-- %s [0x%04X]\r\n",
+                     BG_Event_GetTopicName(current.topic),
+                     (unsigned int)current.topic);
+        for (j = i; j < count; j++) {
+            if (BG_Event_GetSubscription(j, &candidate) == 0 &&
+                candidate.topic == current.topic) {
+                Shell_Printf("    +-- %s\r\n",
+                             candidate.name ? candidate.name : "unnamed");
+            }
+        }
+    }
+    Shell_Print("\r\n");
+    return 0;
+}
+
+static const ShellOpt_t event_opts[] = {
+    OPT("t", "tree", NULL, "Show topic subscription tree", event_tree),
+    OPT_END()
+};
+
+DEFINE_MODULE(event, "Event subscription diagnostics", MOD_CAT_SYSTEM, event_opts);
+#endif
 
 /*============================================================================
  * VFS 文件系统命令模块
@@ -585,11 +634,11 @@ static int cmd_touch(int argc, char *argv[])
 }
 
 static const ShellOpt_t touch_opts[] = {
-    OPT("", "", "<file> [file...]", "Create SD file", cmd_touch),
+    OPT("", "", "<file> [file...]", "Create filesystem file", cmd_touch),
     OPT_END()
 };
 
-DEFINE_MODULE(touch, "Create SD file", MOD_CAT_SYSTEM, touch_opts);
+DEFINE_MODULE(touch, "Create filesystem file", MOD_CAT_SYSTEM, touch_opts);
 
 static int cmd_mkdir(int argc, char *argv[])
 {
@@ -610,11 +659,11 @@ static int cmd_mkdir(int argc, char *argv[])
 }
 
 static const ShellOpt_t mkdir_opts[] = {
-    OPT("", "", "<directory> [directory...]", "Create SD directory", cmd_mkdir),
+    OPT("", "", "<directory> [directory...]", "Create filesystem directory", cmd_mkdir),
     OPT_END()
 };
 
-DEFINE_MODULE(mkdir, "Create SD directory", MOD_CAT_SYSTEM, mkdir_opts);
+DEFINE_MODULE(mkdir, "Create filesystem directory", MOD_CAT_SYSTEM, mkdir_opts);
 
 static int cmd_rm(int argc, char *argv[])
 {
@@ -635,11 +684,11 @@ static int cmd_rm(int argc, char *argv[])
 }
 
 static const ShellOpt_t rm_opts[] = {
-    OPT("", "", "<path> [path...]", "Remove SD file or empty directory", cmd_rm),
+    OPT("", "", "<path> [path...]", "Remove file or empty directory", cmd_rm),
     OPT_END()
 };
 
-DEFINE_MODULE(rm, "Remove SD file or empty directory", MOD_CAT_SYSTEM, rm_opts);
+DEFINE_MODULE(rm, "Remove file or empty directory", MOD_CAT_SYSTEM, rm_opts);
 
 static int cmd_vim(int argc, char *argv[])
 {
@@ -661,7 +710,7 @@ static int cmd_vim(int argc, char *argv[])
         node = DrvFs_FindNode(argv[0]);
     }
     if (!node || node->type != FS_NODE_FILE) {
-        Shell_Printf("vim: %s: not an SD file\r\n", argv[0]);
+        Shell_Printf("vim: %s: not a filesystem file\r\n", argv[0]);
         return -1;
     }
     if (node->fileSize >= EDITOR_BUFFER_SIZE) {
@@ -696,11 +745,11 @@ static int cmd_vim(int argc, char *argv[])
 }
 
 static const ShellOpt_t vim_opts[] = {
-    OPT("", "", "<file>", "Edit SD text file", cmd_vim),
+    OPT("", "", "<file>", "Edit filesystem text file", cmd_vim),
     OPT_END()
 };
 
-DEFINE_MODULE(vim, "Edit SD text file", MOD_CAT_SYSTEM, vim_opts);
+DEFINE_MODULE(vim, "Edit filesystem text file", MOD_CAT_SYSTEM, vim_opts);
 
 /*============================================================================
  * run module - Execute UTF-8 command script
@@ -1148,6 +1197,9 @@ void Shell_RegisterAllModules(void)
 {
     REGISTER_MODULE(sys);
     REGISTER_MODULE(banux);
+#if BG_EVENT_EN
+    REGISTER_MODULE(event);
+#endif
 
 #if VFS_EN
     /* 文件系统导航命令 */

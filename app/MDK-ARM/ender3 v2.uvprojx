@@ -339,7 +339,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xE</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;../Banux;../Banux/00_core;../Banux/01_driver;../Banux/01_driver/eeprom;../Banux/01_driver/sd;../Banux/01_driver/stepper;../Banux/01_driver/timer;../Banux/01_driver/uart;../Banux/inc;../Banux/02_system_components/file_io;../Banux/02_system_components/command_line;../Banux/02_system_components/command_parser;../Banux/02_system_components/event;../Banux/02_system_components/fatfs/app;../Banux/02_system_components/fatfs/target;../Banux/02_system_components/fatfs/src;../Banux/02_system_components/fatfs/src/drivers;../Banux/02_system_components/driver_framework;../Banux/02_system_components/driver_framework/core;../Banux/02_system_components/driver_framework/vfs</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;../Banux;../Banux/00_core;../Banux/01_driver;../Banux/01_driver/eeprom;../Banux/01_driver/internal_flash;../Banux/01_driver/sd;../Banux/01_driver/stepper;../Banux/01_driver/timer;../Banux/01_driver/uart;../Banux/inc;../Banux/02_system_components/file_io;../Banux/02_system_components/command_line;../Banux/02_system_components/command_parser;../Banux/02_system_components/event;../Banux/02_system_components/internal_flash_fs;../Banux/02_system_components/fatfs/app;../Banux/02_system_components/fatfs/target;../Banux/02_system_components/fatfs/src;../Banux/02_system_components/fatfs/src/drivers;../Banux/02_system_components/driver_framework;../Banux/02_system_components/driver_framework/core;../Banux/02_system_components/driver_framework/vfs;../Banux/03_application_components/gcode</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -499,6 +499,11 @@
               <FilePath>../Banux/01_driver/sd/drv_sdio.c</FilePath>
             </File>
             <File>
+              <FileName>internal_flash_diskio.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/01_driver/internal_flash/internal_flash_diskio.c</FilePath>
+            </File>
+            <File>
               <FileName>fs_sd.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Banux/01_driver/sd/fs_sd.c</FilePath>
@@ -547,6 +552,16 @@
               <FileName>driver_init.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Banux/01_driver/driver_init.c</FilePath>
+            </File>
+            <File>
+              <FileName>internal_flash_fs.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c</FilePath>
+            </File>
+            <File>
+              <FileName>gcode.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/03_application_components/gcode/gcode.c</FilePath>
             </File>
           </Files>
         </Group>

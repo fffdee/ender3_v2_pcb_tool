@@ -30,6 +30,12 @@ extern "C" {
  */
 int  SdFs_Mount(void);
 
+/** Mount an additional FatFs logical drive at a VFS root directory. */
+int  FatFsVfs_Mount(const char *mountName, uint8_t drive);
+
+/** Remove a logical-drive VFS mount. */
+void FatFsVfs_Unmount(uint8_t drive);
+
 /**
  * @brief  移除 /sd 挂载点（卸载文件系统）
  */

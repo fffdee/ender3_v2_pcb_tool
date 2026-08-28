@@ -77,6 +77,11 @@ int banux_close(const char *path)
 
 int banux_read(const char *path, void *data, uint32_t len)
 {
+    return banux_read_at(path, data, len, 0u);
+}
+
+int banux_read_at(const char *path, void *data, uint32_t len, uint32_t offset)
+{
 #if BANUX_IO_EN
     VfsNode_t *node;
     DrvDevice_t *device;
@@ -96,11 +101,11 @@ int banux_read(const char *path, void *data, uint32_t len)
         return Vfs_ReadParam(node, (char *)data, (uint16_t)len);
     }
     if (node->type == VFS_NODE_FILE) {
-        return Vfs_ReadFile(node, (char *)data, (uint16_t)len, 0u);
+        return Vfs_ReadFile(node, (char *)data, (uint16_t)len, offset);
     }
     return BANUX_IO_ERR_WRONG_TYPE;
 #else
-    (void)path; (void)data; (void)len;
+    (void)path; (void)data; (void)len; (void)offset;
     return BANUX_IO_ERR_DISABLED;
 #endif
 }

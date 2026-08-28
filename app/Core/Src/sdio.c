@@ -49,7 +49,8 @@ void MX_SDIO_SD_Init(void)
   /* Polling reads can be interrupted by the 2 Mbaud UART. Hardware flow
    * control lets SDIO pause the card clock before the receive FIFO overruns. */
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_ENABLE;
-  hsd.Init.ClockDiv = 8;
+  /* Keep extra timing margin for compatible controller/card combinations. */
+  hsd.Init.ClockDiv = 24;
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */

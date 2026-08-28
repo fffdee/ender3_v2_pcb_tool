@@ -79,7 +79,14 @@ typedef void (*BG_EventCallback_t)(BG_EventTopic_t topic, const void *data, uint
 typedef struct {
     uint16_t            topic;      /**< 订阅话题 ID */
     BG_EventCallback_t  callback;   /**< 回调函数指针 */
+    const char         *name;       /**< 静态订阅者名称 */
 } BG_EventStaticSub_t;
+
+typedef struct {
+    BG_EventTopic_t topic;
+    BG_EventCallback_t callback;
+    const char *name;
+} BG_EventSubscriptionInfo_t;
 
 /* ============================================
  * API
@@ -104,6 +111,10 @@ void BG_Event_Init(void);
  */
 int BG_Event_Subscribe(BG_EventTopic_t topic, BG_EventCallback_t callback);
 
+/** Register a named subscriber. Name must remain valid for the subscription lifetime. */
+int BG_Event_SubscribeNamed(BG_EventTopic_t topic, BG_EventCallback_t callback,
+                            const char *name);
+
 /**
  * @brief 取消订阅
  * @param topic     话题 ID
@@ -126,6 +137,12 @@ int BG_Event_Publish(BG_EventTopic_t topic, const void *data, uint8_t size);
  * @return 已使用的槽数
  */
 uint8_t BG_Event_GetSubscriberCount(void);
+
+/** Read the Nth active subscription for diagnostics. */
+int BG_Event_GetSubscription(uint8_t index, BG_EventSubscriptionInfo_t *info);
+
+/** Return a stable symbolic topic name, or "UNKNOWN". */
+const char *BG_Event_GetTopicName(BG_EventTopic_t topic);
 
 /* ============================================
  * 编译期静态注册宏 (核心)
@@ -166,7 +183,7 @@ uint8_t BG_Event_GetSubscriberCount(void);
     static const BG_EventStaticSub_t                                    \
     __attribute__((used, section("bg_evt_sub")))                        \
     _BG_EVT_CAT(_bg_evt_, __COUNTER__) = {                              \
-        (uint16_t)(topic), (cb)                                         \
+        (uint16_t)(topic), (cb), #cb                                    \
     }
 #endif
 
@@ -197,9 +214,12 @@ uint8_t BG_Event_GetSubscriberCount(void);
 /* BG_EVENT_EN=0 时所有 API 替换为空操作，调用方无需修改 */
 #define BG_Event_Init()                         ((void)0)
 #define BG_Event_Subscribe(topic, cb)           (0)
+#define BG_Event_SubscribeNamed(topic, cb, name) (0)
 #define BG_Event_Unsubscribe(topic, cb)         (0)
 #define BG_Event_Publish(topic, data, size)     (0)
 #define BG_Event_GetSubscriberCount()           (0)
+#define BG_Event_GetSubscription(index, info)   (-1)
+#define BG_Event_GetTopicName(topic)             ("DISABLED")
 #define BG_EVT_SUB(topic, cb)                   /* disabled */
 #define BG_EVT_PUB(topic)                       ((void)0)
 #define BG_EVT_PUB_DATA(topic, pdata, sz)       ((void)0)

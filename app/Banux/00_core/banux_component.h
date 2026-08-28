@@ -26,12 +26,17 @@ typedef enum {
     BANUX_COMPONENT_FAILED
 } BanuxComponentState_t;
 
+typedef int (*BanuxComponentInit_t)(void);
+typedef void (*BanuxComponentProcess_t)(void);
+
 typedef struct {
     const char *name;
     const char *version;
     const char *description;
     BanuxComponentType_t type;
     uint8_t enabled;
+    BanuxComponentInit_t init;
+    BanuxComponentProcess_t process;
 } BanuxComponentDescriptor_t;
 
 typedef struct {
@@ -46,13 +51,25 @@ typedef struct {
                                component_type, component_enabled, component_desc) \
     const BanuxComponentDescriptor_t symbol = {                          \
         component_name, component_version, component_desc,               \
-        component_type, (uint8_t)((component_enabled) ? 1u : 0u)         \
+        component_type, (uint8_t)((component_enabled) ? 1u : 0u),        \
+        (BanuxComponentInit_t)0, (BanuxComponentProcess_t)0               \
+    }
+
+#define BANUX_COMPONENT_DEFINE_EX(symbol, component_name, component_version, \
+                                  component_type, component_enabled,          \
+                                  component_desc, init_fn, process_fn)        \
+    const BanuxComponentDescriptor_t symbol = {                              \
+        component_name, component_version, component_desc,                   \
+        component_type, (uint8_t)((component_enabled) ? 1u : 0u),            \
+        init_fn, process_fn                                                   \
     }
 
 #define BANUX_COMPONENT_DECLARE(symbol) \
     extern const BanuxComponentDescriptor_t symbol
 
 void BanuxComponent_Init(void);
+int BanuxComponent_StartType(BanuxComponentType_t type);
+void BanuxComponent_ProcessAll(void);
 int BanuxComponent_SetState(const char *name, BanuxComponentState_t state);
 uint8_t BanuxComponent_GetCount(void);
 const BanuxComponentInfo_t *BanuxComponent_Get(uint8_t index);

@@ -6,6 +6,7 @@
 #include "banux_scheduler.h"
 #include "drv_init.h"
 #include "bg_event.h"
+#include "internal_flash_fs.h"
 
 static BanuxCallback_t g_setup_callback;
 static BanuxCallback_t g_loop_callback;
@@ -47,10 +48,13 @@ int Banux_Init(const BanuxConfig_t *config)
         if (ret != 0) return -3;
     }
 
+    (void)InternalFlashFs_Init();
+
     if (!Shell_Init()) return -4;
     if (!Shell_SetIO(config->shellIo)) return -5;
     Shell_RegisterAllModules();
     CommandParser_Init();
+    (void)BanuxComponent_StartType(BANUX_COMPONENT_APPLICATION);
 
     g_started = 1u;
     Shell_Print("\r\n[APP] Banux ready: banux -i / help -a / ls / drivers / boot\r\n");
@@ -62,6 +66,7 @@ void Banux_Process(void)
 {
     if (!g_started) return;
     if (g_platform_process) g_platform_process();
+    BanuxComponent_ProcessAll();
     BanuxScheduler_Process();
 }
 

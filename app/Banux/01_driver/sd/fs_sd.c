@@ -21,12 +21,62 @@
 #include "ff.h"             /* f_opendir / f_readdir / f_open ... */
 #include "debug.h"
 
-#define SD_MOUNT_NAME       "sd"
+#define FATFS_VFS_VOLUME_COUNT  2u
 
-static VfsNode_t *s_sdMountNode = NULL;
+typedef struct {
+    VfsNode_t *mountNode;
+    uint8_t drive;
+} FatFsVfsVolume_t;
+
+static FatFsVfsVolume_t s_volumes[FATFS_VFS_VOLUME_COUNT];
 static FIL s_file;
 static DIR s_dir;
 static FILINFO s_fileInfo;
+
+static int is_valid_sfn(const char *name)
+{
+    static const char allowed[] = "!#$%&'()-@^_`{}~.";
+    const unsigned char *p = (const unsigned char *)name;
+    uint8_t len = 0u;
+
+    if (!name || !name[0]) return 0;
+    while (*p) {
+        if (++len > 12u) return 0;
+        if (!((*p >= '0' && *p <= '9') ||
+              (*p >= 'A' && *p <= 'Z') ||
+              (*p >= 'a' && *p <= 'z') ||
+              strchr(allowed, *p))) {
+            return 0;
+        }
+        p++;
+    }
+    return 1;
+}
+
+static void log_invalid_sfn(const char *volumePath, const FILINFO *info)
+{
+    const uint8_t *name = (const uint8_t *)info->fname;
+    DBG("[FatFsVfs] skipped corrupt directory entry: volume=%s "
+        "attr=0x%02X name=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+        volumePath, (unsigned int)info->fattrib,
+        name[0], name[1], name[2], name[3], name[4], name[5], name[6],
+        name[7], name[8], name[9], name[10], name[11], name[12]);
+}
+
+static FatFsVfsVolume_t *find_volume(VfsNode_t *node)
+{
+    uint8_t i;
+    VfsNode_t *cur;
+
+    for (i = 0u; i < FATFS_VFS_VOLUME_COUNT; i++) {
+        cur = node;
+        while (cur) {
+            if (cur == s_volumes[i].mountNode) return &s_volumes[i];
+            cur = cur->parent;
+        }
+    }
+    return NULL;
+}
 
 static const char *path_name(const char *path)
 {
@@ -44,16 +94,19 @@ static const char *path_name(const char *path)
 static int build_fatfs_path(VfsNode_t *node, char *buf, uint16_t maxLen)
 {
     char tmp[VFS_MAX_PATH_LEN];
+    FatFsVfsVolume_t *volume;
     VfsNode_t *cur;
     int pos, len;
 
     if (!node || !buf || maxLen == 0) return -1;
+    volume = find_volume(node);
+    if (!volume) return -1;
 
     /* 从节点向上回溯, 逐段拼出相对挂载点的路径 */
     tmp[VFS_MAX_PATH_LEN - 1] = '\0';
     pos = VFS_MAX_PATH_LEN - 1;
     cur = node;
-    while (cur && cur != s_sdMountNode && cur->name[0] != '\0') {
+    while (cur && cur != volume->mountNode && cur->name[0] != '\0') {
         len = (int)strlen(cur->name);
         if (len <= 0) break;
         pos -= len;
@@ -66,14 +119,14 @@ static int build_fatfs_path(VfsNode_t *node, char *buf, uint16_t maxLen)
 
     if (pos >= VFS_MAX_PATH_LEN - 1) {
         /* 节点就是挂载点本身 -> FatFs 根目录 */
-        snprintf(buf, maxLen, "0:/");
+        snprintf(buf, maxLen, "%u:/", (unsigned int)volume->drive);
         return 0;
     }
 
     /* 前缀卷号: pos 处已是一个 '/' */
     pos -= 2;
     if (pos < 0) return -1;
-    tmp[pos]     = '0';
+    tmp[pos]     = (char)('0' + volume->drive);
     tmp[pos + 1] = ':';
     strncpy(buf, &tmp[pos], maxLen - 1);
     buf[maxLen - 1] = '\0';
@@ -88,7 +141,6 @@ static int resolve_file_path(const char *vfsPath, VfsNode_t **parentOut,
     char *slash;
     const char *name;
     VfsNode_t *parent;
-    VfsNode_t *cur;
     size_t len;
 
     if (!vfsPath || !parentOut || !fatPath || fatPathLen == 0) return -1;
@@ -118,9 +170,7 @@ static int resolve_file_path(const char *vfsPath, VfsNode_t **parentOut,
         return -1;
     }
 
-    cur = parent;
-    while (cur && cur != s_sdMountNode) cur = cur->parent;
-    if (cur != s_sdMountNode) return -1;
+    if (!find_volume(parent)) return -1;
 
     if (build_fatfs_path(parent, fatPath, fatPathLen) != 0) return -1;
     len = strlen(fatPath);
@@ -152,7 +202,7 @@ static int sd_file_read(char *buf, uint16_t maxLen, uint32_t offset, void *userD
 
     fres = f_open(&s_file, path, FA_READ);
     if (fres != FR_OK) {
-        DBG("[SdFs] f_open(%s) failed: %d\n", path, (int)fres);
+        DBG("[FatFsVfs] f_open(%s) failed: %d\n", path, (int)fres);
         return -1;
     }
     if (offset > 0) {
@@ -204,6 +254,10 @@ static int sd_dir_load(VfsNode_t *node, void *userData)
         if (s_fileInfo.fattrib & (AM_VOL | AM_HID)) {
             continue;
         }
+        if (!is_valid_sfn(s_fileInfo.fname)) {
+            log_invalid_sfn(path, &s_fileInfo);
+            continue;
+        }
         if (s_fileInfo.fattrib & AM_DIR) {
             child = Vfs_CreateNode(node, s_fileInfo.fname, VFS_NODE_DIR, NULL);
             if (!child) break;                       /* 子节点数/节点池耗尽 */
@@ -224,15 +278,20 @@ int SdFs_Touch(const char *vfsPath)
     char path[VFS_MAX_PATH_LEN];
     VfsNode_t *parent;
 
-    if (!s_sdMountNode ||
-        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+    if (resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
         return -1;
     }
 
     fres = f_open(&s_file, path, FA_OPEN_ALWAYS | FA_WRITE);
-    if (fres != FR_OK) return -(int)fres;
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] touch open failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
     fres = f_close(&s_file);
-    if (fres != FR_OK) return -(int)fres;
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] touch close failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
     if (!Vfs_FindNode(vfsPath) &&
         !Vfs_CreateFile(parent, path_name(vfsPath), 0u, sd_file_read, NULL)) {
         return -1;
@@ -247,19 +306,26 @@ int SdFs_WriteFile(const char *vfsPath, const uint8_t *data, uint32_t len)
     char path[VFS_MAX_PATH_LEN];
     VfsNode_t *parent;
 
-    if ((!data && len > 0) || !s_sdMountNode ||
+    if ((!data && len > 0) ||
         resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
         return -1;
     }
 
     fres = f_open(&s_file, path, FA_CREATE_ALWAYS | FA_WRITE);
-    if (fres != FR_OK) return -(int)fres;
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] write open failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
     if (len > 0) {
         fres = f_write(&s_file, data, (UINT)len, &written);
     }
     if (fres == FR_OK) fres = f_sync(&s_file);
     if (f_close(&s_file) != FR_OK && fres == FR_OK) fres = FR_DISK_ERR;
-    if (fres != FR_OK || written != (UINT)len) return -(int)FR_DISK_ERR;
+    if (fres != FR_OK || written != (UINT)len) {
+        DBG("[FatFsVfs] write failed: path=%s result=%d bytes=%u/%lu\n",
+            path, (int)fres, (unsigned int)written, (unsigned long)len);
+        return fres != FR_OK ? -(int)fres : -(int)FR_DISK_ERR;
+    }
 
     {
         VfsNode_t *node = Vfs_FindNode(vfsPath);
@@ -277,13 +343,15 @@ int SdFs_Mkdir(const char *vfsPath)
     char path[VFS_MAX_PATH_LEN];
     VfsNode_t *parent;
 
-    if (!s_sdMountNode ||
-        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+    if (resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
         return -1;
     }
 
     fres = f_mkdir(path);
-    if (fres != FR_OK) return -(int)fres;
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] mkdir failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
     {
         VfsNode_t *node = Vfs_CreateNode(parent, path_name(vfsPath),
                                          VFS_NODE_DIR, NULL);
@@ -301,8 +369,7 @@ int SdFs_Remove(const char *vfsPath)
     VfsNode_t *target;
     VfsNode_t *cur;
 
-    if (!s_sdMountNode ||
-        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+    if (resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
         return -1;
     }
 
@@ -316,7 +383,10 @@ int SdFs_Remove(const char *vfsPath)
     }
 
     fres = f_unlink(path);
-    if (fres != FR_OK) return -(int)fres;
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] remove failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
     if (target) (void)Vfs_RemoveNode(target);
     return 0;
 }
@@ -324,32 +394,46 @@ int SdFs_Remove(const char *vfsPath)
 /*===========================================================================
  * 挂载 / 卸载
  *===========================================================================*/
-int SdFs_Mount(void)
+int FatFsVfs_Mount(const char *mountName, uint8_t drive)
 {
-    if (s_sdMountNode) {
-        return 0;                                    /* 已挂载 */
-    }
-    if (!DrvSdio_IsMounted()) {
-        DBG("[SdFs] FATFS not mounted, skip VFS mount\n");
-        return -1;
-    }
+    FatFsVfsVolume_t *volume;
 
-    s_sdMountNode = Vfs_CreateDir(Vfs_GetRoot(), SD_MOUNT_NAME);
-    if (!s_sdMountNode) {
-        DBG("[SdFs] ERROR: create /%s failed\n", SD_MOUNT_NAME);
+    if (!mountName || drive >= FATFS_VFS_VOLUME_COUNT) return -1;
+    volume = &s_volumes[drive];
+    if (volume->mountNode) return 0;
+
+    volume->mountNode = Vfs_CreateDir(Vfs_GetRoot(), mountName);
+    if (!volume->mountNode) {
+        DBG("[FatFsVfs] ERROR: create /%s failed\n", mountName);
         return -2;
     }
-    s_sdMountNode->dirLoad = sd_dir_load;
-    Vfs_RefreshDir(s_sdMountNode);                   /* 立即枚举根目录 */
-    DBG("[SdFs] SD filesystem mounted to /%s\n", SD_MOUNT_NAME);
+    volume->drive = drive;
+    volume->mountNode->dirLoad = sd_dir_load;
+    Vfs_RefreshDir(volume->mountNode);
+    DBG("[FatFsVfs] volume %u: mounted to /%s\n",
+        (unsigned int)drive, mountName);
     return 0;
+}
+
+void FatFsVfs_Unmount(uint8_t drive)
+{
+    if (drive < FATFS_VFS_VOLUME_COUNT && s_volumes[drive].mountNode) {
+        Vfs_RemoveNode(s_volumes[drive].mountNode);
+        s_volumes[drive].mountNode = NULL;
+        DBG("[FatFsVfs] volume %u unmounted\n", (unsigned int)drive);
+    }
+}
+
+int SdFs_Mount(void)
+{
+    if (!DrvSdio_IsMounted()) {
+        DBG("[SdFs] SD FATFS not mounted, skip VFS mount\n");
+        return -1;
+    }
+    return FatFsVfs_Mount("sd", 0u);
 }
 
 void SdFs_Unmount(void)
 {
-    if (s_sdMountNode) {
-        Vfs_RemoveNode(s_sdMountNode);
-        s_sdMountNode = NULL;
-        DBG("[SdFs] SD filesystem unmounted\n");
-    }
+    FatFsVfs_Unmount(0u);
 }

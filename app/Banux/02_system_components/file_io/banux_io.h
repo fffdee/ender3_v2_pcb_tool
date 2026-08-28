@@ -28,6 +28,7 @@ void BanuxIo_Init(void);
 int banux_open(const char *path);
 int banux_close(const char *path);
 int banux_read(const char *path, void *data, uint32_t len);
+int banux_read_at(const char *path, void *data, uint32_t len, uint32_t offset);
 int banux_write(const char *path, const void *data, uint32_t len);
 int banux_ioctl(const char *path, uint32_t command, void *argument);
 

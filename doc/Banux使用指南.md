@@ -2,13 +2,17 @@
 
 本文档面向 Ender-3 V2 主板 APP 开发，描述当前工程中已经接入并通过编译的 Banux 功能。
 
-- 固件版本：`1.0.14`
+- 固件版本：`1.0.19`
 - Banux 框架版本：`V2.0.1`
 - MCU：STM32F103RET6
 - APP 起始地址：`0x08008000`
 - Shell 提示符：`banux$ `
 
 > 本文档以当前 Keil 工程实际链接内容为准。仓库中存在但未加入当前工程的代码，不等于运行时已经启用；请使用 `banux -i` 查看最终状态。
+
+## 组件详细文档
+
+系统组件和应用组件的运行逻辑、调用链、API、Shell 用法及诊断说明统一收录在 [components/README.md](components/README.md)。本指南保留总体架构和常用操作，组件开发与维护应同时查阅对应的详细文档。
 
 ## 1. 目录结构
 
@@ -24,6 +28,7 @@ app/Banux/
 ├── 01_driver/                  具体硬件驱动（依赖框架）
 │   ├── driver_init.c/.h        Ender-3 V2 驱动注册入口
 │   ├── eeprom/                 BL24C16A EEPROM
+│   ├── internal_flash/         20 KB 内部 Flash 块设备
 │   ├── sd/                     SDIO 和 FatFs/VFS 挂载适配
 │   ├── stepper/                X/Y/Z/E 步进电机与限位
 │   ├── timer/                  SysTick 1 ms 时基
@@ -34,6 +39,7 @@ app/Banux/
 │   ├── command_line/           Shell、命令模块和 UART IO
 │   ├── command_parser/         UTF-8 脚本与非阻塞定时调度
 │   ├── event/                  发布/订阅消息系统
+│   ├── internal_flash_fs/      独立 20 KB Flash FAT 系统组件
 │   ├── fatfs/                  FatFs 核心、Cube 适配层与 SD diskio
 │   │   ├── app/                MX_FATFS_Init 和逻辑盘对象
 │   │   ├── target/             STM32F1 SDIO BSP 与 ffconf
@@ -43,6 +49,8 @@ app/Banux/
 │       ├── vfs/                VFS 核心
 │       └── drv_init.c/.h       纯框架初始化
 ├── 03_application_components/  应用组件
+│   ├── gcode/                  G-code 解析与步进驱动适配
+│   └── firmware_upgrade/       可裁剪固件升级组件
 ├── 04_application/             产品应用层
 └── app_version.h              产品固件版本
 ```
@@ -51,7 +59,7 @@ app/Banux/
 
 ## 2. 系统架构
 
-Banux 的系统组件按职责拆分为六部分：
+Banux 的主要系统组件按职责拆分如下：
 
 1. 文件读写系统：向应用提供 `banux_read()`、`banux_write()` 等统一接口。
 2. 命令行系统：处理 UART 输入、命令注册、参数拆分和交互输出。
@@ -59,6 +67,8 @@ Banux 的系统组件按职责拆分为六部分：
 4. 消息订阅系统：提供事件发布/订阅接口。
 5. VFS 系统：维护目录、设备、参数和文件节点。
 6. 驱动框架：提供通用设备模型并挂载到 `/driver/<bus>/<device>`。
+7. FatFs：提供 SD 和内部 Flash 的 FAT12/FAT16/FAT32 文件系统支持。
+8. 内部 Flash 文件系统：可裁剪的 20 KB 独立逻辑卷，挂载到 `/flash`。
 
 具体硬件驱动不是系统组件。它们位于 `01_driver`，只依赖驱动框架公开的 `DrvDevice_t`、`DrvFs_*` 和 VFS 接口。移植 Banux 到其他主板时，可以完整复用 `00_core` 与 `02_system_components`，替换 `01_driver` 即可。
 
@@ -112,8 +122,21 @@ while (1) {
 - `DrvFramework_Init()` 必须早于任何设备注册。
 - `Shell_Init()` 必须早于 `Shell_RegisterAllModules()`，否则 Shell 初始化会清空模块表。
 - SDIO 驱动注册成功后才会创建 `/sd` 挂载点。
+- `BANUX_INTERNAL_FLASH_FS_EN` 使能后始终创建 `/flash`，不依赖 SD 是否存在。
 
 文件系统统一使用 `app/Banux/02_system_components/fatfs` 中的 STM32Cube/Elm-Chan FatFs；工程不再保留 Banux 外部或第二套 FAT32 实现。
+
+FatFs 使用两个相互独立的逻辑卷：SD 固定为 `0:` 并挂载 `/sd`；内部 Flash 固定为 `1:` 并挂载 `/flash`。两者可以同时使用，SD 初始化失败不会改变 Flash 的卷号或挂载路径。Flash 区域为 `0x0807A000..0x0807EFFF`，位于 APP 升级区和 Bootloader 配置页之间。内部 Flash 擦写寿命有限，只适合配置、小脚本和低频文件更新，不适合作为连续日志盘。
+
+可通过驱动属性确认 SD 状态：
+
+```text
+cat /driver/sdio/sd/backend
+cat /driver/sdio/sd/size_kb
+cat /driver/sdio/sd/free_kb
+```
+
+`backend` 固定返回 `sd`。内部 Flash 组件首次使用会自动格式化；Bootloader 常规 APP 升级只擦除到 `0x08078000`，不会清除 `/flash`。使用 Keil 全片擦除下载则会清空它。
 
 ## 4. 组件管理
 
@@ -150,8 +173,9 @@ banux -i
 | 系统 | `shell` | 当前启用 |
 | 系统 | `command_parser` | 当前启用，使用 1 ms 非阻塞调度 |
 | 系统 | `fatfs` | 当前启用 |
-| 系统 | `event_bus` | 描述符已链接，当前配置禁用 |
+| 系统 | `event_bus` | 当前启用，支持命名订阅和订阅树 |
 | 应用 | `firmware_upgrade` | 描述符已链接，当前配置禁用 |
+| 应用 | `gcode` | 当前启用，初始化后注册 `gcode` 命令 |
 
 Bootloader/APP 现有升级通道不等同于 `03_application_components/firmware_upgrade` 组件。后者显示 `disabled` 不代表 `boot` 命令不可用。
 
@@ -162,25 +186,54 @@ Bootloader/APP 现有升级通道不等同于 `03_application_components/firmwar
 ```c
 #include "banux_component.h"
 
-BANUX_COMPONENT_DEFINE(g_banux_component_example,
-                       "example",
-                       "1.0.0",
-                       BANUX_COMPONENT_APPLICATION,
-                       EXAMPLE_COMPONENT_EN,
-                       "example application component");
+BANUX_COMPONENT_DEFINE_EX(g_banux_component_example,
+                          "example",
+                          "1.0.0",
+                          BANUX_COMPONENT_APPLICATION,
+                          EXAMPLE_COMPONENT_EN,
+                          "example application component",
+                          Example_Init,
+                          Example_Process);
 ```
 
-组件初始化完成后更新状态：
+应用组件由 core 在驱动和 Shell 就绪后统一调用 `init`。返回 `0` 时自动进入
+`ready`，否则进入 `failed`；`process` 在每次 `Banux_Process()` 中调用。无需在
+应用组件里手工修改状态。
+
+### 4.3 消息订阅树
+
+运行时使用命名订阅，名称必须是静态字符串：
+
+```c
+BG_Event_SubscribeNamed(EVT_GCODE_STOP,
+                        on_stop,
+                        "motion.emergency_stop");
+```
+
+查询当前订阅关系：
+
+```text
+event -t
+```
+
+输出按 topic 分组：
+
+```text
+Subscription tree: 1 active
++-- EVT_GCODE_STOP [0x0123]
+    +-- gcode.emergency_stop
+```
+
+也可通过 `BG_Event_GetSubscriberCount()` 和
+`BG_Event_GetSubscription()` 在调试器或应用中读取同一份运行时注册表。取消订阅
+后对应节点立即从树中消失。
+
+组件初始化函数示例：
 
 ```c
 int Example_Init(void)
 {
-    int ret = example_hardware_init();
-
-    BanuxComponent_SetState("example", ret == 0
-                            ? BANUX_COMPONENT_READY
-                            : BANUX_COMPONENT_FAILED);
-    return ret;
+    return example_hardware_init();
 }
 ```
 
@@ -512,6 +565,8 @@ DrvEeprom_Write(0, data, sizeof(data));
 | E | PB3 | PB4 | 无 |
 
 四路驱动共用 `PC3` 低电平使能。任意轴修改 `enable` 都会影响全部四路电机。
+`/driver/gpio/stepper_group` 提供 X/Y/Z/E 同步运动的二进制写接口，应用层通过
+`banux_write()` 提交 `DrvStepperMoveCommand_t`，驱动内部使用 DDA 同步发脉冲。
 
 PB3、PB4 和 PA15 原本属于 JTAG 相关引脚。驱动初始化会关闭 JTAG 并保留 SWD 调试。
 
@@ -572,9 +627,50 @@ cat /driver/gpio/stepper_x/limit
 - 上电初始化时 STEP 拉低，共享 EN 拉高，电机默认禁用。
 - 单次命令最多 100000 步。
 - 单次阻塞运动最长 5 秒。
-- 当前脉冲生成是阻塞式软件延时，不适合多轴同步插补。
+- 多轴直线运动使用同步 DDA，但执行期间仍是阻塞式软件脉冲。
 - 当前限位只提供状态，不会自动停止步进命令。
 - 操作前应先确认机械方向和限位状态。
+
+### 9.5 G-code 应用组件
+
+组件目录：`03_application_components/gcode`。应用层不直接访问 GPIO，而是通过
+`banux_write("/driver/gpio/stepper_group", ...)` 和 `banux_ioctl()` 对接步进驱动。
+
+当前支持：
+
+| 指令 | 功能 |
+| --- | --- |
+| `G0` / `G1` | X/Y/Z/E 同步直线脉冲，支持 `F` 进给速度 |
+| `G90` / `G91` | 绝对/相对坐标模式 |
+| `G92` | 设置一个或多个轴的软件坐标 |
+| `M17` | 使能全部步进电机 |
+| `M18` / `M84` | 关闭全部步进电机 |
+| `M114` | 打印当前位置、进给速度和模式 |
+
+单行执行：
+
+```text
+gcode M17
+gcode G90
+gcode G1 X10.000 Y5.000 F1200
+gcode M114
+gcode M84
+```
+
+执行 SD 或内部 Flash 中的文件：
+
+```text
+gcode -f /sd/test.gcode
+gcode -f /flash/test.gcode
+gcode -s
+```
+
+文件支持 UTF-8 BOM、空行、`;` 行尾注释、`(...)` 注释、`N` 行号和 `*` XOR
+校验。遇到未知参数、校验失败或未支持的 G/M 指令会停止文件执行并报告行号。
+
+默认步数为 X/Y=`80 step/mm`、Z=`400 step/mm`、E=`95 step/mm`，可通过
+`GCODE_X_STEPS_PER_MM` 等构建宏覆盖。执行运动前必须先发送 `M17`。当前没有
+加热器和温度驱动，因此温控、风扇和回零指令不会伪实现，而是返回 unsupported。
 
 ## 10. SDIO 与 SD 文件系统
 
@@ -618,6 +714,17 @@ vim /sd/config/startup.txt
 cat /sd/config/startup.txt
 run /sd/config/startup.txt
 rm /sd/config/startup.txt
+```
+
+内部 Flash 组件使能后可同时使用 `/flash`：
+
+```text
+ls /flash
+mkdir /flash/config
+touch /flash/config/startup.txt
+vim /flash/config/startup.txt
+cat /flash/config/startup.txt
+rm /flash/config/startup.txt
 ```
 
 `rm` 删除目录时要求目录为空。不要删除当前工作目录或它的父目录。
@@ -722,6 +829,8 @@ int Example_Register(void)
 #define BANUX_IO_EN               1
 #define COMMAND_PARSER_EN         1
 #define TIMER1MS_EN               COMMAND_PARSER_EN
+#define BG_EVENT_EN               1
+#define BANUX_GCODE_EN            1
 #define STEPPER_LIMIT_ACTIVE_HIGH 1
 ```
 
@@ -732,6 +841,7 @@ int Example_Register(void)
 - 关闭 `BANUX_IO_EN` 后，API 保留但返回 `BANUX_IO_ERR_DISABLED`。
 - 关闭 `COMMAND_PARSER_EN` 后，`run`、`delay` 和异步解析器为空实现。
 - `TIMER1MS_EN` 默认跟随 `COMMAND_PARSER_EN`，也可以单独启用 1 ms 驱动。
+- `BANUX_GCODE_EN` 依赖 `BANUX_IO_EN`、步进驱动和 Shell。
 - `banux -i` 中的组件状态由组件描述符和运行时初始化共同决定。
 
 当前 `00_core/banux_config.h` 还保留了一些其他产品使用的通用开关。是否真正启用应同时检查 Keil 工程源文件和 `banux -i`，不要只根据宏名判断。
@@ -798,6 +908,8 @@ cat /driver/sdio/sd/mount
 ### 15.5 SD 文件操作后复位或死机
 
 当前工程为 FatFs 调用预留 `0x1000` 字节主栈，并把扇区缓冲、`FIL`、`DIR` 和 `FILINFO` 放在静态工作区。VFS 动态目录只在首次访问时枚举；`touch`、`mkdir`、`vim` 和 `rm` 成功后只增量更新对应节点，不再清空整棵子树。脚本解析器也会按路径重新取得文件节点，避免目录刷新后继续使用失效指针。
+
+SD diskio 对所有读写使用 4 字节对齐的 512 字节中转缓冲，并逐扇区调用 STM32 HAL。Polling 写扇区期间只暂停 UART1/UART3 中断，避免 2 Mbaud 串口抢占造成 SDIO TX FIFO 下溢，SysTick 仍保持运行。SDIO 固定使用 rising 采样沿和较低总线时钟，不再因瞬态读错在运行中切换边沿。部分卡会在数据实际写入后让 STM32 SDIO 报数据 CRC 错误；驱动会等待卡就绪并回读比较该扇区，内容一致时按成功处理。目录枚举会拒绝非法 8.3 项并输出 `[FatFsVfs] skipped corrupt directory entry` 诊断；该日志表示介质上已有坏目录项，需要在电脑上运行 FAT 修复或重新格式化。
 
 建议依次验证：
 

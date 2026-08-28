@@ -32,6 +32,7 @@
 /* can be used to modify / undefine following code or add new definitions */
 /* USER CODE END FirstSection */
 /* Includes ------------------------------------------------------------------*/
+#include <string.h>
 #include "bsp_driver_sd.h"
 
 /* Extern variables ---------------------------------------------------------*/
@@ -44,17 +45,65 @@ extern SD_HandleTypeDef hsd;
 #define BSP_SD_USE_4BIT_BUS 0
 #endif
 
-static uint8_t BSP_SD_ReinitAlternateEdge(void)
+#if defined(__CC_ARM)
+__align(4) static uint8_t s_writeVerifyBuffer[512];
+#elif defined(__GNUC__)
+static uint8_t s_writeVerifyBuffer[512] __attribute__((aligned(4)));
+#else
+static uint8_t s_writeVerifyBuffer[512];
+#endif
+
+static HAL_StatusTypeDef BSP_SD_WritePolling(uint32_t *pData,
+                                             uint32_t writeAddr,
+                                             uint32_t numOfBlocks,
+                                             uint32_t timeout)
 {
-  if (HAL_SD_DeInit(&hsd) != HAL_OK)
+  uint32_t uart1Enabled = NVIC_GetEnableIRQ(USART1_IRQn);
+  uint32_t uart3Enabled = NVIC_GetEnableIRQ(USART3_IRQn);
+  HAL_StatusTypeDef status;
+
+  /* Polling TX must keep the FIFO fed. At 2 Mbaud, UART interrupts can hold
+   * the CPU long enough for SDIO to report TXUNDERR during a 512-byte write. */
+  HAL_NVIC_DisableIRQ(USART1_IRQn);
+  HAL_NVIC_DisableIRQ(USART3_IRQn);
+  status = HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, writeAddr,
+                              numOfBlocks, timeout);
+  if (uart1Enabled) HAL_NVIC_EnableIRQ(USART1_IRQn);
+  if (uart3Enabled) HAL_NVIC_EnableIRQ(USART3_IRQn);
+  return status;
+}
+
+static uint8_t BSP_SD_VerifySingleBlock(const uint32_t *expected,
+                                        uint32_t blockAddr,
+                                        uint32_t timeout)
+{
+  uint32_t tickstart = HAL_GetTick();
+  uint32_t uart1Enabled;
+  uint32_t uart3Enabled;
+  HAL_StatusTypeDef status;
+
+  while (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER)
+  {
+    if ((HAL_GetTick() - tickstart) >= timeout)
+    {
+      return MSD_ERROR;
+    }
+  }
+
+  uart1Enabled = NVIC_GetEnableIRQ(USART1_IRQn);
+  uart3Enabled = NVIC_GetEnableIRQ(USART3_IRQn);
+  HAL_NVIC_DisableIRQ(USART1_IRQn);
+  HAL_NVIC_DisableIRQ(USART3_IRQn);
+  status = HAL_SD_ReadBlocks(&hsd, s_writeVerifyBuffer, blockAddr, 1u, timeout);
+  if (uart1Enabled) HAL_NVIC_EnableIRQ(USART1_IRQn);
+  if (uart3Enabled) HAL_NVIC_EnableIRQ(USART3_IRQn);
+
+  if (status != HAL_OK ||
+      memcmp(s_writeVerifyBuffer, expected, sizeof(s_writeVerifyBuffer)) != 0)
   {
     return MSD_ERROR;
   }
-
-  hsd.Init.ClockEdge = (hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_RISING) ?
-                       SDIO_CLOCK_EDGE_FALLING : SDIO_CLOCK_EDGE_RISING;
-
-  return (HAL_SD_Init(&hsd) == HAL_OK) ? MSD_OK : MSD_ERROR;
+  return MSD_OK;
 }
 /* USER CODE END BeforeInitSection */
 /**
@@ -70,6 +119,7 @@ __weak uint8_t BSP_SD_Init(void)
     return MSD_ERROR;
   }
   /* HAL SD initialization */
+  hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
   sd_state = HAL_SD_Init(&hsd);
 #if BSP_SD_USE_4BIT_BUS
   /* Configure SD Bus width (4 bits mode selected) */
@@ -127,15 +177,6 @@ __weak uint8_t BSP_SD_ReadBlocks(uint32_t *pData, uint32_t ReadAddr, uint32_t Nu
     return MSD_OK;
   }
 
-  /* Creality 4.2.x boards have enough clock-path variation that some MCU/card
-   * combinations need the opposite SDIO sampling edge. Reinitialize the card
-   * to flush the receive FIFO, switch edge, and retry the block once. */
-  if (BSP_SD_ReinitAlternateEdge() == MSD_OK &&
-      HAL_SD_ReadBlocks(&hsd, (uint8_t *)pData, ReadAddr, NumOfBlocks, Timeout) == HAL_OK)
-  {
-    return MSD_OK;
-  }
-
   return MSD_ERROR;
 }
 
@@ -152,13 +193,16 @@ __weak uint8_t BSP_SD_ReadBlocks(uint32_t *pData, uint32_t ReadAddr, uint32_t Nu
   */
 __weak uint8_t BSP_SD_WriteBlocks(uint32_t *pData, uint32_t WriteAddr, uint32_t NumOfBlocks, uint32_t Timeout)
 {
-  if (HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, WriteAddr, NumOfBlocks, Timeout) == HAL_OK)
+  uint32_t writeError;
+
+  if (BSP_SD_WritePolling(pData, WriteAddr, NumOfBlocks, Timeout) == HAL_OK)
   {
     return MSD_OK;
   }
-
-  if (BSP_SD_ReinitAlternateEdge() == MSD_OK &&
-      HAL_SD_WriteBlocks(&hsd, (uint8_t *)pData, WriteAddr, NumOfBlocks, Timeout) == HAL_OK)
+  writeError = hsd.ErrorCode;
+  if (NumOfBlocks == 1u &&
+      writeError == HAL_SD_ERROR_DATA_CRC_FAIL &&
+      BSP_SD_VerifySingleBlock(pData, WriteAddr, Timeout) == MSD_OK)
   {
     return MSD_OK;
   }

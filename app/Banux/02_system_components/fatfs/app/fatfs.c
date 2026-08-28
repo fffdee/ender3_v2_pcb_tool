@@ -25,10 +25,13 @@ BANUX_COMPONENT_DEFINE(g_banux_component_fatfs,
                        BANUX_FATFS_EN,
                        "FAT filesystem support");
 
-uint8_t retSD;    /* Return value for SD */
+uint8_t retSD = 1u;    /* Return value for SD */
 char SDPath[4];   /* SD logical drive path */
 FATFS SDFatFS;    /* File system object for SD logical drive */
 FIL SDFile;       /* File object for SD */
+uint8_t retFlash = 1u;
+char FlashPath[4];
+FATFS FlashFatFS;
 
 /* USER CODE BEGIN Variables */
 
@@ -37,13 +40,20 @@ FIL SDFile;       /* File object for SD */
 void MX_FATFS_Init(void)
 {
 #if BANUX_FATFS_EN
-  /*## FatFS: Link the SD driver ###########################*/
-  retSD = FATFS_LinkDriver(&SD_Driver, SDPath);
-  BanuxComponent_SetState("fatfs", retSD == 0u
+  retSD = FATFS_LinkDriver((Diskio_drvTypeDef *)&SD_Driver, SDPath);
+#if BANUX_INTERNAL_FLASH_FS_EN
+  retFlash = FATFS_LinkDriver((Diskio_drvTypeDef *)&InternalFlash_Driver,
+                              FlashPath);
+#else
+  retFlash = 1u;
+#endif
+  BanuxComponent_SetState("fatfs", retSD == 0u &&
+                          (!BANUX_INTERNAL_FLASH_FS_EN || retFlash == 0u)
                           ? BANUX_COMPONENT_READY
                           : BANUX_COMPONENT_FAILED);
 #else
   retSD = 1u;
+  retFlash = 1u;
 #endif
 
   /* USER CODE BEGIN Init */
