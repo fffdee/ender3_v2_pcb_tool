@@ -752,6 +752,151 @@ static const ShellOpt_t vim_opts[] = {
 DEFINE_MODULE(vim, "Edit filesystem text file", MOD_CAT_SYSTEM, vim_opts);
 
 /*============================================================================
+ * recv module - Chunked file receiver for wireless/serial upload
+ *===========================================================================*/
+
+#define RECV_DECODE_MAX  64u
+
+static int recv_b64_value(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+}
+
+static int recv_b64_decode(const char *src, uint8_t *out, uint16_t outMax,
+                           uint16_t *outLen)
+{
+    uint16_t written = 0u;
+
+    if (!src || !out || !outLen) return -1;
+    while (*src) {
+        int v[4];
+        uint8_t pad = 0u;
+        uint8_t i;
+
+        for (i = 0u; i < 4u; i++) {
+            char ch = *src++;
+            if (ch == '\0') return -2;
+            if (ch == '=') {
+                v[i] = 0;
+                pad++;
+            } else {
+                if (pad > 0u) return -3;
+                v[i] = recv_b64_value(ch);
+                if (v[i] < 0) return -4;
+            }
+        }
+
+        if (pad > 2u || written + 3u - pad > outMax) return -5;
+        out[written++] = (uint8_t)((v[0] << 2) | (v[1] >> 4));
+        if (pad < 2u) {
+            out[written++] = (uint8_t)((v[1] << 4) | (v[2] >> 2));
+        }
+        if (pad < 1u) {
+            out[written++] = (uint8_t)((v[2] << 6) | v[3]);
+        }
+        if (pad > 0u && *src != '\0') return -6;
+    }
+
+    *outLen = written;
+    return 0;
+}
+
+static int recv_clear_path(const char *path)
+{
+    int ret = SdFs_WriteFile(path, NULL, 0u);
+    if (ret != 0) {
+        Shell_Printf("recv: clear %s failed (%d)\r\n", path, ret);
+        return ret;
+    }
+    Shell_Printf("OK clear %s\r\n", path);
+    return 0;
+}
+
+static int recv_write_block(const char *path, const char *offsetText,
+                            const char *base64Text)
+{
+    uint8_t data[RECV_DECODE_MAX];
+    uint16_t dataLen = 0u;
+    uint32_t offset;
+    char *end;
+    int ret;
+
+    offset = (uint32_t)strtoul(offsetText, &end, 10);
+    if (end == offsetText || *end != '\0') {
+        Shell_Print("recv: invalid offset\r\n");
+        return -4;
+    }
+    ret = recv_b64_decode(base64Text, data, sizeof(data), &dataLen);
+    if (ret != 0) {
+        Shell_Printf("recv: invalid base64 (%d)\r\n", ret);
+        return -5;
+    }
+    ret = SdFs_WriteFileAt(path, data, dataLen, offset);
+    if (ret != 0) {
+        Shell_Printf("recv: write %s @%lu failed (%d)\r\n",
+                     path, (unsigned long)offset, ret);
+        return ret;
+    }
+    Shell_Printf("OK block %lu %u\r\n", (unsigned long)offset,
+                 (unsigned int)dataLen);
+    return 0;
+}
+
+static int cmd_recv(int argc, char *argv[])
+{
+    if (argc < 2) {
+        Shell_Print("Usage:\r\n");
+        Shell_Print("  recv -c <path>\r\n");
+        Shell_Print("  recv -b <path> <offset> <base64>\r\n");
+        return -1;
+    }
+
+    if (strcmp(argv[0], "-c") == 0 || strcmp(argv[0], "clear") == 0) {
+        return recv_clear_path(argv[1]);
+    }
+
+    if ((strcmp(argv[0], "-b") == 0 || strcmp(argv[0], "block") == 0) &&
+        argc == 4) {
+        return recv_write_block(argv[1], argv[2], argv[3]);
+    }
+    Shell_Print("recv: unknown option\r\n");
+    return -2;
+}
+
+static int cmd_recv_clear(int argc, char *argv[])
+{
+    if (argc != 1) {
+        Shell_Print("Usage: recv -c <path>\r\n");
+        return -1;
+    }
+    return recv_clear_path(argv[0]);
+}
+
+static int cmd_recv_block(int argc, char *argv[])
+{
+    if (argc != 3) {
+        Shell_Print("Usage: recv -b <path> <offset> <base64>\r\n");
+        return -1;
+    }
+    return recv_write_block(argv[0], argv[1], argv[2]);
+}
+
+static const ShellOpt_t recv_opts[] = {
+    OPT("", "", "-c <path> | -b <path> <offset> <base64>",
+        "Receive file chunks over shell", cmd_recv),
+    OPT("c", "clear", "<path>", "Create/truncate destination file", cmd_recv_clear),
+    OPT("b", "block", "<path> <offset> <base64>", "Write one base64 chunk", cmd_recv_block),
+    OPT_END()
+};
+
+DEFINE_MODULE(recv, "Receive file chunks", MOD_CAT_SYSTEM, recv_opts);
+
+/*============================================================================
  * run module - Execute UTF-8 command script
  *===========================================================================*/
 
@@ -1211,6 +1356,7 @@ void Shell_RegisterAllModules(void)
     REGISTER_MODULE(mkdir);
     REGISTER_MODULE(rm);
     REGISTER_MODULE(vim);
+    REGISTER_MODULE(recv);
     CommandParser_RegisterCommands();
     REGISTER_MODULE(echo);    /* 写入参数值 */
     REGISTER_MODULE(tree);

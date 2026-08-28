@@ -45,6 +45,10 @@ extern "C" {
 #define BANUX_GCODE_EN              1
 #endif
 
+#ifndef BANUX_WIRELESS_CONTROL_EN
+#define BANUX_WIRELESS_CONTROL_EN   1   /* ESP8266 WiFi bridge control */
+#endif
+
 #ifndef GCODE_X_STEPS_PER_MM
 #define GCODE_X_STEPS_PER_MM        80
 #endif

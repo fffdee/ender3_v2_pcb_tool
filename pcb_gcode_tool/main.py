@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import re
+import socket
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,11 +19,11 @@ import openpyxl
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem,
-    QToolBar, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QStyle, QTableWidget,
+    QTableWidgetItem, QToolBar, QVBoxLayout, QWidget,
 )
 
 try:
@@ -28,6 +34,19 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_2_2026_08_27.xlsx"
+DISCOVERY_PORT = 8267
+BRIDGE_PORT = 8266
+UPLOAD_CHUNK_SIZE = 48
+
+
+@dataclass
+class WirelessDevice:
+    name: str
+    ip: str
+    bridge_port: int = BRIDGE_PORT
+    http_port: int = 80
+    wifi: str = ""
+    ap: bool = False
 
 
 @dataclass
@@ -190,13 +209,16 @@ class MainWindow(QMainWindow):
         self.gerber_warnings: list[str] = []
         self.current_file: Path | None = None
         self._updating_table = False
+        self.devices: list[WirelessDevice] = []
+        self.connected_device: WirelessDevice | None = None
+        self.bridge_socket: socket.socket | None = None
         self.setWindowTitle("Banux PCB 锡膏路径生成器")
         self.resize(1440, 860)
         self.setMinimumSize(1050, 680)
         self._build_ui()
         self._connect_signals()
         self._apply_style()
-        target = initial_file or (DEFAULT_WORKBOOK if DEFAULT_WORKBOOK.exists() else None)
+        target = initial_file
         if target:
             QTimer.singleShot(0, lambda: self.import_workbook(target, show_error=False))
         if initial_gerber:
@@ -216,9 +238,12 @@ class MainWindow(QMainWindow):
         self.import_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "导入 XLSX", self)
         self.import_gerber_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "导入 Gerber", self)
         self.export_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "导出 G-code", self)
-        toolbar.addAction(self.import_action)
+        self.start_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "开始", self)
+        self.settings_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "无线设置", self)
         toolbar.addAction(self.import_gerber_action)
         toolbar.addAction(self.export_action)
+        toolbar.addAction(self.start_action)
+        toolbar.addAction(self.settings_action)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_settings())
@@ -226,9 +251,15 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_points())
         splitter.setSizes([290, 760, 390])
         splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(splitter)
+        self.prepare_page = splitter
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.prepare_page)
+        self.start_page = self._build_start_page()
+        self.pages.addWidget(self.start_page)
+        self.setCentralWidget(self.pages)
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("请选择 PCB 坐标表")
+        self.statusBar().showMessage("请选择 Gerber Paste 文件")
+        self.update_start_enabled()
 
     def _spin(self, value: float, minimum: float = -100000.0,
               maximum: float = 100000.0, step: float = 0.1,
@@ -344,15 +375,121 @@ class MainWindow(QMainWindow):
         code_title = QLabel("G-code 预览")
         code_title.setObjectName("sectionTitle")
         self.copy_button = QPushButton("复制")
+        self.go_start_button = QPushButton("开始")
         code_header.addWidget(code_title)
         code_header.addStretch()
         code_header.addWidget(self.copy_button)
+        code_header.addWidget(self.go_start_button)
         layout.addLayout(code_header)
         self.gcode_preview = QPlainTextEdit()
         self.gcode_preview.setReadOnly(True)
         self.gcode_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.gcode_preview.setFont(QFont("Consolas", 9))
         layout.addWidget(self.gcode_preview, 2)
+        return panel
+
+    def _build_start_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QHBoxLayout(page)
+        page_layout.setContentsMargins(18, 16, 18, 16)
+        page_layout.setSpacing(12)
+        left_panel = QWidget()
+        layout = QVBoxLayout(left_panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        connection = QGroupBox("无线连接")
+        grid = QGridLayout(connection)
+        self.device_combo = QComboBox()
+        self.device_info_label = QLabel("未搜索")
+        self.device_info_label.setObjectName("muted")
+        self.search_device_button = QPushButton("搜索设备")
+        self.connect_device_button = QPushButton("连接")
+        self.disconnect_device_button = QPushButton("断开")
+        grid.addWidget(QLabel("设备"), 0, 0)
+        grid.addWidget(self.device_combo, 0, 1, 1, 3)
+        grid.addWidget(self.search_device_button, 0, 4)
+        grid.addWidget(self.connect_device_button, 0, 5)
+        grid.addWidget(self.disconnect_device_button, 0, 6)
+        grid.addWidget(self.device_info_label, 1, 1, 1, 6)
+
+        transfer = QGroupBox("G-code 传输与执行")
+        transfer_grid = QGridLayout(transfer)
+        self.storage_combo = QComboBox()
+        self.storage_combo.addItems(["/flash", "/sd"])
+        self.remote_path_edit = QLineEdit("/flash/pcb_solder_paste.gcode")
+        self.upload_button = QPushButton("传到设备")
+        self.execute_button = QPushButton("执行")
+        self.transfer_progress = QLabel("0%")
+        self.transfer_progress.setObjectName("statValue")
+        transfer_grid.addWidget(QLabel("存储"), 0, 0)
+        transfer_grid.addWidget(self.storage_combo, 0, 1)
+        transfer_grid.addWidget(QLabel("路径"), 0, 2)
+        transfer_grid.addWidget(self.remote_path_edit, 0, 3, 1, 3)
+        transfer_grid.addWidget(self.upload_button, 0, 6)
+        transfer_grid.addWidget(self.execute_button, 0, 7)
+        transfer_grid.addWidget(QLabel("进度"), 1, 0)
+        transfer_grid.addWidget(self.transfer_progress, 1, 1, 1, 7)
+
+        self.connection_log = QPlainTextEdit()
+        self.connection_log.setReadOnly(True)
+        self.connection_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.connection_log.setFont(QFont("Consolas", 9))
+
+        layout.addWidget(connection)
+        layout.addWidget(transfer)
+        layout.addWidget(QLabel("通信日志"))
+        layout.addWidget(self.connection_log, 1)
+        page_layout.addWidget(left_panel, 1)
+        page_layout.addWidget(self._build_manual_console())
+        return page
+
+    def _build_manual_console(self) -> QWidget:
+        panel = QGroupBox("手动操作台")
+        panel.setMinimumWidth(280)
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+
+        motion = QFormLayout()
+        self.jog_step = self._spin(1.0, 0.01, 100.0, 0.1)
+        self.jog_feed = self._spin(600.0, 1.0, 10000.0, 50.0, 0)
+        self.extruder_step = self._spin(0.2, 0.001, 100.0, 0.01, 3)
+        motion.addRow("步距 (mm)", self.jog_step)
+        motion.addRow("速度", self.jog_feed)
+        motion.addRow("挤出量 E", self.extruder_step)
+        layout.addLayout(motion)
+
+        xyz_grid = QGridLayout()
+        self.y_plus_button = QPushButton("Y+")
+        self.y_minus_button = QPushButton("Y-")
+        self.x_minus_button = QPushButton("X-")
+        self.x_plus_button = QPushButton("X+")
+        self.z_plus_button = QPushButton("Z+")
+        self.z_minus_button = QPushButton("Z-")
+        xyz_grid.addWidget(self.y_plus_button, 0, 1)
+        xyz_grid.addWidget(self.x_minus_button, 1, 0)
+        xyz_grid.addWidget(self.x_plus_button, 1, 2)
+        xyz_grid.addWidget(self.y_minus_button, 2, 1)
+        xyz_grid.addWidget(self.z_plus_button, 0, 3)
+        xyz_grid.addWidget(self.z_minus_button, 2, 3)
+        layout.addLayout(xyz_grid)
+
+        extruder_row = QHBoxLayout()
+        self.e_minus_button = QPushButton("E-")
+        self.e_plus_button = QPushButton("E+")
+        extruder_row.addWidget(self.e_minus_button)
+        extruder_row.addWidget(self.e_plus_button)
+        layout.addLayout(extruder_row)
+
+        utility_row = QHBoxLayout()
+        self.motor_on_button = QPushButton("使能")
+        self.motor_off_button = QPushButton("释放")
+        self.status_button = QPushButton("状态")
+        utility_row.addWidget(self.motor_on_button)
+        utility_row.addWidget(self.motor_off_button)
+        utility_row.addWidget(self.status_button)
+        layout.addLayout(utility_row)
+        layout.addStretch()
         return panel
 
     def _build_points(self) -> QWidget:
@@ -405,6 +542,8 @@ class MainWindow(QMainWindow):
         self.import_action.triggered.connect(self.choose_workbook)
         self.import_gerber_action.triggered.connect(self.choose_gerber)
         self.export_action.triggered.connect(self.export_gcode)
+        self.start_action.triggered.connect(self.show_start_page)
+        self.settings_action.triggered.connect(self.show_wireless_settings)
         self.sheet_combo.currentIndexChanged.connect(self.sheet_changed)
         for widget in [self.mode_combo, self.source_combo, self.origin_combo, self.order_combo, self.layer_combo]:
             widget.currentIndexChanged.connect(self.refresh)
@@ -420,6 +559,24 @@ class MainWindow(QMainWindow):
         self.select_button.clicked.connect(lambda: self.select_visible(True))
         self.clear_button.clicked.connect(lambda: self.select_visible(False))
         self.copy_button.clicked.connect(self.copy_gcode)
+        self.go_start_button.clicked.connect(self.show_start_page)
+        self.search_device_button.clicked.connect(self.discover_wireless_devices)
+        self.connect_device_button.clicked.connect(self.connect_wireless_device)
+        self.disconnect_device_button.clicked.connect(self.disconnect_wireless_device)
+        self.storage_combo.currentTextChanged.connect(self.update_remote_path_root)
+        self.upload_button.clicked.connect(self.upload_gcode_to_device)
+        self.execute_button.clicked.connect(self.execute_remote_gcode)
+        self.x_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("X", -1.0))
+        self.x_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("X", 1.0))
+        self.y_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("Y", -1.0))
+        self.y_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("Y", 1.0))
+        self.z_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("Z", -1.0))
+        self.z_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("Z", 1.0))
+        self.e_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("E", -1.0))
+        self.e_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("E", 1.0))
+        self.motor_on_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode M17"))
+        self.motor_off_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode M84"))
+        self.status_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode -s"))
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
@@ -702,6 +859,7 @@ class MainWindow(QMainWindow):
         self.distance_label.setText(f"{distance:.1f} mm")
         self.time_label.setText(f"{seconds:.0f} s" if seconds < 60 else f"{seconds / 60:.1f} min")
         self.line_count.setText(str(len(gcode.rstrip().splitlines())))
+        self.update_start_enabled()
 
     def _update_board_size(self, points: list[PointData], pads: list[GerberPad]) -> None:
         xs = [p.x for p in points]
@@ -878,6 +1036,362 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(exc))
             return
         self.statusBar().showMessage(f"已导出 {file_name}", 4000)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.disconnect_wireless_device(show_status=False)
+        super().closeEvent(event)
+
+    def has_prepared_job(self) -> bool:
+        if self.mode_combo.currentIndex() == 1:
+            return bool(self.current_gerber and self.selected_pad_ids and self.gcode_preview.toPlainText().strip())
+        return bool(self.current_file and self.selected_ids and self.gcode_preview.toPlainText().strip())
+
+    def update_start_enabled(self) -> None:
+        enabled = self.has_prepared_job()
+        self.start_action.setEnabled(enabled)
+        self.go_start_button.setEnabled(enabled)
+
+    def show_start_page(self) -> None:
+        if not self.has_prepared_job():
+            QMessageBox.information(self, "还不能开始", "请先导入 Gerber 并选择需要铺膏的焊盘。")
+            self.update_start_enabled()
+            return
+        self.pages.setCurrentWidget(self.start_page)
+        self.statusBar().showMessage("开始页面：搜索 BanPCBTool 并传输 G-code", 2500)
+
+    def update_remote_path_root(self, root: str) -> None:
+        current = self.remote_path_edit.text().strip()
+        filename = Path(current).name or "pcb_solder_paste.gcode"
+        self.remote_path_edit.setText(f"{root}/{filename}")
+
+    def log_connection(self, text: str) -> None:
+        self.connection_log.appendPlainText(text.rstrip())
+        self.connection_log.verticalScrollBar().setValue(
+            self.connection_log.verticalScrollBar().maximum())
+
+    @staticmethod
+    def parse_discovery_packet(data: bytes, source_ip: str) -> WirelessDevice | None:
+        try:
+            text = data.decode("utf-8", errors="replace").strip()
+        except UnicodeError:
+            return None
+        if not text.upper().startswith("BANPCBTOOL"):
+            return None
+        values: dict[str, str] = {}
+        for token in text.split()[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                values[key.lower()] = value
+        return WirelessDevice(
+            name=values.get("name", "BanPCBTool"),
+            ip=values.get("ip", source_ip),
+            bridge_port=int(values.get("bridge", str(BRIDGE_PORT)) or BRIDGE_PORT),
+            http_port=int(values.get("http", "80") or 80),
+            wifi=values.get("wifi", ""),
+            ap=values.get("ap", "0") in {"1", "true", "yes", "on"},
+        )
+
+    def refresh_device_combo(self) -> None:
+        self.device_combo.clear()
+        for device in self.devices:
+            suffix = " AP" if device.ap else ""
+            self.device_combo.addItem(
+                f"{device.name}  {device.ip}:{device.bridge_port}{suffix}", device)
+        if self.devices:
+            self.device_info_label.setText(f"发现 {len(self.devices)} 个 BanPCBTool 设备")
+        else:
+            self.device_info_label.setText("没有发现设备")
+
+    def selected_wireless_device(self) -> WirelessDevice | None:
+        data = self.device_combo.currentData()
+        return data if isinstance(data, WirelessDevice) else None
+
+    def discover_wireless_devices(self) -> None:
+        self.log_connection("search: UDP broadcast BANPCBTOOL?")
+        found: dict[str, WirelessDevice] = {}
+        try:
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp.settimeout(0.25)
+            udp.sendto(b"BANPCBTOOL?", ("255.255.255.255", DISCOVERY_PORT))
+            for _ in range(8):
+                try:
+                    data, address = udp.recvfrom(512)
+                except socket.timeout:
+                    continue
+                device = self.parse_discovery_packet(data, address[0])
+                if device:
+                    found[device.ip] = device
+        except OSError as exc:
+            QMessageBox.warning(self, "搜索失败", str(exc))
+            self.log_connection(f"search error: {exc}")
+            return
+        finally:
+            try:
+                udp.close()
+            except Exception:
+                pass
+        self.devices = list(found.values())
+        self.refresh_device_combo()
+        for device in self.devices:
+            mode = "AP" if device.ap else "STA"
+            self.log_connection(f"found: {device.name} {device.ip}:{device.bridge_port} {mode} wifi={device.wifi or '-'}")
+
+    def connect_wireless_device(self) -> None:
+        device = self.selected_wireless_device()
+        if not device:
+            QMessageBox.information(self, "未选择设备", "请先搜索并选择 BanPCBTool。")
+            return
+        self.disconnect_wireless_device(show_status=False)
+        try:
+            sock = socket.create_connection((device.ip, device.bridge_port), timeout=3.0)
+            sock.settimeout(0.6)
+            self.bridge_socket = sock
+            self.connected_device = device
+            self.log_connection(f"connect: {device.name} {device.ip}:{device.bridge_port}")
+            sock.sendall(b"@BPC HELLO\r\n")
+            response = self.read_bridge_response(1.2)
+            if response:
+                self.log_connection(response)
+            if "BanPCBTool" not in response and "@BPC OK" not in response:
+                self.log_connection("warning: ESP8266 did not return the expected name")
+            self.device_info_label.setText(f"已连接 {device.name} ({device.ip})")
+            self.statusBar().showMessage("无线模块已连接", 2500)
+        except OSError as exc:
+            self.bridge_socket = None
+            self.connected_device = None
+            QMessageBox.warning(self, "连接失败", str(exc))
+            self.log_connection(f"connect error: {exc}")
+
+    def disconnect_wireless_device(self, show_status: bool = True) -> None:
+        if self.bridge_socket:
+            try:
+                self.bridge_socket.close()
+            except OSError:
+                pass
+        self.bridge_socket = None
+        self.connected_device = None
+        if show_status:
+            self.device_info_label.setText("已断开")
+            self.statusBar().showMessage("无线连接已断开", 2000)
+
+    def read_bridge_response(self, timeout_s: float = 2.0) -> str:
+        if not self.bridge_socket:
+            return ""
+        chunks: list[bytes] = []
+        self.bridge_socket.settimeout(0.2)
+        stop_at = time.monotonic() + timeout_s
+        while time.monotonic() < stop_at:
+            try:
+                chunk = self.bridge_socket.recv(1024)
+            except socket.timeout:
+                QApplication.processEvents()
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8", errors="replace")
+            if "banux$ " in text or "OK block" in text or "OK clear" in text or "Error:" in text:
+                return text.strip()
+        return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+    def send_bridge_command(self, command: str, timeout_s: float = 2.5) -> str:
+        if not self.bridge_socket:
+            raise OSError("无线设备未连接")
+        self.log_connection(f"> {command}")
+        self.bridge_socket.sendall(command.encode("ascii") + b"\r\n")
+        response = self.read_bridge_response(timeout_s)
+        if response:
+            self.log_connection(response)
+        if "Error:" in response or "failed" in response.lower():
+            raise OSError(response or "命令执行失败")
+        return response
+
+    def _transfer_ready(self) -> bool:
+        if self.mode_combo.currentIndex() == 1 and not self.selected_pad_ids:
+            QMessageBox.warning(self, "无法传输", "请至少选择一个 Gerber 焊盘。")
+            return False
+        if self.mode_combo.currentIndex() != 1 and not self.selected_ids:
+            QMessageBox.warning(self, "无法传输", "请至少选择一个点胶坐标。")
+            return False
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", "请先搜索并连接 BanPCBTool。")
+            return False
+        return True
+
+    def upload_gcode_to_device(self) -> None:
+        if not self._transfer_ready():
+            return
+        path = self.remote_path_edit.text().strip()
+        if not path.startswith(("/flash/", "/sd/")) or " " in path:
+            QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
+            return
+        payload = self.generate_gcode().encode("ascii")
+        try:
+            self.send_bridge_command(f"recv -c {path}", 3.0)
+            for offset in range(0, len(payload), UPLOAD_CHUNK_SIZE):
+                chunk = payload[offset:offset + UPLOAD_CHUNK_SIZE]
+                encoded = base64.b64encode(chunk).decode("ascii")
+                self.send_bridge_command(f"recv -b {path} {offset} {encoded}", 3.0)
+                percent = int(((offset + len(chunk)) * 100) / max(1, len(payload)))
+                self.transfer_progress.setText(f"{percent}%  {offset + len(chunk)} / {len(payload)} bytes")
+                QApplication.processEvents()
+        except OSError as exc:
+            QMessageBox.warning(self, "传输失败", str(exc))
+            return
+        self.statusBar().showMessage(f"已传输到 {path}", 3500)
+
+    def execute_remote_gcode(self) -> None:
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool。")
+            return
+        path = self.remote_path_edit.text().strip()
+        try:
+            self.send_bridge_command(f"gcode -f {path}", 4.0)
+        except OSError as exc:
+            QMessageBox.warning(self, "执行失败", str(exc))
+            return
+        self.statusBar().showMessage(f"已发送执行命令：{path}", 3000)
+
+    def send_manual_command(self, command: str, timeout_s: float = 2.5) -> bool:
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool。")
+            return False
+        try:
+            self.send_bridge_command(command, timeout_s)
+        except OSError as exc:
+            QMessageBox.warning(self, "操作失败", str(exc))
+            return False
+        return True
+
+    def jog_axis(self, axis: str, direction: float) -> None:
+        amount = self.extruder_step.value() if axis == "E" else self.jog_step.value()
+        value = gcode_number(amount * direction, 4 if axis == "E" else 3)
+        feed = gcode_number(self.jog_feed.value(), 0)
+        if not self.send_manual_command("gcode G91", 1.5):
+            return
+        if not self.send_manual_command(f"gcode G1 {axis}{value} F{feed}", 3.0):
+            return
+        self.send_manual_command("gcode G90", 1.5)
+
+    def http_json(self, path: str, data: dict[str, str] | None = None) -> Any:
+        device = self.connected_device or self.selected_wireless_device()
+        if not device:
+            raise OSError("请先选择或连接设备")
+        url = f"http://{device.ip}:{device.http_port}{path}"
+        body = None
+        headers = {}
+        if data is not None:
+            body = urllib.parse.urlencode(data).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST" if data is not None else "GET")
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            text = response.read().decode("utf-8", errors="replace")
+        return json.loads(text) if text.strip().startswith(("{", "[")) else text
+
+    def show_wireless_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("无线设置")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        device = self.connected_device or self.selected_wireless_device()
+        host_edit = QLineEdit(device.ip if device else "")
+        ssid_edit = QLineEdit()
+        pass_edit = QLineEdit()
+        pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        ota_edit = QLineEdit()
+        scan_box = QComboBox()
+        form.addRow("模块 IP", host_edit)
+        form.addRow("WiFi", ssid_edit)
+        form.addRow("密码", pass_edit)
+        form.addRow("扫描结果", scan_box)
+        form.addRow("OTA URL", ota_edit)
+        layout.addLayout(form)
+        button_row = QHBoxLayout()
+        scan_button = QPushButton("扫描")
+        save_button = QPushButton("保存配网")
+        ap_button = QPushButton("进入配网")
+        clear_button = QPushButton("清除 WiFi")
+        ota_button = QPushButton("OTA")
+        restart_button = QPushButton("重启模块")
+        for button in (scan_button, save_button, ap_button, clear_button, ota_button, restart_button):
+            button_row.addWidget(button)
+        layout.addLayout(button_row)
+        info = QPlainTextEdit()
+        info.setReadOnly(True)
+        layout.addWidget(info)
+
+        def device_from_host() -> WirelessDevice:
+            host = host_edit.text().strip()
+            if not host:
+                raise OSError("请输入模块 IP")
+            if device:
+                device.ip = host
+                return device
+            return WirelessDevice("BanPCBTool", host)
+
+        def call(path: str, payload: dict[str, str] | None = None) -> Any:
+            old_connected = self.connected_device
+            old_devices = self.devices[:]
+            temp = device_from_host()
+            self.connected_device = temp
+            try:
+                result = self.http_json(path, payload)
+            finally:
+                self.connected_device = old_connected
+                self.devices = old_devices
+            info.appendPlainText(json.dumps(result, ensure_ascii=False, indent=2) if not isinstance(result, str) else result)
+            return result
+
+        def scan_wifi() -> None:
+            try:
+                result = call("/api/scan")
+                scan_box.clear()
+                for item in result if isinstance(result, list) else []:
+                    name = str(item.get("ssid", ""))
+                    if name:
+                        scan_box.addItem(name)
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "扫描失败", str(exc))
+
+        def save_wifi() -> None:
+            ssid = ssid_edit.text().strip() or scan_box.currentText().strip()
+            if not ssid:
+                QMessageBox.information(dialog, "缺少 WiFi", "请输入或选择 WiFi 名称。")
+                return
+            try:
+                call("/api/wifi", {"ssid": ssid, "pass": pass_edit.text()})
+                QMessageBox.information(dialog, "已保存", "模块会尝试连接新 WiFi。")
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "保存失败", str(exc))
+
+        def post_action(path: str) -> None:
+            try:
+                call(path, {})
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "操作失败", str(exc))
+
+        def ota_action() -> None:
+            url = ota_edit.text().strip()
+            if not url:
+                QMessageBox.information(dialog, "缺少 URL", "请输入 ESP8266 固件 URL。")
+                return
+            try:
+                call("/api/ota", {"url": url})
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "OTA 失败", str(exc))
+
+        scan_box.currentTextChanged.connect(ssid_edit.setText)
+        scan_button.clicked.connect(scan_wifi)
+        save_button.clicked.connect(save_wifi)
+        ap_button.clicked.connect(lambda _checked=False: post_action("/api/ap"))
+        clear_button.clicked.connect(lambda _checked=False: post_action("/api/clear"))
+        ota_button.clicked.connect(ota_action)
+        restart_button.clicked.connect(lambda _checked=False: post_action("/api/restart"))
+        dialog.resize(640, 430)
+        dialog.exec()
 
 
 def run() -> int:

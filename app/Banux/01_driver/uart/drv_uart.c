@@ -5,7 +5,7 @@
  *
  * 注册两个设备节点：
  *   - /driver/uart/uart1  USART1 @2M（Shell/升级口）
- *   - /driver/uart/uart3  USART3 @2M（升级口）
+ *   - /driver/uart/uart3  USART3 @115200（Shell/WiFi）
  *
  * RX 数据流：UART 中断 → 环形缓冲 → app_bl_poll()（嗅探 ENTER_BOOT 帧）
  *           → 镜像缓冲 → Shell / 本设备 read。

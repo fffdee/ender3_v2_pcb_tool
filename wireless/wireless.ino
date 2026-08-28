@@ -1,292 +1,442 @@
 /*
- * mylight.ino
+ * BanPCBTool ESP8266 wireless bridge
  *
- * 硬件：ESP8266 + 3个舵机
- *   舵机1 (GPIO0) — 大灯
- *   舵机2 (GPIO2) — 氛围灯1
- *   舵机3 (GPIO3) — 氛围灯2
- *
- * 话题：
- *   TOPIC_LIGHT    (mainlight002) — 大灯
- *   TOPIC_AMBIENT  (seclight002)  — 氛围灯1
- *   TOPIC_AMBIENT2 (seclight002c) — 氛围灯2
- *
- * 标准灯协议（每个灯独立 ON/OFF，使用同一个舵机）：
- *   大灯   ON : 舵机1 → 180° → 90°
- *   大灯   OFF: 舵机1 → 0°   → 90°
- *   氛围灯1 ON : 舵机2 → 20° → 170° → 90°
- *   氛围灯1 OFF: 舵机2 → 20° → 90°  → 170° (反向)
- *   氛围灯2 ON : 舵机3 → 20° → 170° → 90°
- *   氛围灯2 OFF: 舵机3 → 20° → 90°  → 170° (反向)
+ * Functions:
+ *   - STM32 UART3 <-> WiFi TCP transparent bridge, default TCP port 8266.
+ *   - UDP discovery for the desktop tool, default UDP port 8267.
+ *   - Auto STA connect. If WiFi is unavailable, start a visible AP.
+ *   - HTTP provisioning and OTA update. Open http://<device-ip>/update.
+ *   - Local control lines beginning with "@BPC " are consumed by ESP8266.
  */
 
-#include <Ticker.h>
+#include <EEPROM.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266httpUpdate.h>
-#include <Servo.h>
-#include "ap_config.h"
+#include <WiFiUdp.h>
 
-// ---- Bemfa 服务器 ----
-#define server_ip   "bemfa.com"
-#define server_port "8344"
+#define DEVICE_DEFAULT_NAME   "BanPCBTool"
+#define UART_BAUD            115200UL
+#define BRIDGE_TCP_PORT      8266
+#define DISCOVERY_UDP_PORT   8267
+#define HTTP_PORT            80
+#define WIFI_CONNECT_TIMEOUT 15000UL
+#define EEPROM_BYTES         512
+#define CONFIG_MAGIC         0x42504354UL
+#define CONTROL_MAX          160
+#define WIFI_RETRY_MS        10000UL
 
-String UID            = "c03b0385d6468c31245bd9f86236fc4d";
-String TOPIC_LIGHT    = "mainlight002";   // 大灯话题
-String TOPIC_AMBIENT  = "seclight002";    // 氛围灯1话题
-String TOPIC_AMBIENT2 = "seclight002c";   // 氛围灯2话题
+struct DeviceConfig {
+    uint32_t magic;
+    char name[32];
+    char ssid[64];
+    char pass[64];
+};
 
-// ---- 舵机引脚 ----
-#define SERVO1_PIN 0   // 大灯舵机
-#define SERVO2_PIN 2   // 氛围灯1舵机
-#define SERVO3_PIN 3   // 氛围灯2舵机
+DeviceConfig cfg;
+ESP8266WebServer httpServer(HTTP_PORT);
+ESP8266HTTPUpdateServer httpUpdater;
+WiFiServer bridgeServer(BRIDGE_TCP_PORT);
+WiFiClient bridgeClient;
+WiFiUDP discoveryUdp;
 
-// 舵机动作间隔（毫秒）
-#define SERVO_STEP_MS 500
+bool apRunning = false;
+bool bridgeStarted = false;
+bool rebootPending = false;
+unsigned long rebootAt = 0;
+unsigned long staStartAt = 0;
+unsigned long lastWifiRetry = 0;
 
-Servo servo1;
-Servo servo2;
-Servo servo3;
+char serialCtl[CONTROL_MAX];
+uint16_t serialCtlLen = 0;
+bool serialMaybeControl = false;
+bool serialLineStart = true;
 
-// ---- TCP ----
-#define MAX_PACKETSIZE  512
-#define KEEPALIVEATIME  (30 * 1000)
+char tcpCtl[CONTROL_MAX];
+uint16_t tcpCtlLen = 0;
+bool tcpMaybeControl = false;
+bool tcpLineStart = true;
 
-WiFiClient TCPclient;
-String TcpClient_Buff = "";
-unsigned int TcpClient_BuffIndex = 0;
-unsigned long TcpClient_preTick  = 0;
-unsigned long preHeartTick        = 0;
-unsigned long preTCPStartTick     = 0;
-bool preTCPConnected              = false;
-
-// ====================================================================
-// 灯控制函数
-// ====================================================================
-
-// 大灯 ON：舵机1 → 180° → 90°
-void lightOn() {
-    servo1.write(180);
-    delay(SERVO_STEP_MS);
-    servo1.write(90);
+static void scheduleRestart(uint32_t delayMs) {
+    rebootPending = true;
+    rebootAt = millis() + delayMs;
 }
 
-// 大灯 OFF：舵机1 → 0° → 90°
-void lightOff() {
-    servo1.write(0);
-    delay(SERVO_STEP_MS);
-    servo1.write(90);
+static String deviceName() {
+    return cfg.name[0] ? String(cfg.name) : String(DEVICE_DEFAULT_NAME);
 }
 
-// 氛围灯1 ON：舵机2 → 20° → 170° → 90°
-void ambientOn() {
-    servo2.write(20);
-    delay(SERVO_STEP_MS);
-    servo2.write(170);
-    delay(SERVO_STEP_MS);
-    servo2.write(90);
+static void copyField(char *dst, size_t dstSize, const String &src) {
+    size_t len = src.length();
+    if (len >= dstSize) len = dstSize - 1;
+    memcpy(dst, src.c_str(), len);
+    dst[len] = '\0';
 }
 
-// 氛围灯1 OFF：舵机2 → 20° → 90° → 170° (反向动作)
-void ambientOff() {
-    servo2.write(20);
-    delay(SERVO_STEP_MS);
-    servo2.write(90);
-    delay(SERVO_STEP_MS);
-    servo2.write(170);
-}
-
-// 氛围灯2 ON：舵机3 → 20° → 170° → 90°
-void ambient2On() {
-    servo3.write(20);
-    delay(SERVO_STEP_MS);
-    servo3.write(170);
-    delay(SERVO_STEP_MS);
-    servo3.write(90);
-}
-
-// 氛围灯2 OFF：舵机3 → 20° → 90° → 170° (反向动作)
-void ambient2Off() {
-    servo3.write(20);
-    delay(SERVO_STEP_MS);
-    servo3.write(90);
-    delay(SERVO_STEP_MS);
-    servo3.write(170);
-}
-
-// ====================================================================
-// TCP / WiFi
-// ====================================================================
-
-void sendtoTCPServer(String p) {
-    if (!TCPclient.connected()) return;
-    TCPclient.print(p);
-    preHeartTick = millis();
-}
-
-void startTCPClient() {
-    // 先尝试域名，失败则直连 IP（应对 ESP8266 DNS 解析失败）
-    const char* ip_fallback = "119.91.109.180";
-    bool connected = TCPclient.connect(server_ip, atoi(server_port));
-    if (!connected) {
-        DBG_PRINTF("DNS connect failed, trying IP %s:%s\r\n", ip_fallback, server_port);
-        connected = TCPclient.connect(ip_fallback, atoi(server_port));
-    }
-    if (connected) {
-        sendtoTCPServer("cmd=1&uid=" + UID + "&topic=" + TOPIC_LIGHT + "\r\n");
-        delay(100);
-        sendtoTCPServer("cmd=1&uid=" + UID + "&topic=" + TOPIC_AMBIENT + "\r\n");
-        delay(100);
-        sendtoTCPServer("cmd=1&uid=" + UID + "&topic=" + TOPIC_AMBIENT2 + "\r\n");
-        preTCPConnected = true;
-        TCPclient.setNoDelay(true);
-    } else {
-        TCPclient.stop();
-        preTCPConnected = false;
-    }
-    preTCPStartTick = millis();
-}
-
-void startSTA() {
-    if (apHasSavedWifi()) {
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(apGetSavedSsid().c_str(), apGetSavedPass().c_str());
+static void loadConfig() {
+    EEPROM.begin(EEPROM_BYTES);
+    EEPROM.get(0, cfg);
+    if (cfg.magic != CONFIG_MAGIC) {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.magic = CONFIG_MAGIC;
+        copyField(cfg.name, sizeof(cfg.name), DEVICE_DEFAULT_NAME);
+        EEPROM.put(0, cfg);
+        EEPROM.commit();
     }
 }
 
-void doWiFiTick() {
-    static bool startSTAFlag = false;
-    static bool taskStarted  = false;
-    static uint32_t lastWiFiCheckTick = 0;
+static void saveConfig() {
+    cfg.magic = CONFIG_MAGIC;
+    EEPROM.put(0, cfg);
+    EEPROM.commit();
+}
 
-    if (!startSTAFlag) {
-        startSTAFlag = true;
-        startSTA();
-    }
+static bool hasSavedWifi() {
+    return cfg.ssid[0] != '\0';
+}
 
-    if (WiFi.status() != WL_CONNECTED) {
-        if (millis() - lastWiFiCheckTick > 1000) {
-            lastWiFiCheckTick = millis();
-        }
-    } else {
-        if (!taskStarted) {
-            taskStarted = true;
-            startTCPClient();
-        }
+static String ipText() {
+    if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+    if (apRunning) return WiFi.softAPIP().toString();
+    return String("0.0.0.0");
+}
+
+static void sendTcpLine(const String &line) {
+    if (bridgeClient && bridgeClient.connected()) {
+        bridgeClient.print(line);
+        if (!line.endsWith("\n")) bridgeClient.print("\n");
     }
 }
 
-// 处理一条完整的 Bemfa 消息（已去掉 \r\n 的单行文本）
-void handleTCPMessage(const String& line) {
-    if (line.length() <= 15) return;
-    int topicIdx = line.indexOf("&topic=");
-    int msgIdx   = line.indexOf("&msg=");
-    if (topicIdx < 0 || msgIdx <= topicIdx) return;
-
-    String getTopic = line.substring(topicIdx + 7, msgIdx);
-    String getMsg   = line.substring(msgIdx + 5);
-    DBG_PRINTLN("[TCP] topic=" + getTopic + " msg=" + getMsg);
-
-    // ---- 大灯话题 ----
-    if (getTopic == TOPIC_LIGHT) {
-        if      (getMsg == "on")  lightOn();
-        else if (getMsg == "off") lightOff();
-    }
-    // ---- 氛围灯1话题 ----
-    else if (getTopic == TOPIC_AMBIENT) {
-        if      (getMsg == "on")  ambientOn();
-        else if (getMsg == "off") ambientOff();
-    }
-    // ---- 氛围灯2话题 ----
-    else if (getTopic == TOPIC_AMBIENT2) {
-        if      (getMsg == "on")  ambient2On();
-        else if (getMsg == "off") ambient2Off();
-    }
-    // ---- 通用指令（任意话题均可触发）----
-    if (getMsg == "config") {
-        apClearWifi();
-        delay(500);
-        ESP.restart();
-    }
+static void startBridgeServices() {
+    if (bridgeStarted) return;
+    bridgeServer.begin();
+    bridgeServer.setNoDelay(true);
+    discoveryUdp.begin(DISCOVERY_UDP_PORT);
+    bridgeStarted = true;
 }
 
-void doTCPClientTick() {
-    if (WiFi.status() != WL_CONNECTED) return;
+static void startConfigAp() {
+    if (apRunning) return;
+    String suffix = String(ESP.getChipId(), HEX);
+    String ssid = deviceName() + "-" + suffix;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(ssid.c_str());
+    apRunning = true;
+    startBridgeServices();
+}
 
-    if (!TCPclient.connected()) {
-        if (preTCPConnected) {
-            preTCPConnected = false;
-            preTCPStartTick = millis();
-            TCPclient.stop();
-        } else if (millis() - preTCPStartTick > 10 * 1000) {
-            startTCPClient();
-        }
+static void stopConfigApIfConnected() {
+    if (!apRunning || WiFi.status() != WL_CONNECTED) return;
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apRunning = false;
+}
+
+static void startStaConnect() {
+    if (!hasSavedWifi()) {
+        startConfigAp();
         return;
     }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(cfg.ssid, cfg.pass);
+    staStartAt = millis();
+    lastWifiRetry = millis();
+}
 
-    // 读取所有可用字节，遇到 \n 立即处理当前行（支持缓冲区中多条消息并发）
-    while (TCPclient.available()) {
-        char c = TCPclient.read();
-        TcpClient_preTick = millis();
-        if (c == '\n') {
-            TcpClient_Buff.trim();          // 去掉末尾 \r 及多余空白
-            handleTCPMessage(TcpClient_Buff);
-            TcpClient_Buff      = "";
-            TcpClient_BuffIndex = 0;
-        } else {
-            TcpClient_Buff += c;
-            TcpClient_BuffIndex++;
-            if (TcpClient_BuffIndex >= MAX_PACKETSIZE - 1) {
-                DBG_PRINTLN("[TCP] buffer overflow, cleared");
-                TcpClient_Buff      = "";
-                TcpClient_BuffIndex = 0;
-            }
-        }
+static String jsonInfo() {
+    String json = "{";
+    json += "\"name\":\"" + deviceName() + "\",";
+    json += "\"ip\":\"" + ipText() + "\",";
+    json += "\"bridge\":" + String(BRIDGE_TCP_PORT) + ",";
+    json += "\"http\":" + String(HTTP_PORT) + ",";
+    json += "\"ap\":" + String(apRunning ? 1 : 0) + ",";
+    json += "\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? 1 : 0) + ",";
+    json += "\"ssid\":\"" + String(cfg.ssid) + "\",";
+    json += "\"version\":\"1.0.0\"";
+    json += "}";
+    return json;
+}
+
+static void handleRoot() {
+    String html;
+    html += "<!doctype html><html><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>BanPCBTool</title></head><body>";
+    html += "<h2>BanPCBTool WiFi</h2><pre>" + jsonInfo() + "</pre>";
+    html += "<form method='post' action='/api/wifi'>";
+    html += "SSID:<br><input name='ssid' value='" + String(cfg.ssid) + "'><br>";
+    html += "Password:<br><input name='pass' type='password'><br><br>";
+    html += "<button type='submit'>Save WiFi</button></form>";
+    html += "<p><a href='/update'>OTA update</a></p>";
+    html += "</body></html>";
+    httpServer.send(200, "text/html", html);
+}
+
+static void handleInfo() {
+    httpServer.send(200, "application/json", jsonInfo());
+}
+
+static void handleWifiSave() {
+    if (!httpServer.hasArg("ssid")) {
+        httpServer.send(400, "application/json", "{\"ok\":0,\"error\":\"missing ssid\"}");
+        return;
     }
+    copyField(cfg.ssid, sizeof(cfg.ssid), httpServer.arg("ssid"));
+    copyField(cfg.pass, sizeof(cfg.pass),
+              httpServer.hasArg("pass") ? httpServer.arg("pass") : httpServer.arg("password"));
+    saveConfig();
+    httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"saved\"}");
+    delay(100);
+    WiFi.disconnect();
+    startStaConnect();
+}
 
-    if (millis() - preHeartTick >= KEEPALIVEATIME) {
-        // 三个话题各自重发 cmd=1 以保持订阅活跃，避免其中一个掉线
-        TCPclient.print("cmd=1&uid=" + UID + "&topic=" + TOPIC_LIGHT + "\r\n");
-        delay(100);
-        TCPclient.print("cmd=1&uid=" + UID + "&topic=" + TOPIC_AMBIENT + "\r\n");
-        delay(100);
-        TCPclient.print("cmd=1&uid=" + UID + "&topic=" + TOPIC_AMBIENT2 + "\r\n");
-        preHeartTick = millis();
+static void handleAp() {
+    startConfigAp();
+    httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"ap started\"}");
+}
+
+static void handleClear() {
+    cfg.ssid[0] = '\0';
+    cfg.pass[0] = '\0';
+    saveConfig();
+    startConfigAp();
+    httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"wifi cleared\"}");
+}
+
+static void handleRestart() {
+    httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"restarting\"}");
+    scheduleRestart(300);
+}
+
+static void handleScan() {
+    int count = WiFi.scanNetworks();
+    String json = "[";
+    for (int i = 0; i < count; i++) {
+        if (i) json += ",";
+        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    }
+    json += "]";
+    httpServer.send(200, "application/json", json);
+}
+
+static void handleOtaUrl() {
+    if (!httpServer.hasArg("url")) {
+        httpServer.send(400, "application/json", "{\"ok\":0,\"error\":\"missing url\"}");
+        return;
+    }
+    httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"ota started\"}");
+    t_httpUpdate_return result = ESPhttpUpdate.update(httpServer.arg("url"));
+    if (result == HTTP_UPDATE_FAILED) {
+        sendTcpLine("@BPC OTA_FAILED " + String(ESPhttpUpdate.getLastError()));
     }
 }
 
-// ====================================================================
-// setup / loop
-// ====================================================================
+static void setupHttp() {
+    httpServer.on("/", HTTP_GET, handleRoot);
+    httpServer.on("/api/info", HTTP_GET, handleInfo);
+    httpServer.on("/api/scan", HTTP_GET, handleScan);
+    httpServer.on("/api/wifi", HTTP_POST, handleWifiSave);
+    httpServer.on("/api/ap", HTTP_POST, handleAp);
+    httpServer.on("/api/clear", HTTP_POST, handleClear);
+    httpServer.on("/api/restart", HTTP_POST, handleRestart);
+    httpServer.on("/api/ota", HTTP_POST, handleOtaUrl);
+    httpUpdater.setup(&httpServer, "/update");
+    httpServer.begin();
+}
+
+static void handleDiscovery() {
+    int size = discoveryUdp.parsePacket();
+    if (size <= 0) return;
+    char packet[96];
+    int len = discoveryUdp.read(packet, sizeof(packet) - 1);
+    if (len <= 0) return;
+    packet[len] = '\0';
+    String req(packet);
+    req.trim();
+    if (req.indexOf("BANPCBTOOL?") < 0 && req.indexOf("BANUX_DISCOVER") < 0) return;
+    String reply = "BANPCBTool name=" + deviceName() +
+                   " ip=" + ipText() +
+                   " bridge=" + String(BRIDGE_TCP_PORT) +
+                   " http=" + String(HTTP_PORT) +
+                   " wifi=" + String(WiFi.status() == WL_CONNECTED ? 1 : 0) +
+                   " ap=" + String(apRunning ? 1 : 0) + "\n";
+    discoveryUdp.beginPacket(discoveryUdp.remoteIP(), discoveryUdp.remotePort());
+    discoveryUdp.print(reply);
+    discoveryUdp.endPacket();
+}
+
+static void handleControlLine(const String &line, bool fromTcp) {
+    String cmd = line;
+    cmd.trim();
+    if (!cmd.startsWith("@BPC")) return;
+    cmd = cmd.substring(4);
+    cmd.trim();
+
+    if (cmd.startsWith("HELLO")) {
+        if (fromTcp) sendTcpLine("@BPC OK " + deviceName());
+    } else if (cmd == "STATUS") {
+        if (fromTcp) sendTcpLine("@BPC " + jsonInfo());
+    } else if (cmd == "AP" || cmd == "CONFIG") {
+        startConfigAp();
+        if (fromTcp) sendTcpLine("@BPC OK ap");
+    } else if (cmd == "CLEAR") {
+        cfg.ssid[0] = '\0';
+        cfg.pass[0] = '\0';
+        saveConfig();
+        startConfigAp();
+        if (fromTcp) sendTcpLine("@BPC OK clear");
+    } else if (cmd.startsWith("NAME ")) {
+        copyField(cfg.name, sizeof(cfg.name), cmd.substring(5));
+        saveConfig();
+        if (fromTcp) sendTcpLine("@BPC OK name=" + deviceName());
+    } else if (cmd.startsWith("WIFI ")) {
+        int split = cmd.indexOf(' ', 5);
+        if (split > 5) {
+            copyField(cfg.ssid, sizeof(cfg.ssid), cmd.substring(5, split));
+            copyField(cfg.pass, sizeof(cfg.pass), cmd.substring(split + 1));
+            saveConfig();
+            WiFi.disconnect();
+            startStaConnect();
+            if (fromTcp) sendTcpLine("@BPC OK wifi");
+        } else if (fromTcp) {
+            sendTcpLine("@BPC ERR wifi_args");
+        }
+    } else if (cmd.startsWith("OTA ")) {
+        if (fromTcp) sendTcpLine("@BPC OK ota");
+        ESPhttpUpdate.update(cmd.substring(4));
+    } else if (cmd == "RESTART") {
+        if (fromTcp) sendTcpLine("@BPC OK restart");
+        scheduleRestart(300);
+    } else if (fromTcp) {
+        sendTcpLine("@BPC ERR unknown");
+    }
+}
+
+static bool controlPrefixMatches(const char *buf, uint16_t len) {
+    const char prefix[] = "@BPC";
+    if (len > strlen(prefix)) return false;
+    for (uint16_t i = 0; i < len; i++) {
+        if (buf[i] != prefix[i]) return false;
+    }
+    return true;
+}
+
+static void flushSerialControlToTcp() {
+    if (bridgeClient && bridgeClient.connected() && serialCtlLen > 0) {
+        bridgeClient.write((const uint8_t *)serialCtl, serialCtlLen);
+    }
+    serialCtlLen = 0;
+    serialMaybeControl = false;
+}
+
+static void feedSerialByte(uint8_t byte) {
+    if (serialLineStart && byte == '@') {
+        serialMaybeControl = true;
+        serialCtlLen = 0;
+    }
+
+    if (serialMaybeControl) {
+        if (serialCtlLen < CONTROL_MAX - 1) {
+            serialCtl[serialCtlLen++] = (char)byte;
+            serialCtl[serialCtlLen] = '\0';
+        }
+        if (!controlPrefixMatches(serialCtl, serialCtlLen)) {
+            flushSerialControlToTcp();
+        } else if (byte == '\n' || byte == '\r') {
+            handleControlLine(String(serialCtl), false);
+            serialCtlLen = 0;
+            serialMaybeControl = false;
+        }
+    } else if (bridgeClient && bridgeClient.connected()) {
+        bridgeClient.write(byte);
+    }
+    serialLineStart = (byte == '\n' || byte == '\r');
+}
+
+static void flushTcpControlToSerial() {
+    if (tcpCtlLen > 0) Serial.write((const uint8_t *)tcpCtl, tcpCtlLen);
+    tcpCtlLen = 0;
+    tcpMaybeControl = false;
+}
+
+static void feedTcpByte(uint8_t byte) {
+    if (tcpLineStart && byte == '@') {
+        tcpMaybeControl = true;
+        tcpCtlLen = 0;
+    }
+
+    if (tcpMaybeControl) {
+        if (tcpCtlLen < CONTROL_MAX - 1) {
+            tcpCtl[tcpCtlLen++] = (char)byte;
+            tcpCtl[tcpCtlLen] = '\0';
+        }
+        if (!controlPrefixMatches(tcpCtl, tcpCtlLen)) {
+            flushTcpControlToSerial();
+        } else if (byte == '\n' || byte == '\r') {
+            handleControlLine(String(tcpCtl), true);
+            tcpCtlLen = 0;
+            tcpMaybeControl = false;
+        }
+    } else {
+        Serial.write(byte);
+    }
+    tcpLineStart = (byte == '\n' || byte == '\r');
+}
+
+static void handleBridge() {
+    if (bridgeServer.hasClient()) {
+        WiFiClient incoming = bridgeServer.available();
+        if (bridgeClient && bridgeClient.connected()) {
+            bridgeClient.stop();
+        }
+        bridgeClient = incoming;
+        bridgeClient.setNoDelay(true);
+        sendTcpLine("@BPC CONNECTED " + deviceName());
+    }
+
+    while (Serial.available()) {
+        feedSerialByte((uint8_t)Serial.read());
+    }
+    if (bridgeClient && bridgeClient.connected()) {
+        while (bridgeClient.available()) {
+            feedTcpByte((uint8_t)bridgeClient.read());
+        }
+    }
+}
+
+static void handleWifi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        startBridgeServices();
+        stopConfigApIfConnected();
+        return;
+    }
+    if (!apRunning && millis() - staStartAt > WIFI_CONNECT_TIMEOUT) {
+        startConfigAp();
+    }
+    if (hasSavedWifi() && millis() - lastWifiRetry > WIFI_RETRY_MS) {
+        WiFi.begin(cfg.ssid, cfg.pass);
+        lastWifiRetry = millis();
+    }
+}
 
 void setup() {
-    // 先完成 WiFi / AP 初始化（此时舵机还未 attach，GPIO 安全）
-    apSetDeviceInfo("mylight", TOPIC_LIGHT);
-    bool staMode = apConfigSetup();  // 有已保存 WiFi 且连上→true，否则→false
-
-    // WiFi 初始化完成后再 attach 舵机，避免 GPIO 状态干扰
-    servo1.attach(SERVO1_PIN);
-    servo2.attach(SERVO2_PIN);
-    servo3.attach(SERVO3_PIN);
-    servo1.write(90);
-    servo2.write(90);
-    servo3.write(90);
-
-    String savedTopic = apGetSavedTopic();
-    String savedTopic2 = apGetSavedTopic2();
-    String savedTopic3 = apGetSavedTopic3();
-    if (savedTopic.length() > 0)   TOPIC_LIGHT    = savedTopic;
-    if (savedTopic2.length() > 0)  TOPIC_AMBIENT  = savedTopic2;
-    if (savedTopic3.length() > 0)  TOPIC_AMBIENT2 = savedTopic3;
-
-    // 注册舵机控制回调，供 ap_config.h 的 /control 端点调用
-    apRegisterControlCallbacks(lightOn, lightOff,
-                               ambientOn, ambientOff,
-                               ambient2On, ambient2Off);
+    Serial.begin(UART_BAUD);
+    Serial.setRxBufferSize(1024);
+    loadConfig();
+    startStaConnect();
+    setupHttp();
+    startBridgeServices();
 }
 
 void loop() {
-    apConfigLoop();
-    if (isApMode()) return;
-    doWiFiTick();
-    doTCPClientTick();
+    httpServer.handleClient();
+    handleWifi();
+    handleDiscovery();
+    handleBridge();
+    if (rebootPending && (int32_t)(millis() - rebootAt) >= 0) {
+        ESP.restart();
+    }
 }

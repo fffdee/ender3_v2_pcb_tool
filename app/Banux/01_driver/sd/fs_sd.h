@@ -47,6 +47,10 @@ int SdFs_Touch(const char *vfsPath);
 /** Replace an SD file with the supplied bytes. */
 int SdFs_WriteFile(const char *vfsPath, const uint8_t *data, uint32_t len);
 
+/** Write a chunk to a mounted FatFs file at the supplied byte offset. */
+int SdFs_WriteFileAt(const char *vfsPath, const uint8_t *data, uint32_t len,
+                     uint32_t offset);
+
 /** Create one directory on the SD filesystem. */
 int SdFs_Mkdir(const char *vfsPath);
 

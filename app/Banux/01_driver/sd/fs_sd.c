@@ -337,6 +337,48 @@ int SdFs_WriteFile(const char *vfsPath, const uint8_t *data, uint32_t len)
     return 0;
 }
 
+int SdFs_WriteFileAt(const char *vfsPath, const uint8_t *data, uint32_t len,
+                     uint32_t offset)
+{
+    FRESULT fres;
+    UINT written = 0;
+    char path[VFS_MAX_PATH_LEN];
+    VfsNode_t *parent;
+
+    if ((!data && len > 0) ||
+        resolve_file_path(vfsPath, &parent, path, sizeof(path)) != 0) {
+        return -1;
+    }
+
+    fres = f_open(&s_file, path, FA_OPEN_ALWAYS | FA_WRITE);
+    if (fres != FR_OK) {
+        DBG("[FatFsVfs] write_at open failed: path=%s result=%d\n", path, (int)fres);
+        return -(int)fres;
+    }
+    fres = f_lseek(&s_file, offset);
+    if (fres == FR_OK && len > 0) {
+        fres = f_write(&s_file, data, (UINT)len, &written);
+    }
+    if (fres == FR_OK) fres = f_sync(&s_file);
+    if (f_close(&s_file) != FR_OK && fres == FR_OK) fres = FR_DISK_ERR;
+    if (fres != FR_OK || written != (UINT)len) {
+        DBG("[FatFsVfs] write_at failed: path=%s off=%lu result=%d bytes=%u/%lu\n",
+            path, (unsigned long)offset, (int)fres,
+            (unsigned int)written, (unsigned long)len);
+        return fres != FR_OK ? -(int)fres : -(int)FR_DISK_ERR;
+    }
+
+    {
+        uint32_t size = offset + len;
+        VfsNode_t *node = Vfs_FindNode(vfsPath);
+        if (!node) node = Vfs_CreateFile(parent, path_name(vfsPath), size,
+                                         sd_file_read, NULL);
+        if (!node) return -1;
+        if (node->fileSize < size) node->fileSize = size;
+    }
+    return 0;
+}
+
 int SdFs_Mkdir(const char *vfsPath)
 {
     FRESULT fres;
