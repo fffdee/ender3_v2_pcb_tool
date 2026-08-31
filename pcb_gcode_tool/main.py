@@ -4,9 +4,13 @@ import argparse
 import base64
 import json
 import math
+import os
 import re
+import select
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +41,264 @@ DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_
 DISCOVERY_PORT = 8267
 BRIDGE_PORT = 8266
 UPLOAD_CHUNK_SIZE = 48
+DEFAULT_DEVICE_IP = "192.168.4.1"  # AP 模式固定 IP
+DEFAULT_DEVICE_NAME = "BanPCBTool"  # 模块热点名称前缀
+
+
+def _pump_sleep(seconds: float) -> None:
+    """阻塞等待期间保持 GUI 响应：边睡边处理 Qt 事件。
+
+    用在扫描 WiFi、切换热点轮询等较长阻塞等待中，避免界面卡死、
+    日志不刷新。非 Qt 环境下等价于普通 sleep。
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            QApplication.processEvents()
+        except RuntimeError:
+            pass
+        time.sleep(0.05)
+
+
+def scan_local_wifi() -> list[str]:
+    """使用本机网卡扫描周围 WiFi。
+
+    优先调用 Windows WLAN API（wlanapi.dll）并主动触发一次扫描，
+    可以拿到附近全部可见 WiFi；netsh 在无线网卡已连接时通常
+    只列出当前连接的网络，仅作为回退。
+    """
+    if sys.platform != "win32":
+        return []
+    # WLAN API 与 netsh 结果取并集：有的网卡驱动 netsh 只返回
+    # 当前连接网络，而 WLAN API 能列出全部；反之亦然，两者互补。
+    names: list[str] = []
+    for fn in (_scan_wlanapi, _scan_netsh):
+        try:
+            for name in fn():
+                if name and name not in names:
+                    names.append(name)
+        except Exception:
+            continue
+    return names
+
+
+def _scan_netsh() -> list[str]:
+    try:
+        output = subprocess.check_output(
+            ["netsh", "wlan", "show", "networks"],
+            timeout=15.0,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ssids: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("ssid") and ":" in stripped:
+            name = stripped.split(":", 1)[1].strip()
+            if name and name not in ssids:
+                ssids.append(name)
+    return ssids
+
+
+def _scan_wlanapi() -> list[str]:
+    """通过 wlanapi.dll 触发无线网卡扫描并读取完整可用网络列表。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class WLAN_INTERFACE_INFO(ctypes.Structure):
+        _fields_ = [
+            ("InterfaceGuid", ctypes.c_ubyte * 16),
+            ("strInterfaceDescription", wintypes.WCHAR * 256),
+            ("isState", wintypes.DWORD),
+        ]
+
+    class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+        _fields_ = [
+            ("dwNumberOfItems", wintypes.DWORD),
+            ("dwIndex", wintypes.DWORD),
+            ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
+        ]
+
+    class WLAN_AVAILABLE_NETWORK(ctypes.Structure):
+        _fields_ = [
+            ("ProfileName", wintypes.WCHAR * 256),
+            ("SSIDLength", wintypes.DWORD),
+            ("SSID", ctypes.c_ubyte * 32),
+            ("BssType", wintypes.DWORD),
+            ("AuthAlgorithm", wintypes.DWORD),
+            ("CipherAlgorithm", wintypes.DWORD),
+            ("Flags", wintypes.DWORD),
+            ("SignalQuality", wintypes.DWORD),
+            ("NumSecurityAlgorithms", wintypes.DWORD),
+            ("SecurityAlgorithms", wintypes.DWORD * 1),
+            ("PhyTypeNumber", wintypes.DWORD),
+            ("PhyTypes", wintypes.DWORD * 1),
+        ]
+
+    class WLAN_AVAILABLE_NETWORK_LIST(ctypes.Structure):
+        _fields_ = [
+            ("dwNumberOfItems", wintypes.DWORD),
+            ("dwIndex", wintypes.DWORD),
+            ("Network", WLAN_AVAILABLE_NETWORK * 1),
+        ]
+
+    try:
+        wlanapi = ctypes.WinDLL("wlanapi", use_last_error=True)
+    except OSError:
+        return []
+
+    wlanapi.WlanOpenHandle.argtypes = [
+        wintypes.DWORD, ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.HANDLE)]
+    wlanapi.WlanOpenHandle.restype = wintypes.DWORD
+    wlanapi.WlanEnumInterfaces.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(WLAN_INTERFACE_INFO_LIST))]
+    wlanapi.WlanEnumInterfaces.restype = wintypes.DWORD
+    wlanapi.WlanScan.argtypes = [wintypes.HANDLE, ctypes.c_void_p] + [ctypes.c_void_p] * 3
+    wlanapi.WlanScan.restype = wintypes.DWORD
+    wlanapi.WlanGetAvailableNetworkList.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(WLAN_AVAILABLE_NETWORK_LIST))]
+    wlanapi.WlanGetAvailableNetworkList.restype = wintypes.DWORD
+    wlanapi.WlanFreeMemory.argtypes = [ctypes.c_void_p]
+    wlanapi.WlanCloseHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    wlanapi.WlanCloseHandle.restype = wintypes.DWORD
+
+    handle = wintypes.HANDLE()
+    negotiated = wintypes.DWORD()
+    if wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated),
+                              ctypes.byref(handle)) != 0:
+        return []
+    try:
+        p_interfaces = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        if wlanapi.WlanEnumInterfaces(handle, None, ctypes.byref(p_interfaces)) != 0:
+            return []
+        interfaces = p_interfaces.contents
+        if interfaces.dwNumberOfItems == 0:
+            return []
+        guid = interfaces.InterfaceInfo[0].InterfaceGuid
+        guid_ptr = ctypes.cast(ctypes.byref(guid), ctypes.c_void_p)
+        # 主动触发一次扫描，等待几秒让网卡收集周围 WiFi
+        if wlanapi.WlanScan(handle, guid_ptr, None, None, None) != 0:
+            return []
+        _pump_sleep(3.0)
+        p_list = ctypes.POINTER(WLAN_AVAILABLE_NETWORK_LIST)()
+        if wlanapi.WlanGetAvailableNetworkList(
+                handle, guid_ptr, 0, None, ctypes.byref(p_list)) != 0:
+            return []
+        networks = p_list.contents
+        networks_arr = ctypes.cast(
+            ctypes.addressof(networks.Network),
+            ctypes.POINTER(WLAN_AVAILABLE_NETWORK))
+        ssids: list[str] = []
+        for i in range(networks.dwNumberOfItems):
+            network = networks_arr[i]
+            length = min(network.SSIDLength, 32)
+            raw = bytes(network.SSID[:length])
+            try:
+                name = raw.decode("utf-8", "ignore")
+            except Exception:
+                continue
+            name = name.strip()
+            if name and name.isprintable() and name not in ssids:
+                ssids.append(name)
+        return ssids
+    finally:
+        wlanapi.WlanCloseHandle(handle, None)
+
+
+def current_wifi_ssid() -> str:
+    """返回电脑当前连接的 WiFi 名称；未连接无线网卡时返回空串。"""
+    if sys.platform != "win32":
+        return ""
+    try:
+        output = subprocess.check_output(
+            ["netsh", "wlan", "show", "interfaces"],
+            timeout=10.0, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("ssid") and ":" in stripped:
+            name = stripped.split(":", 1)[1].strip()
+            if name:
+                return name
+    return ""
+
+
+def _netsh(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["netsh", "wlan", *args],
+        capture_output=True, text=True, errors="replace", timeout=15.0,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def build_open_profile(ssid: str) -> str:
+    """生成开放热点（无密码）的 WLAN profile XML。"""
+    esc = ssid.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (f'<?xml version="1.0"?>\n'
+            f'<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+            f"    <name>{esc}</name>\n"
+            f"    <SSIDConfig>\n"
+            f"        <SSID>\n"
+            f"            <name>{esc}</name>\n"
+            f"        </SSID>\n"
+            f"    </SSIDConfig>\n"
+            f"    <connectionType>ESS</connectionType>\n"
+            f"    <connectionMode>auto</connectionMode>\n"
+            f"    <MSM>\n"
+            f"        <security>\n"
+            f"            <authEncryption>\n"
+            f"                <authentication>open</authentication>\n"
+            f"                <encryption>none</encryption>\n"
+            f"                <useOneX>false</useOneX>\n"
+            f"            </authEncryption>\n"
+            f"        </security>\n"
+            f"    </MSM>\n"
+            f"</WLANProfile>")
+
+
+def connect_to_hotspot(ssid: str, timeout: float = 15.0) -> bool:
+    """把电脑 Wi-Fi 自动切换到指定开放热点；连上后返回 True。"""
+    if sys.platform != "win32":
+        return False
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".xml", delete=False, encoding="utf-8") as f:
+            f.write(build_open_profile(ssid))
+            path = f.name
+        _netsh(["add", "profile", f"filename={path}", "user=current"])  # 重复添加报错可忽略
+        _netsh(["connect", f"name={ssid}"])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _pump_sleep(1.0)
+        if current_wifi_ssid() == ssid:
+            return True
+    return False
+
+
+def reconnect_wifi(ssid: str) -> None:
+    """用系统已保存的 profile 回连指定 WiFi（不新建 profile，避免覆盖密码）。"""
+    if sys.platform != "win32":
+        return
+    try:
+        _netsh(["connect", f"name={ssid}"])
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 @dataclass
@@ -212,6 +474,8 @@ class MainWindow(QMainWindow):
         self.devices: list[WirelessDevice] = []
         self.connected_device: WirelessDevice | None = None
         self.bridge_socket: socket.socket | None = None
+        self._connecting = False
+        self._prev_ssid = ""
         self.setWindowTitle("Banux PCB 锡膏路径生成器")
         self.resize(1440, 860)
         self.setMinimumSize(1050, 680)
@@ -401,17 +665,15 @@ class MainWindow(QMainWindow):
         connection = QGroupBox("无线连接")
         grid = QGridLayout(connection)
         self.device_combo = QComboBox()
-        self.device_info_label = QLabel("未搜索")
+        self.device_info_label = QLabel("未连接")
         self.device_info_label.setObjectName("muted")
-        self.search_device_button = QPushButton("搜索设备")
-        self.connect_device_button = QPushButton("连接")
+        self.connect_device_button = QPushButton("一键连接")
         self.disconnect_device_button = QPushButton("断开")
         grid.addWidget(QLabel("设备"), 0, 0)
         grid.addWidget(self.device_combo, 0, 1, 1, 3)
-        grid.addWidget(self.search_device_button, 0, 4)
-        grid.addWidget(self.connect_device_button, 0, 5)
-        grid.addWidget(self.disconnect_device_button, 0, 6)
-        grid.addWidget(self.device_info_label, 1, 1, 1, 6)
+        grid.addWidget(self.connect_device_button, 0, 4)
+        grid.addWidget(self.disconnect_device_button, 0, 5)
+        grid.addWidget(self.device_info_label, 1, 1, 1, 5)
 
         transfer = QGroupBox("G-code 传输与执行")
         transfer_grid = QGridLayout(transfer)
@@ -560,7 +822,6 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(lambda: self.select_visible(False))
         self.copy_button.clicked.connect(self.copy_gcode)
         self.go_start_button.clicked.connect(self.show_start_page)
-        self.search_device_button.clicked.connect(self.discover_wireless_devices)
         self.connect_device_button.clicked.connect(self.connect_wireless_device)
         self.disconnect_device_button.clicked.connect(self.disconnect_wireless_device)
         self.storage_combo.currentTextChanged.connect(self.update_remote_path_root)
@@ -1109,6 +1370,7 @@ class MainWindow(QMainWindow):
     def discover_wireless_devices(self) -> None:
         self.log_connection("search: UDP broadcast BANPCBTOOL?")
         found: dict[str, WirelessDevice] = {}
+        udp = None
         try:
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1118,50 +1380,280 @@ class MainWindow(QMainWindow):
                 try:
                     data, address = udp.recvfrom(512)
                 except socket.timeout:
+                    QApplication.processEvents()  # 搜索等待期间保持界面响应
                     continue
                 device = self.parse_discovery_packet(data, address[0])
                 if device:
                     found[device.ip] = device
         except OSError as exc:
-            QMessageBox.warning(self, "搜索失败", str(exc))
             self.log_connection(f"search error: {exc}")
-            return
         finally:
-            try:
-                udp.close()
-            except Exception:
-                pass
+            if udp is not None:
+                try:
+                    udp.close()
+                except Exception:
+                    pass
+        if DEFAULT_DEVICE_IP not in found:
+            fallback = WirelessDevice("BanPCBTool", DEFAULT_DEVICE_IP, ap=True)
+            found[DEFAULT_DEVICE_IP] = fallback
+            self.log_connection(
+                f"fallback: {fallback.name} {DEFAULT_DEVICE_IP} (AP 固定 IP)")
         self.devices = list(found.values())
         self.refresh_device_combo()
+        self.select_fixed_ip_device()
         for device in self.devices:
             mode = "AP" if device.ap else "STA"
             self.log_connection(f"found: {device.name} {device.ip}:{device.bridge_port} {mode} wifi={device.wifi or '-'}")
 
-    def connect_wireless_device(self) -> None:
-        device = self.selected_wireless_device()
-        if not device:
-            QMessageBox.information(self, "未选择设备", "请先搜索并选择 BanPCBTool。")
-            return
-        self.disconnect_wireless_device(show_status=False)
+    def select_fixed_ip_device(self) -> None:
+        for index in range(self.device_combo.count()):
+            device = self.device_combo.itemData(index)
+            if isinstance(device, WirelessDevice) and device.ip == DEFAULT_DEVICE_IP:
+                self.device_combo.setCurrentIndex(index)
+                break
+
+    def try_auto_connect_hotspot(self) -> bool:
+        """扫描附近 WiFi，自动把电脑 Wi-Fi 切到模块热点；成功返回 True。"""
+        self._prev_ssid = current_wifi_ssid()  # 记住切热点前的网络，配网后自动切回
+        target = ""
         try:
-            sock = socket.create_connection((device.ip, device.bridge_port), timeout=3.0)
-            sock.settimeout(0.6)
-            self.bridge_socket = sock
-            self.connected_device = device
-            self.log_connection(f"connect: {device.name} {device.ip}:{device.bridge_port}")
-            sock.sendall(b"@BPC HELLO\r\n")
-            response = self.read_bridge_response(1.2)
-            if response:
-                self.log_connection(response)
-            if "BanPCBTool" not in response and "@BPC OK" not in response:
-                self.log_connection("warning: ESP8266 did not return the expected name")
-            self.device_info_label.setText(f"已连接 {device.name} ({device.ip})")
-            self.statusBar().showMessage("无线模块已连接", 2500)
-        except OSError as exc:
-            self.bridge_socket = None
-            self.connected_device = None
-            QMessageBox.warning(self, "连接失败", str(exc))
+            for ssid in scan_local_wifi():
+                if ssid.lower().startswith(DEFAULT_DEVICE_NAME.lower()):
+                    target = ssid
+                    break
+        except Exception:
+            target = ""
+        if not target:
+            self.statusBar().showMessage("未扫描到模块热点", 3000)
+            QMessageBox.information(
+                self, "未找到模块热点",
+                f"附近没扫到 {DEFAULT_DEVICE_NAME} 热点。\n\n"
+                "请确认模块已通电、无线网卡已开启后重试，\n"
+                "也可以手动在电脑 Wi-Fi 列表里连接该热点后再点\"一键连接\"。")
+            return False
+        self.statusBar().showMessage(f"正在自动连接热点 {target} ...", 0)
+        self.log_connection(f"auto connect hotspot: {target}")
+        if connect_to_hotspot(target):
+            self.statusBar().showMessage(f"已连接模块热点 {target}", 2500)
+            self.log_connection("hotspot connected")
+            return True
+        self.statusBar().showMessage("自动连接热点失败", 3000)
+        QMessageBox.warning(
+            self, "自动连接失败",
+            f"尝试自动连接热点「{target}」失败。\n\n"
+            "请手动在电脑 Wi-Fi 列表中选择该热点（无密码）连接后，"
+            "再点\"一键连接\"。")
+        return False
+
+    def _tcp_connect(self, host: str, port: int, timeout: float = 2.5) -> socket.socket:
+        """非阻塞 TCP 连接，连接等待期间保持界面响应；失败抛 OSError。"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"连接 {host}:{port} 超时")
+                try:
+                    sock.connect((host, port))
+                except (BlockingIOError, InterruptedError):
+                    pass  # 连接进行中，等待可写
+                except OSError:
+                    sock.close()
+                    raise
+                else:
+                    sock.setblocking(True)
+                    sock.settimeout(0.6)
+                    return sock
+                _, writable, _ = select.select([], [sock], [], min(0.1, remaining))
+                if writable:
+                    err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    if err == 0:
+                        sock.setblocking(True)
+                        sock.settimeout(0.6)
+                        return sock
+                    sock.close()
+                    raise OSError(err, os.strerror(err) or f"连接 {host}:{port} 失败")
+                QApplication.processEvents()
+        except BaseException:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def connect_wireless_device(self) -> None:
+        # 一键连接：自动搜索 -> 选设备 -> 连接；失败时自动切热点或弹配网
+        if getattr(self, "_connecting", False):
+            return
+        if self.bridge_socket:
+            self.statusBar().showMessage("已连接，无需重复连接", 2000)
+            return
+        # 连接过程中禁用两个按钮，避免等待期间用户点按触发重入导致状态错乱
+        self._connecting = True
+        self.connect_device_button.setEnabled(False)
+        self.disconnect_device_button.setEnabled(False)
+        device: WirelessDevice | None = None
+        try:
+            for _attempt in (1, 2):
+                try:
+                    self.discover_wireless_devices()
+                    QApplication.processEvents()
+                    device = self.selected_wireless_device()
+                    if not device:
+                        self.log_connection("connect error: no device")
+                        self.statusBar().showMessage("未发现设备，请确认模块已上电", 3000)
+                        return
+                    self.log_connection(
+                        f"connect: {device.name} {device.ip}:{device.bridge_port}")
+                    sock = self._tcp_connect(device.ip, device.bridge_port, timeout=2.5)
+                    self.bridge_socket = sock
+                    self.connected_device = device
+                    self.log_connection(
+                        f"connect ok: {device.name} {device.ip}:{device.bridge_port}")
+                    sock.sendall(b"@BPC HELLO\r\n")
+                    response = self.read_bridge_response(1.2)
+                    if response:
+                        self.log_connection(response)
+                    if "BanPCBTool" not in response and "@BPC OK" not in response:
+                        self.log_connection("warning: ESP8266 did not return the expected name")
+                    self.device_info_label.setText(f"已连接 {device.name} ({device.ip})")
+                    # 查询模块状态：处于 AP 模式且未连上路由器 = 尚未配网
+                    ap_mode = False
+                    sta_ok = False
+                    sock.sendall(b"@BPC STATUS\r\n")
+                    status_text = self.read_bridge_response(1.2)
+                    if "{" in status_text:
+                        try:
+                            info = json.loads(
+                                status_text[status_text.index("{"):status_text.rindex("}") + 1])
+                            ap_mode = bool(info.get("ap"))
+                            sta_ok = bool(info.get("wifi"))
+                            self.log_connection(f"status: {status_text.strip()}")
+                        except (ValueError, json.JSONDecodeError):
+                            pass
+                    if ap_mode and not sta_ok:
+                        self.statusBar().showMessage("模块尚未配网，请配网", 3000)
+                        self.show_provision_dialog(device)
+                    elif device.ip == DEFAULT_DEVICE_IP and not sta_ok:
+                        # 连上了 192.168.4.1（模块 AP 模式 = 未配网），但 STATUS 响应没解析出
+                        # 已连路由器的证据 → 兜底仍然弹配网窗，避免静默失败
+                        self.log_connection(f"status raw: {status_text!r}")
+                        self.statusBar().showMessage("模块尚未配网，请配网", 3000)
+                        self.show_provision_dialog(device)
+                    else:
+                        self.statusBar().showMessage("无线模块已连接", 2500)
+                    return
+                except OSError as exc:
+                    self.bridge_socket = None
+                    self.connected_device = None
+                    self.log_connection(f"connect error: {exc}")
+                    if not device or not device.ap:
+                        self.statusBar().showMessage(f"连接失败: {exc}", 3000)
+                        return
+                    cur = current_wifi_ssid()
+                    if cur.lower().startswith(DEFAULT_DEVICE_NAME.lower()):
+                        # 电脑已连模块热点但连接 8266 端口仍失败
+                        QMessageBox.warning(
+                            self, "连接超时",
+                            f"电脑已连接模块热点（当前 WiFi：{cur}），但连接 8266 端口超时。\n"
+                            "请确认：模块已通电、热点名称以 BanPCBTool 开头。\n"
+                            "可尝试给模块断电重启后，再点\"一键连接\"。")
+                        return
+                    # 电脑没连模块热点：自动扫描并切换热点，再重试连接
+                    self.log_connection("not on module hotspot, auto switching ...")
+                    if self.try_auto_connect_hotspot():
+                        self.statusBar().showMessage("已连上模块热点，正在连接模块...", 0)
+                        QApplication.processEvents()
+                        continue  # 第二轮重试连接
+                    return
+            self.statusBar().showMessage("自动连接热点失败，请手动连接后再试", 3000)
+        except Exception as exc:  # noqa: BLE001  未预期异常统一兜底，不再弹未处理异常窗
             self.log_connection(f"connect error: {exc}")
+            self.statusBar().showMessage(f"连接失败: {exc}", 3000)
+        finally:
+            self._connecting = False
+            self.connect_device_button.setEnabled(True)
+            self.disconnect_device_button.setEnabled(True)
+
+    def show_provision_dialog(self, device: WirelessDevice | None = None) -> None:
+        """首次连接时的简洁配网弹窗：本地扫描 WiFi + 密码 + 保存。"""
+        target = (device or self.selected_wireless_device()
+                  or WirelessDevice("BanPCBTool", DEFAULT_DEVICE_IP))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("WiFi 配网")
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("模块尚未配网。请确认电脑已连接模块热点"
+                      f"（{DEFAULT_DEVICE_NAME}-xxxx，即 192.168.4.1）后再保存。\n"
+                      "选择要连接的 WiFi 并输入密码，保存后模块会自动重启并连接该 WiFi。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        row = QHBoxLayout()
+        scan_box = QComboBox()
+        scan_button = QPushButton("扫描")
+        row.addWidget(QLabel("WiFi:"))
+        row.addWidget(scan_box, 1)
+        row.addWidget(scan_button)
+        layout.addLayout(row)
+        pass_form = QFormLayout()
+        pass_edit = QLineEdit()
+        pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pass_form.addRow("密码:", pass_edit)
+        layout.addLayout(pass_form)
+        buttons = QHBoxLayout()
+        save_button = QPushButton("保存配网")
+        cancel_button = QPushButton("取消")
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+        layout.addLayout(buttons)
+
+        def fill_local() -> None:
+            scan_box.clear()
+            for name in scan_local_wifi():
+                scan_box.addItem(name)
+            if scan_box.count():
+                scan_box.setCurrentIndex(0)
+                scan_button.setText("重新扫描")
+                scan_button.setToolTip("从本机网卡重新扫描")
+            else:
+                scan_button.setText("扫描")
+                scan_box.setEditable(True)
+                scan_box.setPlaceholderText("未扫描到 WiFi，请手动输入名称")
+
+        def save() -> None:
+            ssid = scan_box.currentText().strip()
+            if not ssid:
+                QMessageBox.information(dialog, "缺少 WiFi", "请选择或输入 WiFi 名称。")
+                return
+            old_connected = self.connected_device
+            self.connected_device = target
+            try:
+                result = self.http_json("/api/wifi", {"ssid": ssid, "pass": pass_edit.text()})
+                self.log_connection(
+                    f"provision ok: ssid={ssid} -> {json.dumps(result, ensure_ascii=False)}")
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "保存失败", str(exc))
+                return
+            finally:
+                self.connected_device = old_connected
+            QMessageBox.information(
+                dialog, "配网成功",
+                f"已保存 WiFi「{ssid}」。\n模块正在重启并连接新 WiFi，"
+                "电脑会与模块热点断开，正在尝试自动切回原网络，"
+                "约 10 秒后点\"一键连接\"即可。")
+            prev = getattr(self, "_prev_ssid", "")
+            if prev and prev != ssid:
+                QTimer.singleShot(2000, lambda: reconnect_wifi(prev))
+            dialog.accept()
+
+        scan_button.clicked.connect(fill_local)
+        save_button.clicked.connect(save)
+        cancel_button.clicked.connect(dialog.reject)
+        fill_local()
+        dialog.resize(420, 170)
+        dialog.exec()
 
     def disconnect_wireless_device(self, show_status: bool = True) -> None:
         if self.bridge_socket:
@@ -1176,14 +1668,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("无线连接已断开", 2000)
 
     def read_bridge_response(self, timeout_s: float = 2.0) -> str:
-        if not self.bridge_socket:
+        sock = self.bridge_socket
+        if sock is None:
             return ""
         chunks: list[bytes] = []
-        self.bridge_socket.settimeout(0.2)
+        try:
+            sock.settimeout(0.2)
+        except OSError:
+            return ""
         stop_at = time.monotonic() + timeout_s
         while time.monotonic() < stop_at:
             try:
-                chunk = self.bridge_socket.recv(1024)
+                chunk = sock.recv(1024)
             except socket.timeout:
                 QApplication.processEvents()
                 continue
@@ -1198,10 +1694,11 @@ class MainWindow(QMainWindow):
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
 
     def send_bridge_command(self, command: str, timeout_s: float = 2.5) -> str:
-        if not self.bridge_socket:
+        sock = self.bridge_socket
+        if not sock:
             raise OSError("无线设备未连接")
         self.log_connection(f"> {command}")
-        self.bridge_socket.sendall(command.encode("ascii") + b"\r\n")
+        sock.sendall(command.encode("ascii") + b"\r\n")
         response = self.read_bridge_response(timeout_s)
         if response:
             self.log_connection(response)
@@ -1297,7 +1794,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
         device = self.connected_device or self.selected_wireless_device()
-        host_edit = QLineEdit(device.ip if device else "")
+        host_edit = QLineEdit(device.ip if device else DEFAULT_DEVICE_IP)
         ssid_edit = QLineEdit()
         pass_edit = QLineEdit()
         pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1346,9 +1843,16 @@ class MainWindow(QMainWindow):
             return result
 
         def scan_wifi() -> None:
+            # 优先从本机网卡扫描（AP 模式下模块 /api/scan 可能不可用）
+            local = scan_local_wifi()
+            scan_box.clear()
+            for name in local:
+                scan_box.addItem(name)
+            if local:
+                info.appendPlainText(f"本地扫描到 {len(local)} 个 WiFi，请从下拉框选择。")
+                return
             try:
                 result = call("/api/scan")
-                scan_box.clear()
                 for item in result if isinstance(result, list) else []:
                     name = str(item.get("ssid", ""))
                     if name:

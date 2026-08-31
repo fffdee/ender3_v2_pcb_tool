@@ -2,12 +2,12 @@
 =================================================== keil-build-viewer v1.6 ==================================================
  
 [Search keil project] 1 item(s)
-	D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
+	E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
 
 [User input] 
-[Current folder] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM
+[Current folder] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM
 [Encoding] 936
-[Keil project path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
+[Keil project path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
 [Keil project name] ender3 v2.uvprojx
 [Is keil v4] 0
 [target name] ender3 v2
@@ -34,7 +34,7 @@ Note: source file '../Banux/02_system_components/event/component_manifest.c' - o
 Note: source file '../Banux/03_application_components/firmware_upgrade/component_manifest.c' - object file renamed from 'ender3 v2\upgrade_component_manifest.o' to 'ender3 v2\upgrade_component_manifest.o'.
 'upgrade_component_manifest.c' rename to 'upgrade_component_manifest.o'
 
-[map file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.map
+[map file path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.map
 
 [region info]
 [load region] LR_IROM1
@@ -230,9 +230,9 @@ LR_IROM1
         FLASH 1           [0x08008000 | 0x00070000 (458752)]
                 ER_IROM1  [0x08008000]|■■■■■■■___________________________________________| (  69.6 KB / 448.0 KB )  15.5%  
  
-[htm file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
+[htm file path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
 Maximum Stack Usage =       1376 bytes + Unknown(Functions without stacksize, Cycles, Untraceable Function Pointers)
  
 =============================================================================================================================
 
-run time: 0.186 s
+run time: 0.244 s

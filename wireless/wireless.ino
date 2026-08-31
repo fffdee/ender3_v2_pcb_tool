@@ -119,9 +119,10 @@ static void startBridgeServices() {
 
 static void startConfigAp() {
     if (apRunning) return;
-    String suffix = String(ESP.getChipId(), HEX);
-    String ssid = deviceName() + "-" + suffix;
+    String ssid = deviceName();
     WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
     WiFi.softAP(ssid.c_str());
     apRunning = true;
     startBridgeServices();
@@ -164,7 +165,10 @@ static void handleRoot() {
     html += "<!doctype html><html><head><meta charset='utf-8'>";
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<title>BanPCBTool</title></head><body>";
-    html += "<h2>BanPCBTool WiFi</h2><pre>" + jsonInfo() + "</pre>";
+    html += "<h2>BanPCBTool WiFi</h2>";
+    html += "<p>AP fixed IP: <b>192.168.4.1</b> (connect to the hotspot then open "
+            "http://192.168.4.1)</p>";
+    html += "<pre>" + jsonInfo() + "</pre>";
     html += "<form method='post' action='/api/wifi'>";
     html += "SSID:<br><input name='ssid' value='" + String(cfg.ssid) + "'><br>";
     html += "Password:<br><input name='pass' type='password'><br><br>";
@@ -228,7 +232,8 @@ static void handleOtaUrl() {
         return;
     }
     httpServer.send(200, "application/json", "{\"ok\":1,\"message\":\"ota started\"}");
-    t_httpUpdate_return result = ESPhttpUpdate.update(httpServer.arg("url"));
+    WiFiClient otaClient;
+    t_httpUpdate_return result = ESPhttpUpdate.update(otaClient, httpServer.arg("url"));
     if (result == HTTP_UPDATE_FAILED) {
         sendTcpLine("@BPC OTA_FAILED " + String(ESPhttpUpdate.getLastError()));
     }
@@ -306,7 +311,8 @@ static void handleControlLine(const String &line, bool fromTcp) {
         }
     } else if (cmd.startsWith("OTA ")) {
         if (fromTcp) sendTcpLine("@BPC OK ota");
-        ESPhttpUpdate.update(cmd.substring(4));
+        WiFiClient otaClient;
+        ESPhttpUpdate.update(otaClient, cmd.substring(4));
     } else if (cmd == "RESTART") {
         if (fromTcp) sendTcpLine("@BPC OK restart");
         scheduleRestart(300);
