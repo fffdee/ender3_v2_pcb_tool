@@ -12,16 +12,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import openpyxl
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
+from PyQt6.QtGui import (QAction, QColor, QFont, QPainter, QPainterPath, QPen,
+                         QPolygonF, QTextCursor)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -38,11 +41,13 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_2_2026_08_27.xlsx"
+DEVICE_CONFIG_PATH = ROOT / "device_connection.json"
 DISCOVERY_PORT = 8267
 BRIDGE_PORT = 8266
 UPLOAD_CHUNK_SIZE = 48
 DEFAULT_DEVICE_IP = "192.168.4.1"  # AP 模式固定 IP
 DEFAULT_DEVICE_NAME = "BanPCBTool"  # 模块热点名称前缀
+DEFAULT_AP_PASSWORD = "12345678"    # Ban-IOT 协议统一 AP 密码
 
 
 def _pump_sleep(seconds: float) -> None:
@@ -238,42 +243,249 @@ def _netsh(args: list[str]) -> subprocess.CompletedProcess:
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def get_local_broadcast_addresses() -> list[str]:
+    """Return all directed broadcast addresses the current host is on
+    (e.g. 192.168.1.255 for each NIC) + 255.255.255.255 + 192.168.4.255 (module AP).
+    Windows routing often silently drops 255.255.255.255 on multi-NIC PCs,
+    so the directed subnet broadcasts dramatically improve discovery hit rate.
+    """
+    result: set[str] = {"255.255.255.255", "192.168.4.255"}
+    try:
+        import netifaces  # type: ignore
+        for iface in netifaces.interfaces():
+            for entry in netifaces.ifaddresses(iface).get(netifaces.AF_INET, []):
+                ip = entry.get("addr", "")
+                mask = entry.get("netmask", "")
+                if not ip or not mask or ip.startswith("127."):
+                    continue
+                try:
+                    ip_bytes = socket.inet_aton(ip)
+                    mask_bytes = socket.inet_aton(mask)
+                    bcast_bytes = bytes(ib | (~mb & 0xFF) for ib, mb in zip(ip_bytes, mask_bytes, strict=False))
+                    result.add(socket.inet_ntoa(bcast_bytes))
+                except OSError:
+                    pass
+        return list(result)
+    except Exception:
+        try:
+            _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+            for ip in ips:
+                if ip.startswith("127."):
+                    continue
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    result.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+        except (socket.herror, OSError):
+            pass
+        return list(result)
+
+
+def get_local_lan_prefixes() -> list[str]:
+    """Return list of "x.y.z" 24-bit prefixes this PC lives on (sorted by priority).
+    优先选 192.168.x.x → 10.x.x.x → 172.16-31.x.x；忽略 127/169.254/192.168.4(模块AP)。
+    每个前缀对应的本机完整 IP 用空格另存。返回 [("192.168.220", "192.168.220.15"), ...]。
+    """
+    nics: list[tuple[str, str]] = []
+    try:
+        import netifaces  # type: ignore
+        for iface in netifaces.interfaces():
+            for entry in netifaces.ifaddresses(iface).get(netifaces.AF_INET, []):
+                ip = entry.get("addr", "")
+                if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+                    continue
+                parts = ip.split(".")
+                if len(parts) != 4:
+                    continue
+                # 跳过模块 AP 默认网段（192.168.4.x）—— 除非它是唯一网卡
+                if parts[0] == "192" and parts[1] == "168" and parts[2] == "4":
+                    continue
+                prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                nics.append((prefix, ip))
+        if nics:
+            # 按常见家庭路由网段优先：192.168.x > 172.16-31 > 10.x
+            def _rank(item: tuple[str, str]) -> int:
+                p = item[0]
+                if p.startswith("192.168."):
+                    return 0
+                if p.startswith("10."):
+                    return 2
+                a, b, _ = p.split(".", 2)
+                if a == "172" and 16 <= int(b) <= 31:
+                    return 1
+                return 3
+            nics.sort(key=_rank)
+            return nics
+    except Exception:
+        pass
+    # fallback without netifaces
+    try:
+        _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+        for ip in ips:
+            if not ip or ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("192.168.4."):
+                continue
+            parts = ip.split(".")
+            if len(parts) == 4:
+                nics.append((f"{parts[0]}.{parts[1]}.{parts[2]}", ip))
+    except (socket.herror, OSError):
+        pass
+    return nics
+
+
+def is_ip_busy(ip: str, tcp_ports: tuple[int, ...] = (80, 8266), tcp_timeout: float = 0.25) -> bool:
+    """快速判断一个 IP 是否被局域网内其他主机占用。
+    先试 TCP 80(HTTP)/8266(桥接) 200ms 快速 SYN；都不通再试 ICMP ping（subprocess ping，800ms 超时）。
+    任何一个通就算 IP 已占用。
+    """
+    for port in tcp_ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(tcp_timeout)
+        try:
+            s.connect((ip, port))
+            return True
+        except (socket.timeout, TimeoutError, OSError):
+            pass
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    # ICMP 兜底：Windows ping -n 1 -w 600
+    try:
+        if sys.platform.startswith("win"):
+            proc = subprocess.run(
+                ["ping.exe", "-n", "1", "-w", "600", "-l", "1", ip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return proc.returncode == 0
+        proc = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def suggest_static_ip(fallback_prefix: str = "192.168.1",
+                      avoid_ips: list[str] | None = None,
+                      check_conflict: bool = True,
+                      max_tries: int = 12) -> str:
+    """推荐一个无人使用的静态 IP（对齐用户需求：192.168.xx.xx，后两段随机/不冲突）。
+    - 自动获取 PC 所在的家庭网段前缀 x.y.z；拿不到才用 fallback_prefix（默认 192.168.1）
+    - 主机号在 100~240 之间随机挑候选，避开 avoid_ips（saved_device.ip 等）
+    - check_conflict=True 时对每个候选做 TCP 80/8266 + ICMP 冲突检测
+    - 12 轮都冲突就返回最后一个候选（让用户自己改），不会抛异常
+    """
+    prefixes = get_local_lan_prefixes()
+    if prefixes:
+        chosen_prefix, _my_ip = prefixes[0]
+    else:
+        chosen_prefix = fallback_prefix
+
+    avoid = set(avoid_ips or [])
+    # 把本机 IP 也加到避免列表
+    for _, myip in prefixes:
+        avoid.add(myip)
+    # 典型网关 x.y.z.1 / x.y.z.254 不选
+    avoid.add(f"{chosen_prefix}.1")
+    avoid.add(f"{chosen_prefix}.254")
+    avoid.add(f"{chosen_prefix}.255")
+
+    import random
+    rng = random.Random()
+    candidate = ""
+    for _ in range(max_tries):
+        host = rng.randint(100, 240)
+        ip = f"{chosen_prefix}.{host}"
+        if ip in avoid:
+            continue
+        candidate = ip
+        if not check_conflict:
+            return ip
+        if not is_ip_busy(ip):
+            return ip
+    return candidate or f"{chosen_prefix}.200"
+
+
+def build_wlan_profile(ssid: str, password: str | None = None) -> str:
+    """生成 WLAN profile XML。
+    - 有 password → WPA2-PSK/AES（模块 AP 模式，对齐 Ban-IOT）
+    - 无 password → 开放热点（向后兼容）
+    """
+    esc_s = ssid.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if password:
+        esc_p = password.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return (
+            '<?xml version="1.0"?>\n'
+            '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+            f"    <name>{esc_s}</name>\n"
+            "    <SSIDConfig>\n"
+            "        <SSID>\n"
+            f"            <name>{esc_s}</name>\n"
+            "        </SSID>\n"
+            "    </SSIDConfig>\n"
+            "    <connectionType>ESS</connectionType>\n"
+            "    <connectionMode>auto</connectionMode>\n"
+            "    <MSM>\n"
+            "        <security>\n"
+            "            <authEncryption>\n"
+            "                <authentication>WPA2PSK</authentication>\n"
+            "                <encryption>AES</encryption>\n"
+            "                <useOneX>false</useOneX>\n"
+            "            </authEncryption>\n"
+            "            <sharedKey>\n"
+            "                <keyType>passPhrase</keyType>\n"
+            "                <protected>false</protected>\n"
+            f"                <keyMaterial>{esc_p}</keyMaterial>\n"
+            "            </sharedKey>\n"
+            "        </security>\n"
+            "    </MSM>\n"
+            "</WLANProfile>"
+        )
+    return (
+        '<?xml version="1.0"?>\n'
+        '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+        f"    <name>{esc_s}</name>\n"
+        "    <SSIDConfig>\n"
+        "        <SSID>\n"
+        f"            <name>{esc_s}</name>\n"
+        "        </SSID>\n"
+        "    </SSIDConfig>\n"
+        "    <connectionType>ESS</connectionType>\n"
+        "    <connectionMode>auto</connectionMode>\n"
+        "    <MSM>\n"
+        "        <security>\n"
+        "            <authEncryption>\n"
+        "                <authentication>open</authentication>\n"
+        "                <encryption>none</encryption>\n"
+        "                <useOneX>false</useOneX>\n"
+        "            </authEncryption>\n"
+        "        </security>\n"
+        "    </MSM>\n"
+        "</WLANProfile>"
+    )
+
+
 def build_open_profile(ssid: str) -> str:
-    """生成开放热点（无密码）的 WLAN profile XML。"""
-    esc = ssid.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return (f'<?xml version="1.0"?>\n'
-            f'<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
-            f"    <name>{esc}</name>\n"
-            f"    <SSIDConfig>\n"
-            f"        <SSID>\n"
-            f"            <name>{esc}</name>\n"
-            f"        </SSID>\n"
-            f"    </SSIDConfig>\n"
-            f"    <connectionType>ESS</connectionType>\n"
-            f"    <connectionMode>auto</connectionMode>\n"
-            f"    <MSM>\n"
-            f"        <security>\n"
-            f"            <authEncryption>\n"
-            f"                <authentication>open</authentication>\n"
-            f"                <encryption>none</encryption>\n"
-            f"                <useOneX>false</useOneX>\n"
-            f"            </authEncryption>\n"
-            f"        </security>\n"
-            f"    </MSM>\n"
-            f"</WLANProfile>")
+    """兼容旧代码：生成开放热点（无密码）的 WLAN profile XML。"""
+    return build_wlan_profile(ssid, None)
 
 
-def connect_to_hotspot(ssid: str, timeout: float = 15.0) -> bool:
-    """把电脑 Wi-Fi 自动切换到指定开放热点；连上后返回 True。"""
+def connect_to_hotspot(ssid: str, password: str | None = None,
+                       timeout: float = 15.0) -> bool:
+    """把电脑 Wi-Fi 自动切换到指定热点；连上后返回 True。
+    - 有 password → WPA2-PSK（新固件 AP 模式）
+    - 无 password → 开放热点（向后兼容）
+    """
     if sys.platform != "win32":
         return False
     path = None
     try:
         with tempfile.NamedTemporaryFile(
                 "w", suffix=".xml", delete=False, encoding="utf-8") as f:
-            f.write(build_open_profile(ssid))
+            f.write(build_wlan_profile(ssid, password))
             path = f.name
-        _netsh(["add", "profile", f"filename={path}", "user=current"])  # 重复添加报错可忽略
+        # 覆盖 profile 再 connect；重复 add 一般只是 warning，可忽略
+        _netsh(["add", "profile", f"filename={path}", "user=current"])
         _netsh(["connect", f"name={ssid}"])
     except (OSError, subprocess.SubprocessError):
         return False
@@ -473,8 +685,11 @@ class MainWindow(QMainWindow):
         self._updating_table = False
         self.devices: list[WirelessDevice] = []
         self.connected_device: WirelessDevice | None = None
+        self.saved_device: WirelessDevice | None = self.load_saved_device()
         self.bridge_socket: socket.socket | None = None
         self._connecting = False
+        self._transfer_busy = False
+        self._terminal_busy = False
         self._prev_ssid = ""
         self.setWindowTitle("Banux PCB 锡膏路径生成器")
         self.resize(1440, 860)
@@ -482,11 +697,30 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._apply_style()
+        # 启动后如果已经有 saved_device，先预填 UI 让用户感知"已记住设备"
+        if self.saved_device and self.saved_device.ip:
+            self.device_name_label.setText(self.saved_device.name or DEFAULT_DEVICE_NAME)
+            suffix = " AP" if self.saved_device.ap else ""
+            hint = (
+                f"{self.saved_device.name or DEFAULT_DEVICE_NAME}  "
+                f"{self.saved_device.ip}:{self.saved_device.bridge_port}{suffix}"
+                f"  WiFi: {self.saved_device.wifi or '—'}"
+                "   （自动重连中…）"
+            )
+            self.device_info_label.setText(hint)
+            self.set_device_state(
+                "offline", f"记住上次设备，重连中 {self.saved_device.ip}:{self.saved_device.bridge_port}")
         target = initial_file
         if target:
             QTimer.singleShot(0, lambda: self.import_workbook(target, show_error=False))
         if initial_gerber:
             QTimer.singleShot(50, lambda: self.import_gerber(initial_gerber, show_error=False))
+        self.device_timer = QTimer(self)
+        self.device_timer.setInterval(3000)
+        self.device_timer.timeout.connect(self.poll_device_status)
+        self.device_timer.start()
+        # 延时 900ms 再做首次探测（给 Windows 多网卡/WiFi 栈就绪留时间）
+        QTimer.singleShot(900, self.poll_device_status)
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("主工具栏")
@@ -504,10 +738,12 @@ class MainWindow(QMainWindow):
         self.export_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "导出 G-code", self)
         self.start_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "开始", self)
         self.settings_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "无线设置", self)
+        self.terminal_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), "命令行", self)
         toolbar.addAction(self.import_gerber_action)
         toolbar.addAction(self.export_action)
         toolbar.addAction(self.start_action)
         toolbar.addAction(self.settings_action)
+        toolbar.addAction(self.terminal_action)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_settings())
@@ -662,18 +898,21 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        connection = QGroupBox("无线连接")
+        connection = QGroupBox("设备")
         grid = QGridLayout(connection)
         self.device_combo = QComboBox()
-        self.device_info_label = QLabel("未连接")
+        self.device_combo.setVisible(False)
+        self.device_status_label = QLabel("离线")
+        self.device_status_label.setObjectName("deviceOffline")
+        self.device_name_label = QLabel(self.saved_device.name if self.saved_device else DEFAULT_DEVICE_NAME)
+        self.device_name_label.setObjectName("statValue")
+        self.device_info_label = QLabel("正在查找设备")
         self.device_info_label.setObjectName("muted")
-        self.connect_device_button = QPushButton("一键连接")
-        self.disconnect_device_button = QPushButton("断开")
-        grid.addWidget(QLabel("设备"), 0, 0)
-        grid.addWidget(self.device_combo, 0, 1, 1, 3)
-        grid.addWidget(self.connect_device_button, 0, 4)
-        grid.addWidget(self.disconnect_device_button, 0, 5)
-        grid.addWidget(self.device_info_label, 1, 1, 1, 5)
+        self.first_setup_button = QPushButton("首次设置")
+        grid.addWidget(self.device_status_label, 0, 0)
+        grid.addWidget(self.device_name_label, 0, 1, 1, 3)
+        grid.addWidget(self.first_setup_button, 0, 4)
+        grid.addWidget(self.device_info_label, 1, 0, 1, 5)
 
         transfer = QGroupBox("G-code 传输与执行")
         transfer_grid = QGridLayout(transfer)
@@ -697,11 +936,12 @@ class MainWindow(QMainWindow):
         self.connection_log.setReadOnly(True)
         self.connection_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.connection_log.setFont(QFont("Consolas", 9))
+        self.connection_log.setVisible(False)
 
         layout.addWidget(connection)
         layout.addWidget(transfer)
-        layout.addWidget(QLabel("通信日志"))
-        layout.addWidget(self.connection_log, 1)
+        layout.addWidget(self.connection_log)
+        layout.addStretch(1)
         page_layout.addWidget(left_panel, 1)
         page_layout.addWidget(self._build_manual_console())
         return page
@@ -747,6 +987,12 @@ class MainWindow(QMainWindow):
         self.motor_on_button = QPushButton("使能")
         self.motor_off_button = QPushButton("释放")
         self.status_button = QPushButton("状态")
+        self.manual_buttons = [
+            self.y_plus_button, self.y_minus_button, self.x_minus_button,
+            self.x_plus_button, self.z_plus_button, self.z_minus_button,
+            self.e_minus_button, self.e_plus_button, self.motor_on_button,
+            self.motor_off_button, self.status_button,
+        ]
         utility_row.addWidget(self.motor_on_button)
         utility_row.addWidget(self.motor_off_button)
         utility_row.addWidget(self.status_button)
@@ -806,6 +1052,7 @@ class MainWindow(QMainWindow):
         self.export_action.triggered.connect(self.export_gcode)
         self.start_action.triggered.connect(self.show_start_page)
         self.settings_action.triggered.connect(self.show_wireless_settings)
+        self.terminal_action.triggered.connect(self.show_bridge_terminal)
         self.sheet_combo.currentIndexChanged.connect(self.sheet_changed)
         for widget in [self.mode_combo, self.source_combo, self.origin_combo, self.order_combo, self.layer_combo]:
             widget.currentIndexChanged.connect(self.refresh)
@@ -822,8 +1069,7 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(lambda: self.select_visible(False))
         self.copy_button.clicked.connect(self.copy_gcode)
         self.go_start_button.clicked.connect(self.show_start_page)
-        self.connect_device_button.clicked.connect(self.connect_wireless_device)
-        self.disconnect_device_button.clicked.connect(self.disconnect_wireless_device)
+        self.first_setup_button.clicked.connect(self.start_first_setup)
         self.storage_combo.currentTextChanged.connect(self.update_remote_path_root)
         self.upload_button.clicked.connect(self.upload_gcode_to_device)
         self.execute_button.clicked.connect(self.execute_remote_gcode)
@@ -850,6 +1096,9 @@ class MainWindow(QMainWindow):
             QLabel#sectionTitle { font-size: 14px; font-weight: 700; }
             QLabel#muted { color: #68777d; }
             QLabel#statValue { font-size: 16px; font-weight: 700; }
+            QLabel#deviceOnline { min-width: 56px; padding: 5px 9px; color: white; background: #087f5b; border-radius: 4px; font-weight: 700; }
+            QLabel#deviceOffline { min-width: 56px; padding: 5px 9px; color: white; background: #8b1e2d; border-radius: 4px; font-weight: 700; }
+            QLabel#deviceSetup { min-width: 56px; padding: 5px 9px; color: #1c282d; background: #ffd43b; border-radius: 4px; font-weight: 700; }
             QGroupBox { margin-top: 9px; padding-top: 11px; font-weight: 700; border: 1px solid #ccd4d6; border-radius: 5px; background: white; }
             QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; }
             QLineEdit, QComboBox, QDoubleSpinBox { min-height: 28px; padding: 0 6px; background: white; border: 1px solid #bdc7ca; border-radius: 4px; }
@@ -1302,6 +1551,77 @@ class MainWindow(QMainWindow):
         self.disconnect_wireless_device(show_status=False)
         super().closeEvent(event)
 
+    def load_saved_device(self) -> WirelessDevice | None:
+        """读取上一次记住的设备。兼容两种旧格式：
+        1) 新版 6 字段：name/ip/bridge_port/http_port/wifi/ap
+        2) 旧版字段名：device_name/device_ip/port/bridge/last_ip 等都接受
+        """
+        try:
+            data = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+        def _first(*keys: str, default: Any = "") -> Any:
+            for k in keys:
+                if k in data and data[k] not in (None, ""):
+                    return data[k]
+            return default
+
+        ip = str(_first("ip", "device_ip", "last_ip", "host", default=""))
+        name = str(_first("name", "device_name", default=DEFAULT_DEVICE_NAME))
+        if not ip:
+            return None
+
+        try:
+            bp = int(_first("bridge_port", "bridge", "port", default=BRIDGE_PORT))
+        except (TypeError, ValueError):
+            bp = BRIDGE_PORT
+        try:
+            hp = int(_first("http_port", "http", default=80))
+        except (TypeError, ValueError):
+            hp = 80
+        wifi = str(_first("wifi", "ssid", "last_ssid", default=""))
+        ap_raw = _first("ap", "is_ap", "mode", default=False)
+        if isinstance(ap_raw, bool):
+            ap = ap_raw
+        else:
+            s = str(ap_raw).lower()
+            ap = s in {"1", "true", "yes", "on", "ap"}
+        dev = WirelessDevice(
+            name=name or DEFAULT_DEVICE_NAME,
+            ip=ip,
+            bridge_port=bp or BRIDGE_PORT,
+            http_port=hp or 80,
+            wifi=wifi,
+            ap=ap,
+        )
+        # 旧格式读完立刻转存新格式（下次就不用兼容判断）
+        self.save_device(dev)
+        return dev
+
+    def save_device(self, device: WirelessDevice) -> None:
+        self.saved_device = device
+        payload = {
+            "name": device.name,
+            "ip": device.ip,
+            "bridge_port": device.bridge_port,
+            "http_port": device.http_port,
+            "wifi": device.wifi,
+            "ap": device.ap,
+        }
+        # 扩展：保存静态 IP / Topic（如果 dataclass 里有，或者通过 attribute 动态挂的）
+        for extra in ("static_ip", "topic", "uid", "device_type"):
+            val = getattr(device, extra, None)
+            if val:
+                payload[extra] = val
+        try:
+            DEVICE_CONFIG_PATH.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self.log_connection(f"save device failed: {exc}")
+
     def has_prepared_job(self) -> bool:
         if self.mode_combo.currentIndex() == 1:
             return bool(self.current_gerber and self.selected_pad_ids and self.gcode_preview.toPlainText().strip())
@@ -1311,6 +1631,32 @@ class MainWindow(QMainWindow):
         enabled = self.has_prepared_job()
         self.start_action.setEnabled(enabled)
         self.go_start_button.setEnabled(enabled)
+        self.update_device_actions()
+
+    def set_device_state(self, state: str, detail: str = "") -> None:
+        if state == "online":
+            self.device_status_label.setText("在线")
+            self.device_status_label.setObjectName("deviceOnline")
+        elif state == "setup":
+            self.device_status_label.setText("待配网")
+            self.device_status_label.setObjectName("deviceSetup")
+        else:
+            self.device_status_label.setText("离线")
+            self.device_status_label.setObjectName("deviceOffline")
+        self.device_status_label.style().unpolish(self.device_status_label)
+        self.device_status_label.style().polish(self.device_status_label)
+        self.device_info_label.setText(detail)
+        self.update_device_actions()
+
+    def update_device_actions(self) -> None:
+        online = self.bridge_socket is not None
+        prepared = self.has_prepared_job() if hasattr(self, "gcode_preview") else False
+        busy = getattr(self, "_transfer_busy", False)
+        if hasattr(self, "upload_button"):
+            self.upload_button.setEnabled(online and prepared and not busy)
+            self.execute_button.setEnabled(online and prepared and not busy)
+        for button in getattr(self, "manual_buttons", []):
+            button.setEnabled(online and not busy)
 
     def show_start_page(self) -> None:
         if not self.has_prepared_job():
@@ -1318,7 +1664,8 @@ class MainWindow(QMainWindow):
             self.update_start_enabled()
             return
         self.pages.setCurrentWidget(self.start_page)
-        self.statusBar().showMessage("开始页面：搜索 BanPCBTool 并传输 G-code", 2500)
+        self.statusBar().showMessage("设备会自动连接，在线后即可传输或手动操作", 2500)
+        self.poll_device_status()
 
     def update_remote_path_root(self, root: str) -> None:
         current = self.remote_path_edit.text().strip()
@@ -1358,52 +1705,75 @@ class MainWindow(QMainWindow):
             suffix = " AP" if device.ap else ""
             self.device_combo.addItem(
                 f"{device.name}  {device.ip}:{device.bridge_port}{suffix}", device)
-        if self.devices:
-            self.device_info_label.setText(f"发现 {len(self.devices)} 个 BanPCBTool 设备")
-        else:
-            self.device_info_label.setText("没有发现设备")
 
     def selected_wireless_device(self) -> WirelessDevice | None:
+        if self.connected_device:
+            return self.connected_device
         data = self.device_combo.currentData()
-        return data if isinstance(data, WirelessDevice) else None
+        if isinstance(data, WirelessDevice):
+            return data
+        if self.devices:
+            return self.devices[0]
+        return self.saved_device
 
-    def discover_wireless_devices(self) -> None:
-        self.log_connection("search: UDP broadcast BANPCBTOOL?")
+    def discover_wireless_devices(self, include_ap_fallback: bool = False,
+                                  log: bool = False,
+                                  rounds: int = 3,
+                                  extra_broadcast_targets: list[str] | None = None,
+                                  recv_rounds_mult: int = 1) -> list[WirelessDevice]:
+        """UDP 发现 BanPCBTool 设备。
+
+        默认向每个 NIC 子网的定向广播 + 255.255.255.255 + 192.168.4.255 发 3 轮；
+        recv_rounds_mult > 1 时会增加接收窗口，用于配网后密集等待上线。
+        """
+        if log:
+            self.log_connection("search: UDP broadcast BANPCBTOOL?")
         found: dict[str, WirelessDevice] = {}
         udp = None
         try:
+            targets = get_local_broadcast_addresses()
+            if extra_broadcast_targets:
+                targets = list(dict.fromkeys(targets + extra_broadcast_targets))
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             udp.settimeout(0.25)
-            udp.sendto(b"BANPCBTOOL?", ("255.255.255.255", DISCOVERY_PORT))
-            for _ in range(8):
+            for _round in range(max(1, int(rounds))):
+                for bcast in targets:
+                    try:
+                        udp.sendto(b"BANPCBTOOL?", (bcast, DISCOVERY_PORT))
+                    except OSError:
+                        continue
+            for _ in range(8 * max(1, int(recv_rounds_mult))):
                 try:
                     data, address = udp.recvfrom(512)
-                except socket.timeout:
-                    QApplication.processEvents()  # 搜索等待期间保持界面响应
+                except (socket.timeout, TimeoutError):
+                    QApplication.processEvents()
                     continue
                 device = self.parse_discovery_packet(data, address[0])
                 if device:
                     found[device.ip] = device
         except OSError as exc:
-            self.log_connection(f"search error: {exc}")
+            if log:
+                self.log_connection(f"search error: {exc}")
         finally:
             if udp is not None:
                 try:
                     udp.close()
                 except Exception:
                     pass
-        if DEFAULT_DEVICE_IP not in found:
+        if include_ap_fallback and DEFAULT_DEVICE_IP not in found:
             fallback = WirelessDevice("BanPCBTool", DEFAULT_DEVICE_IP, ap=True)
             found[DEFAULT_DEVICE_IP] = fallback
-            self.log_connection(
-                f"fallback: {fallback.name} {DEFAULT_DEVICE_IP} (AP 固定 IP)")
+            if log:
+                self.log_connection(
+                    f"fallback: {fallback.name} {DEFAULT_DEVICE_IP} (AP 固定 IP)")
         self.devices = list(found.values())
         self.refresh_device_combo()
-        self.select_fixed_ip_device()
-        for device in self.devices:
-            mode = "AP" if device.ap else "STA"
-            self.log_connection(f"found: {device.name} {device.ip}:{device.bridge_port} {mode} wifi={device.wifi or '-'}")
+        if log:
+            for device in self.devices:
+                mode = "AP" if device.ap else "STA"
+                self.log_connection(f"found: {device.name} {device.ip}:{device.bridge_port} {mode} wifi={device.wifi or '-'}")
+        return self.devices
 
     def select_fixed_ip_device(self) -> None:
         for index in range(self.device_combo.count()):
@@ -1412,9 +1782,149 @@ class MainWindow(QMainWindow):
                 self.device_combo.setCurrentIndex(index)
                 break
 
+    def pick_auto_device(self, log: bool = False) -> WirelessDevice | None:
+        """发现优先级：UDP 广播发现(3 轮，AP 模式回落兜底) → saved_device。"""
+        devices = self.discover_wireless_devices(
+            include_ap_fallback=True, log=log, rounds=3, recv_rounds_mult=2)
+        if devices:
+            saved = self.saved_device
+            best: WirelessDevice | None = None
+            # 先 STA 模式，优先匹配 saved_device 名字
+            for d in devices:
+                if d.ap:
+                    continue
+                if saved and d.name == (saved.name or DEFAULT_DEVICE_NAME):
+                    best = d
+                    break
+                if best is None:
+                    best = d
+            if best is not None:
+                return best
+            for d in devices:
+                if d.ip != DEFAULT_DEVICE_IP:
+                    return d
+            return devices[0]
+        return self.saved_device
+
+    def query_bridge_info(self) -> dict[str, Any]:
+        if not self.bridge_socket:
+            return {}
+        try:
+            self.bridge_socket.sendall(b"@BPC STATUS\r\n")
+            status_text = self.read_bridge_response(0.8)
+        except OSError:
+            return {}
+        if "{" not in status_text:
+            return {}
+        try:
+            return json.loads(status_text[status_text.index("{"):status_text.rindex("}") + 1])
+        except (ValueError, json.JSONDecodeError):
+            return {}
+
+    def mark_connected(self, device: WirelessDevice, info: dict[str, Any] | None = None) -> None:
+        info = info or {}
+        device.name = str(info.get("name", device.name or DEFAULT_DEVICE_NAME))
+        device.ip = str(info.get("ip", device.ip))
+        device.bridge_port = int(info.get("bridge", device.bridge_port))
+        device.http_port = int(info.get("http", device.http_port))
+        device.wifi = str(info.get("ssid", device.wifi or ""))
+        device.ap = bool(info.get("ap", device.ap))
+        self.connected_device = device
+        self.device_name_label.setText(device.name)
+        self.save_device(device)
+        if device.ap and not bool(info.get("wifi", not device.ap)):
+            self.set_device_state("setup", f"{device.name} 已连接，等待配网")
+        else:
+            address = f"{device.ip}:{device.bridge_port}"
+            self.set_device_state("online", f"{device.name} 已在线  {address}")
+
+    def mark_offline(self, detail: str = "设备离线，开机后会自动重连") -> None:
+        self.connected_device = None
+        if self.bridge_socket:
+            try:
+                self.bridge_socket.close()
+            except OSError:
+                pass
+        self.bridge_socket = None
+        name = self.saved_device.name if self.saved_device else DEFAULT_DEVICE_NAME
+        self.device_name_label.setText(name)
+        self.set_device_state("offline", detail)
+
+    def try_open_device(self, device: WirelessDevice, timeout: float = 0.9) -> bool:
+        if not device or not device.ip:
+            return False
+        try:
+            sock = self._tcp_connect(device.ip, device.bridge_port, timeout=timeout)
+            self.bridge_socket = sock
+            sock.sendall(b"@BPC PING\r\n")
+            response = self.read_bridge_response(0.7)
+            if "@BPC PONG" not in response and "@BPC OK" not in response:
+                sock.sendall(b"@BPC HELLO\r\n")
+                response += "\n" + self.read_bridge_response(0.7)
+            if "@BPC PONG" not in response and "@BPC OK" not in response:
+                raise OSError("设备握手失败")
+            info = self.query_bridge_info()
+            self.mark_connected(device, info)
+            return True
+        except OSError as exc:
+            self.log_connection(f"auto connect failed: {exc}")
+            self.mark_offline()
+            return False
+
+    def poll_device_status(self) -> None:
+        """设备状态轮询（每 3 秒一次，首次启动 900ms 后执行）：
+        1) 已有 TCP 桥接 → @BPC PING 心跳确认；掉线则 mark_offline
+        2) 有 saved_device（用户上次成功连接过的 IP）→ 先直接 TCP saved_device:bridge_port
+           （跳过 UDP 广播，保证即便路由器屏蔽 255.255.255.255 也能秒重连）
+        3) saved_device 不通 → UDP 广播(3 轮 + 子网定向广播 + AP 兜底) + 自动挑选一台连接
+        """
+        if (getattr(self, "_connecting", False)
+                or getattr(self, "_transfer_busy", False)
+                or getattr(self, "_terminal_busy", False)):
+            return
+
+        # —— 1) 心跳检测已有连接 ——
+        if self.bridge_socket:
+            alive = False
+            try:
+                self.bridge_socket.sendall(b"@BPC PING\r\n")
+                response = self.read_bridge_response(0.6)
+                if "@BPC PONG" in response or "@BPC OK" in response:
+                    alive = True
+                    if self.connected_device:
+                        info = self.query_bridge_info()
+                        if info:
+                            self.mark_connected(self.connected_device, info)
+            except OSError:
+                alive = False
+            if not alive:
+                self.mark_offline()
+            else:
+                return
+
+        # —— 2) saved_device 直连 TCP 优先（不必等 UDP 广播）——
+        sd = self.saved_device
+        if sd and sd.ip and not sd.ap and sd.ip != DEFAULT_DEVICE_IP:
+            try:
+                if self.try_open_device(sd, timeout=1.6):
+                    return
+            except Exception as _ex:  # noqa: BLE001
+                self.log_connection(f"saved_device TCP {sd.ip} failed: {_ex}")
+
+        # —— 3) UDP 广播发现 + 自动选 + TCP 建链 ——
+        device = self.pick_auto_device(log=False)
+        if device:
+            try:
+                self.try_open_device(device, timeout=1.0)
+            except Exception as _ex:  # noqa: BLE001
+                self.log_connection(f"auto-pick connect failed: {_ex}")
+
     def try_auto_connect_hotspot(self) -> bool:
-        """扫描附近 WiFi，自动把电脑 Wi-Fi 切到模块热点；成功返回 True。"""
-        self._prev_ssid = current_wifi_ssid()  # 记住切热点前的网络，配网后自动切回
+        """扫描附近 WiFi，自动把电脑 Wi-Fi 切到模块热点；成功返回 True。
+        对齐 Ban-IOT APP：热点前缀 = DEFAULT_DEVICE_NAME，密码固定 = 12345678。
+        连接热点前记住当前连接的 WiFi（存入 self._prev_ssid），配网完成后会自动切回。
+        """
+        self._prev_ssid = current_wifi_ssid()
         target = ""
         try:
             for ssid in scan_local_wifi():
@@ -1427,13 +1937,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("未扫描到模块热点", 3000)
             QMessageBox.information(
                 self, "未找到模块热点",
-                f"附近没扫到 {DEFAULT_DEVICE_NAME} 热点。\n\n"
-                "请确认模块已通电、无线网卡已开启后重试，\n"
-                "也可以手动在电脑 Wi-Fi 列表里连接该热点后再点\"一键连接\"。")
+                f"附近没扫到 {DEFAULT_DEVICE_NAME}XXXX 热点。\n\n"
+                "请确认模块已通电、无线网卡已开启后重试；\n"
+                "如果模块 STA 已经连到家庭 WiFi，请直接 UDP 发现后点\"首次设置\"。\n"
+                "也可以手动在电脑 Wi-Fi 列表里连接该热点后再点\"首次设置\"\n"
+                f"（热点名：{DEFAULT_DEVICE_NAME}XXXX，  密码：{DEFAULT_AP_PASSWORD}）。")
             return False
-        self.statusBar().showMessage(f"正在自动连接热点 {target} ...", 0)
-        self.log_connection(f"auto connect hotspot: {target}")
-        if connect_to_hotspot(target):
+        self.statusBar().showMessage(f"正在自动连接热点 {target} (pwd {DEFAULT_AP_PASSWORD}) ...", 0)
+        self.log_connection(f"auto connect hotspot: {target} pwd={DEFAULT_AP_PASSWORD}")
+        # 优先用带密码的新协议；连接失败再尝试无密码（兼容旧固件未烧录的场景）
+        if connect_to_hotspot(target, DEFAULT_AP_PASSWORD) or connect_to_hotspot(target, None):
             self.statusBar().showMessage(f"已连接模块热点 {target}", 2500)
             self.log_connection("hotspot connected")
             return True
@@ -1441,9 +1954,815 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(
             self, "自动连接失败",
             f"尝试自动连接热点「{target}」失败。\n\n"
-            "请手动在电脑 Wi-Fi 列表中选择该热点（无密码）连接后，"
-            "再点\"一键连接\"。")
+            f"请手动在电脑 Wi-Fi 列表中选择该热点（密码 {DEFAULT_AP_PASSWORD}）连接后，"
+            "再点\"首次设置\"。")
         return False
+
+    def start_first_setup(self) -> None:
+        """Ban-IOT APP 风格的两步配网向导。
+        Step 1：扫描 / 自动连接模块 AP（BanPCBToolXXXX, 12345678）
+        Step 2：让模块扫描附近 WiFi，用户选择后 POST /config 保存，读取设备返回 JSON。
+        """
+        self._connecting = True
+        try:
+            # 如果已经在同一 WiFi 网内 UDP 发现了设备，直接弹出设置面板即可
+            if self.bridge_socket and self.connected_device and not self.connected_device.ap:
+                self.set_device_state("setup", f"{self.connected_device.name} 已在网内，弹出配网面板")
+                self.show_provision_dialog(self.connected_device)
+                return
+            self.set_device_state("setup", "正在查找模块热点 (BanPCBToolXXXX)")
+            # 1) 还没连上模块热点 → 尝试自动切过去
+            curr = current_wifi_ssid()
+            if not curr.lower().startswith(DEFAULT_DEVICE_NAME.lower()):
+                if not self.try_auto_connect_hotspot():
+                    return
+            device = WirelessDevice(DEFAULT_DEVICE_NAME, DEFAULT_DEVICE_IP, ap=True)
+            # 2) 尝试桥接握手；AP 模式下即便 TCP 桥接没通也能走 HTTP 配网，所以这里只是 try
+            if self.try_open_device(device, timeout=2.0):
+                self.show_provision_dialog(self.connected_device or device)
+            else:
+                # TCP 桥接不通但 HTTP 配网接口仍可用（AP 模式就是这个场景）
+                self.log_connection("TCP bridge handshake skipped — use HTTP config via " + DEFAULT_DEVICE_IP)
+                self.device_name_label.setText(device.name)
+                self.set_device_state("setup", f"已连到 {DEFAULT_DEVICE_NAME} AP (HTTP 192.168.4.1)")
+                self.show_provision_dialog(device)
+        finally:
+            self._connecting = False
+
+    def show_provision_dialog(self, device: WirelessDevice | None = None) -> None:
+        """Ban-IOT APP 风格配网面板（和 WifiConfigActivity 流程对齐）。
+        - SSID 下拉框先用模块侧 /scan 结果（更准确，因为模块和要配的 WiFi 在同一物理空间），
+          回退到本机扫描结果 + 手动输入。
+        - POST /config 提交 ssid / pass / topic / static_ip / uid；
+          返回 JSON 含 device_type / device_topic / static_ip / device_uid。
+        """
+        target = (device or self.selected_wireless_device()
+                  or WirelessDevice(DEFAULT_DEVICE_NAME, DEFAULT_DEVICE_IP, ap=True))
+        target_is_ap = bool(target.ap) or target.ip == DEFAULT_DEVICE_IP
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("WiFi 配网  ·  Ban-IOT 协议")
+        dlg.setMinimumWidth(480)
+        vbox = QVBoxLayout(dlg)
+
+        banner = QLabel()
+        banner.setStyleSheet(
+            "padding:10px;border-radius:8px;font-weight:600;"
+            + ("background:#fff3bf;color:#8a5a00;" if target_is_ap
+               else "background:#d3f9d8;color:#087f5b;"))
+        if target_is_ap:
+            banner.setText(f"🔌 当前连接模块 AP · {target.name}  ·  192.168.4.1")
+        else:
+            banner.setText(f"🌐 已入网设备 · {target.name} @ {target.ip}")
+        vbox.addWidget(banner)
+
+        # —— Step 2 配置面板 ——
+        title = QLabel("第 2 步 · 填写要让模块连接的 WiFi")
+        title.setStyleSheet("font-weight:700;font-size:13px;margin-top:4px;")
+        vbox.addWidget(title)
+
+        form = QFormLayout()
+        ssid_row = QHBoxLayout()
+        scan_box = QComboBox()
+        scan_box.setEditable(True)
+        scan_box.setMinimumWidth(220)
+        scan_btn = QPushButton("调模块扫描")
+        local_btn = QPushButton("本机扫描")
+        ssid_row.addWidget(scan_box, 1)
+        ssid_row.addWidget(scan_btn)
+        ssid_row.addWidget(local_btn)
+        ssid_wrap = QWidget()
+        ssid_wrap.setLayout(ssid_row)
+        form.addRow("WiFi 名称 (SSID)", ssid_wrap)
+
+        pass_edit = QLineEdit()
+        pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pass_tip = QLabel("空 = 开放 WiFi 或保留已保存的密码")
+        pass_tip.setStyleSheet("color:#868e96;font-size:11px;")
+        pass_wrap = QWidget()
+        pv = QVBoxLayout(pass_wrap)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.addWidget(pass_edit)
+        pv.addWidget(pass_tip)
+        form.addRow("WiFi 密码", pass_wrap)
+
+        topic_edit = QLineEdit()
+        topic_edit.setPlaceholderText("可选，例如 pcbtool001（用于云端/组群识别）")
+        form.addRow("设备 Topic", topic_edit)
+
+        static_ip_edit = QLineEdit()
+        static_ip_edit.setPlaceholderText(
+            "可选，留空自动推荐未占用静态IP（192.168.x.100~240）；填 DHCP 请手动删除")
+        sip_row = QHBoxLayout()
+        sip_auto_btn = QPushButton("🎲 推荐未占用IP")
+        sip_check_btn = QPushButton("🔎 此IP冲突?")
+        sip_row.addWidget(static_ip_edit, 1)
+        sip_row.addWidget(sip_auto_btn)
+        sip_row.addWidget(sip_check_btn)
+        sip_wrap = QWidget()
+        sip_wrap.setLayout(sip_row)
+        form.addRow("静态 IP", sip_wrap)
+
+        # —— 静态 IP 推荐 & 冲突检测助手 ——
+        def _do_suggest_ip(_checked: bool = False) -> None:
+            saved = [self.saved_device.ip] if (self.saved_device and self.saved_device.ip) else []
+            sip_auto_btn.setEnabled(False)
+            sip_auto_btn.setText("检测中…")
+            QApplication.processEvents()
+
+            def _worker() -> str:
+                return suggest_static_ip(avoid_ips=saved, check_conflict=True)
+
+            def _on_done(ip_: str) -> None:
+                try:
+                    static_ip_edit.setText(ip_)
+                    prefixes = get_local_lan_prefixes()
+                    if prefixes:
+                        p, my = prefixes[0]
+                        log(f"[√] 已推荐静态 IP：{ip_}    (当前PC {my}，网段 {p}.x)")
+                    else:
+                        log(f"[√] 已推荐静态 IP：{ip_}")
+                finally:
+                    sip_auto_btn.setEnabled(True)
+                    sip_auto_btn.setText("🎲 推荐未占用IP")
+
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                exe = getattr(self, "_one_off_pool", None)
+                if exe is None:
+                    exe = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sip")
+                    setattr(self, "_one_off_pool", exe)
+                fut = exe.submit(_worker)
+
+                def _poll() -> None:
+                    if fut.done():
+                        try:
+                            _on_done(fut.result())
+                        except Exception as _ex:  # noqa: BLE001
+                            log(f"[×] 推荐静态IP失败：{_ex}")
+                            sip_auto_btn.setEnabled(True)
+                            sip_auto_btn.setText("🎲 推荐未占用IP")
+                        return
+                    QTimer.singleShot(150, _poll)
+                _poll()
+            except Exception as _ex:  # noqa: BLE001
+                # 无并发支持就同步跑，几秒而已
+                try:
+                    _on_done(_worker())
+                except Exception as _ex2:  # noqa: BLE001
+                    log(f"[×] 推荐静态IP失败：{_ex} / {_ex2}")
+                    sip_auto_btn.setEnabled(True)
+                    sip_auto_btn.setText("🎲 推荐未占用IP")
+
+        def _check_ip(_checked: bool = False) -> None:
+            ip = static_ip_edit.text().strip()
+            if not ip or "." not in ip:
+                QMessageBox.information(dlg, "请先填 IP", "在「静态 IP」里填入地址，然后再测冲突。")
+                return
+            sip_check_btn.setEnabled(False)
+            sip_check_btn.setText("检测中…")
+            QApplication.processEvents()
+
+            def _worker() -> bool:
+                return is_ip_busy(ip)
+
+            def _on_done(busy: bool) -> None:
+                try:
+                    if busy:
+                        log(f"[×] 冲突：{ip} 已经被其他设备占用！建议点「🎲 推荐未占用IP」。")
+                        QMessageBox.warning(dlg, "IP 已被占用",
+                                            f"{ip} 已经有人在用，换一个或点推荐按钮。")
+                    else:
+                        log(f"[√] OK：{ip} 当前未占用，可以使用。")
+                        QMessageBox.information(dlg, "IP 空闲", f"{ip} 当前无其他设备响应，可以使用。")
+                finally:
+                    sip_check_btn.setEnabled(True)
+                    sip_check_btn.setText("🔎 此IP冲突?")
+
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                exe = getattr(self, "_one_off_pool", None)
+                if exe is None:
+                    exe = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sip")
+                    setattr(self, "_one_off_pool", exe)
+                fut = exe.submit(_worker)
+
+                def _poll() -> None:
+                    if fut.done():
+                        try:
+                            _on_done(fut.result())
+                        except Exception as _ex:  # noqa: BLE001
+                            log(f"[×] 冲突检测异常：{_ex}")
+                            sip_check_btn.setEnabled(True)
+                            sip_check_btn.setText("🔎 此IP冲突?")
+                        return
+                    QTimer.singleShot(150, _poll)
+                _poll()
+            except Exception as _ex:  # noqa: BLE001
+                try:
+                    _on_done(_worker())
+                except Exception as _ex2:  # noqa: BLE001
+                    log(f"[×] 冲突检测失败：{_ex} / {_ex2}")
+                    sip_check_btn.setEnabled(True)
+                    sip_check_btn.setText("🔎 此IP冲突?")
+
+        sip_auto_btn.clicked.connect(_do_suggest_ip)
+        sip_check_btn.clicked.connect(_check_ip)
+
+        def _auto_fill_sip_if_empty() -> None:
+            """GET /status 之后如果模块/PC都没填静态IP，自动帮用户推荐一个。"""
+            if static_ip_edit.text().strip():
+                return
+            saved_list = [self.saved_device.ip] if (self.saved_device and self.saved_device.ip) else []
+            try:
+                ip_ = suggest_static_ip(avoid_ips=saved_list, check_conflict=True)
+                static_ip_edit.setText(ip_)
+                log(f"[→] 已自动推荐静态 IP {ip_}（可手动修改或点🎲再抽一次）")
+            except Exception as _ex:  # noqa: BLE001
+                log(f"[·] 自动推荐静态IP 跳过：{_ex}")
+
+        uid_edit = QLineEdit()
+        uid_edit.setPlaceholderText("可选，巴法云 / 其他云端的私钥 UID")
+        uid_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("云端 UID", uid_edit)
+
+        vbox.addLayout(form)
+
+        # 操作按钮
+        row_btn = QHBoxLayout()
+        reconfig_btn = QPushButton("清除 WiFi 并重配")
+        save_btn = QPushButton("保存并重启")
+        save_btn.setStyleSheet(
+            "padding:8px 14px;background:#087f5b;color:white;font-weight:700;border-radius:6px;")
+        cancel_btn = QPushButton("关闭")
+        row_btn.addWidget(reconfig_btn)
+        row_btn.addStretch(1)
+        row_btn.addWidget(cancel_btn)
+        row_btn.addWidget(save_btn)
+        vbox.addLayout(row_btn)
+
+        result_box = QPlainTextEdit()
+        result_box.setReadOnly(True)
+        result_box.setPlaceholderText("保存结果会显示在这里……")
+        result_box.setMaximumBlockCount(120)
+        vbox.addWidget(result_box, 1)
+
+        # --- helpers ---
+        def log(msg: str) -> None:
+            result_box.appendPlainText(msg)
+
+        def temp_select_device() -> None:
+            # 让 http_json 使用目标 device，而不是当前可能没建立 TCP 的 connected_device
+            nonlocal _swap
+            _swap = (self.connected_device, self.devices[:])
+            self.connected_device = target
+
+        def temp_restore_device() -> None:
+            nonlocal _swap
+            if _swap is None:
+                return
+            self.connected_device, self.devices = _swap
+            _swap = None
+
+        _swap: Any = None
+
+        def fill_from_esp_scan() -> None:
+            """GET /scan  -> 让模块自己扫描它能看到的 WiFi（Ban-IOT APP 的 scan 逻辑）。"""
+            temp_select_device()
+            current = scan_box.currentText().strip()
+            try:
+                log("[>] GET /scan (模块侧扫描) ...")
+                result = self.http_json("/scan")
+                names: list[str] = []
+                if isinstance(result, list):
+                    # 按 RSSI 降序排
+                    def rssi(it: dict[str, Any]) -> int:
+                        try:
+                            return int(it.get("rssi", -100))
+                        except (TypeError, ValueError):
+                            return -100
+                    sorted_list = sorted(result, key=rssi, reverse=True)
+                    for item in sorted_list:
+                        name = str(item.get("ssid", "")).strip()
+                        if name and name not in names:
+                            names.append(name)
+                scan_box.clear()
+                for n in names:
+                    scan_box.addItem(n)
+                if current:
+                    idx = scan_box.findText(current)
+                    if idx >= 0:
+                        scan_box.setCurrentIndex(idx)
+                    else:
+                        scan_box.setEditText(current)
+                log(f"[√] 模块扫描到 {len(names)} 个 WiFi，已填入下拉框")
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                log(f"[×] 模块侧扫描失败：{exc}")
+                log("    提示：确认电脑已连到模块热点（或已在同一局域网）")
+            finally:
+                temp_restore_device()
+
+        def fill_from_local_scan() -> None:
+            current = scan_box.currentText().strip()
+            scan_box.clear()
+            names = scan_local_wifi()
+            for n in names:
+                scan_box.addItem(n)
+            if current:
+                idx = scan_box.findText(current)
+                if idx >= 0:
+                    scan_box.setCurrentIndex(idx)
+                else:
+                    scan_box.setEditText(current)
+            log(f"本机扫描到 {len(names)} 个 WiFi（本机连 AP 模式时可能只有周边少量结果）")
+
+        def save_and_reboot() -> None:
+            """对齐 Ban-IOT APP sendConfigToDevice：POST /config + 读 JSON + 等待设备重启上线。
+            保存成功后不会立刻关闭对话框，而是进入“等待设备上线”阶段：
+              - PC 切回原家庭 WiFi（如果之前是连 AP 模式的话）
+              - 密集做 UDP 发现（最多 35 秒），一旦找到 STA 模式新 IP：
+                * 自动建立 TCP 桥接，顶部状态变绿 → 显示“在线 <IP>:<PORT>”
+                * 把新 IP / name / wifi 存到 saved_device（下次启动直接连）
+                * 对话框日志区打出 Web UI / OTA / 静态 IP 等所有操作入口
+                * 弹「配网完成」面板给用户直接打开 Web 配置 / OTA / 完成
+
+            全程 try/except BaseException，任何异常都写日志 + 弹窗，绝不冒泡到 Qt 事件循环闪退。
+            """
+            ssid = scan_box.currentText().strip()
+            pwd = pass_edit.text()
+            if not ssid:
+                QMessageBox.information(dlg, "缺少 WiFi",
+                                        "请先点击\"调模块扫描\"并选择要让模块连接的 WiFi。")
+                return
+
+            # —— UI 存活检测辅助：C++ 对象被删时，Qt/PyQt6 会抛 RuntimeError
+            def _alive() -> bool:
+                try:
+                    # 对任意一个 widget 调属性，如果底层 C++ 对象已删就抛
+                    _ = dlg.windowTitle()
+                    _ = banner.text()
+                    _ = save_btn.text()
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
+
+            dev_topic = ""
+            dev_type = ""
+            dev_sip = ""
+            dev_uid = ""
+            user_hint_static_ip = ""
+            prev_ssid = ""
+
+            try:
+                # 1) 保存：优先 POST /config（Ban-IOT 协议），老固件 404 就 fallback /api/wifi
+                temp_select_device()
+                saved_ok = False
+                try:
+                    payload: dict[str, str] = {"ssid": ssid, "pass": pwd}
+                    if topic_edit.text().strip():
+                        payload["topic"] = topic_edit.text().strip()
+                    if static_ip_edit.text().strip():
+                        payload["static_ip"] = static_ip_edit.text().strip()
+                    if uid_edit.text().strip():
+                        payload["uid"] = uid_edit.text().strip()
+                    log(f"[>] POST /config  {urllib.parse.urlencode(payload)}")
+                    try:
+                        resp = self.http_json("/config", payload)
+                    except (urllib.error.HTTPError, OSError) as _ex1:
+                        # 老固件（没有 /config 端点，一般是 HTTP 404 或空响应解析失败）
+                        log(f"[·] 新接口 /config 不可用（{_ex1}），尝试旧版 /api/wifi ...")
+                        legacy: dict[str, str] = {"ssid": ssid, "pass": pwd}
+                        # 老固件不识别 static_ip/topic/uid，但仍然记一下让用户知道
+                        resp = self.http_json("/api/wifi", legacy)
+                    if isinstance(resp, dict):
+                        log("[√] 模块保存成功，返回 JSON：")
+                        log(json.dumps(resp, ensure_ascii=False, indent=2))
+                        dev_topic = str(resp.get("device_topic", payload.get("topic", "")))
+                        dev_type = str(resp.get("device_type", ""))
+                        dev_uid = str(resp.get("device_uid", payload.get("uid", "")))
+                        dev_sip = str(resp.get("static_ip", payload.get("static_ip", "")))
+                    else:
+                        log(f"[√] 保存成功（文本返回）：{resp}")
+                    saved_ok = True
+                except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                    log(f"[×] 保存失败：{exc}")
+                    QMessageBox.warning(dlg, "保存失败", str(exc))
+                finally:
+                    temp_restore_device()
+                if not saved_ok:
+                    return
+
+                # 2) 关闭输入，UI 进入“等待上线”阶段
+                if not _alive():
+                    return
+                for w in (scan_box, scan_btn, local_btn, pass_edit,
+                          topic_edit, static_ip_edit, uid_edit, save_btn,
+                          reconfig_btn):
+                    try:
+                        w.setEnabled(False)
+                    except Exception:
+                        pass
+                banner.setText(
+                    f"📡 已保存 WiFi「{ssid}」，模块将在 3 秒后重启接入该网络…"
+                    f" 等待设备在线中"
+                )
+                banner.setStyleSheet(
+                    "padding:10px;border-radius:8px;font-weight:600;"
+                    "background:#d0ebff;color:#1864ab;")
+                save_btn.setText("已保存")
+                cancel_btn.setText("关闭")
+                try:
+                    self.statusBar().showMessage("模块正在重启，等待上线…", 0)
+                except Exception:
+                    pass
+                self.log_connection(
+                    f"saved wifi {ssid}; waiting ESP reboot (3s) + STA connect")
+
+                # 3) 先把 PC 切回原来的家庭 WiFi（等模块重启 3 秒 之后再切）
+                prev_ssid = getattr(self, "_prev_ssid", "") or ""
+                if prev_ssid.lower().startswith(DEFAULT_DEVICE_NAME.lower()):
+                    # _prev_ssid 是在连 AP 之前记住的家庭 WiFi；不可能等于 AP 名称
+                    # 如果这里是 AP，说明之前记录的值已经被污染；重置为空避免乱切
+                    prev_ssid = ""
+                user_hint_static_ip = static_ip_edit.text().strip() or dev_sip
+
+            except BaseException as _boot_exc:  # noqa: BLE001
+                tb = traceback.format_exc()
+                log(f"[FATAL] save_and_reboot phase1 异常：{_boot_exc}\n{tb}")
+                self.log_connection(f"[provision crash] phase1: {_boot_exc}")
+                try:
+                    QMessageBox.warning(dlg, "配网保存阶段出错",
+                                        f"{_boot_exc}\n\n详细信息已写入日志面板。")
+                except Exception:
+                    pass
+                return
+
+            # —————— 异步阶段：4s 后开始切回家庭 WiFi + 探测设备 ——————
+            wait_ctx: dict[str, Any] = {"attempt": 0, "max_attempts": 35, "stopped": False}
+
+            def _after_reboot_phase() -> None:
+                if wait_ctx["stopped"] or not _alive():
+                    return
+                try:
+                    # 3a) 回连原家庭 WiFi（如果原来的是另一个非AP热点）
+                    if prev_ssid and prev_ssid != ssid and current_wifi_ssid() != prev_ssid:
+                        log(f"[WiFi] 把 PC 切回原 WiFi「{prev_ssid}」，准备寻找模块新地址…")
+                        try:
+                            reconnect_wifi(prev_ssid)
+                        except Exception as _ex:  # noqa: BLE001
+                            log(f"[WiFi] 回连失败：{_ex}（继续探测，可能 PC 已自动切换）")
+
+                    # 3b) 启动密集等待上线的循环（异步，保持界面不卡）
+                    wait_ctx["attempt"] = 0
+                    wait_ctx["stopped"] = False
+                    QTimer.singleShot(200, _probe_once)
+
+                except BaseException as _exc:  # noqa: BLE001
+                    tb = traceback.format_exc()
+                    log(f"[FATAL] _after_reboot_phase 异常：{_exc}\n{tb}")
+                    self.log_connection(f"[provision crash] reboot phase: {_exc}")
+                    try:
+                        QMessageBox.warning(dlg, "等待上线阶段出错",
+                                            f"{_exc}\n\n详细信息已写入日志面板。")
+                    except Exception:
+                        pass
+
+            def _probe_once() -> None:
+                if wait_ctx["stopped"] or not _alive():
+                    wait_ctx["stopped"] = True
+                    return
+                try:
+                    wait_ctx["attempt"] = int(wait_ctx["attempt"]) + 1
+                    attempt = int(wait_ctx["attempt"])
+                    max_attempts = int(wait_ctx["max_attempts"])
+
+                    # 组装额外的广播目标：如果用户指定了 static IP，把该子网广播加入
+                    extra_targets: list[str] | None = None
+                    if (user_hint_static_ip and "." in user_hint_static_ip
+                            and user_hint_static_ip != "0.0.0.0"):
+                        parts = user_hint_static_ip.rsplit(".", 1)
+                        if len(parts) == 2 and parts[0]:
+                            extra_targets = [f"{parts[0]}.255"]
+
+                    sta_devices = self.discover_wireless_devices(
+                        include_ap_fallback=False, log=False,
+                        rounds=2, recv_rounds_mult=2,
+                        extra_broadcast_targets=extra_targets,
+                    )
+
+                    # 优先选 STA 模式（不是 AP），优先匹配 static IP 或已保存 name
+                    online: WirelessDevice | None = None
+                    for candidate in sta_devices:
+                        if candidate.ap:
+                            continue
+                        if user_hint_static_ip and candidate.ip == user_hint_static_ip:
+                            online = candidate
+                            break
+                        if online is None:
+                            online = candidate
+                            continue
+                        # 与 saved_device.name 匹配的优先
+                        if self.saved_device and candidate.name == (
+                                self.saved_device.name or DEFAULT_DEVICE_NAME):
+                            online = candidate
+                    if online is None:
+                        for c in sta_devices:
+                            if c.ip != DEFAULT_DEVICE_IP:
+                                online = c
+                                break
+
+                    banner.setText(
+                        f"📡 等待模块上线（第 {attempt}/{max_attempts} 次）… "
+                        f"已发现 {len(sta_devices)} 台设备"
+                    )
+
+                    if online is None and attempt < max_attempts:
+                        QTimer.singleShot(1000, _probe_once)
+                        return
+
+                    if online is None:
+                        # 多次探测都没找到
+                        banner.setText("⚠️ 未通过 UDP 找到模块，请直接用路由器管理页查看设备 IP")
+                        banner.setStyleSheet(
+                            "padding:10px;border-radius:8px;font-weight:600;"
+                            "background:#fff5f5;color:#c92a2a;")
+                        msg = (
+                            "UDP 广播未在局域网内发现新设备，但模块配网过程已经成功。\n\n"
+                            f"请用以下任一方法继续：\n"
+                            f"  ① 登录 {ssid} 路由器管理页 → 查看设备列表 → 找到 "
+                            f"ESP8266 或 BanPCBTool  → 记录 IP\n"
+                            f"  ② 或等模块 AP 192.168.4.1 再次出现（STA 失败自动回落）\n"
+                            f"  ③ 如有静态 IP：{user_hint_static_ip or '未设置'}\n"
+                        )
+                        log("[×] 等待上线超时，用户需手动查找 IP")
+                        if user_hint_static_ip and user_hint_static_ip != "0.0.0.0":
+                            try:
+                                tmp = WirelessDevice(
+                                    name=(self.saved_device.name
+                                          if self.saved_device else None)
+                                         or DEFAULT_DEVICE_NAME,
+                                    ip=user_hint_static_ip, wifi=ssid, ap=False,
+                                )
+                                self.save_device(tmp)
+                                self.log_connection(
+                                    f"saved_device via static_ip: {tmp.ip}")
+                            except Exception as _ex:  # noqa: BLE001
+                                log(f"[×] 写入 saved_device(static_ip) 失败：{_ex}")
+                        wait_ctx["stopped"] = True
+                        try:
+                            QMessageBox.information(dlg, "配网完成", msg)
+                        except Exception:
+                            pass
+                        try:
+                            dlg.accept()
+                        except Exception:
+                            pass
+                        return
+
+                    # 4) 找到在线设备 → 尝试建立 TCP 桥接 + 标记在线
+                    log(f"[√] 发现模块上线：{online.name} @ {online.ip}  (AP={online.ap})")
+                    success = False
+                    try:
+                        if self.try_open_device(online, timeout=1.5):
+                            success = True
+                        elif not online.ap:
+                            try:
+                                self.save_device(online)
+                            except Exception:
+                                pass
+                            success = self.try_open_device(online, timeout=2.2)
+                    except Exception as _ex:  # noqa: BLE001
+                        log(f"[×] try_open_device 失败：{_ex}")
+                        success = False
+
+                    # 5) 更新 saved_device，下次启动直接用新 IP
+                    try:
+                        if not online.wifi:
+                            online.wifi = ssid
+                        self.save_device(online)
+                        self.log_connection(
+                            f"saved_device updated: {online.name} {online.ip}")
+                    except Exception as _ex:  # noqa: BLE001
+                        log(f"[×] save_device 失败：{_ex}")
+
+                    # 6) 汇总日志 + 弹窗显示所有入口
+                    http_url = f"http://{online.ip}:{online.http_port}/"
+                    update_url = f"http://{online.ip}:{online.http_port}/update"
+                    log("")
+                    log("══════════════  配网完成 设备上线  ══════════════")
+                    log(f"  设备名称 : {online.name}")
+                    log(f"  设备 IP  : {online.ip}")
+                    log(f"  网桥入口 : TCP {online.ip}:{online.bridge_port}")
+                    log(f"  Web 配置 : {http_url}")
+                    log(f"  OTA 固件 : {update_url}")
+                    log(f"  所在 WiFi: {online.wifi or ssid}")
+                    if dev_topic:
+                        log(f"  设备Topic: {dev_topic}")
+                    if dev_type:
+                        log(f"  设备类型 : {dev_type}")
+                    if dev_sip and dev_sip not in ("0.0.0.0", "255.255.255.255"):
+                        log(f"  静态 IP  : {dev_sip}")
+                    if dev_uid:
+                        log(f"  UID      : {dev_uid[:8]}…")
+                    log("═══════════════════════════════════════════════")
+
+                    banner.setText(
+                        f"✅ {online.name} 已在线 ｜ {online.ip}:{online.bridge_port} ｜ WiFi: "
+                        f"{online.wifi or ssid}"
+                    )
+                    banner.setStyleSheet(
+                        "padding:10px;border-radius:8px;font-weight:600;"
+                        "background:#d3f9d8;color:#087f5b;")
+                    try:
+                        self.statusBar().showMessage(
+                            f"{online.name} 已在线 {online.ip}:{online.bridge_port}", 4000)
+                    except Exception:
+                        pass
+
+                    # 给用户一个最终操作面板：可以直接打开 Web UI / OTA，或者完成
+                    final_dlg = QDialog(dlg)
+                    final_dlg.setWindowTitle("配网完成")
+                    v2 = QVBoxLayout(final_dlg)
+                    bridge_html = ("<span style='color:#087f5b'>已自动连接</span>✅"
+                                   if success else
+                                   "<span style='color:#c92a2a'>未连通</span>"
+                                   "（不影响 IP 写入，下次打开工具会继续尝试重连）")
+                    info_txt = QLabel(
+                        f"<b>{online.name}</b> 已上线并建立桥接：<br><br>"
+                        f"&nbsp;&nbsp;🏠 WiFi ：{online.wifi or ssid}<br>"
+                        f"&nbsp;&nbsp;🌐  IP   ：<b><code>{online.ip}</code></b><br>"
+                        f"&nbsp;&nbsp;🔌 网桥 ：TCP {online.ip}:{online.bridge_port}<br>"
+                        f"&nbsp;&nbsp;🌍 WebUI：{http_url}<br>"
+                        f"&nbsp;&nbsp;⬆️ OTA  ：{update_url}<br>"
+                        + (f"&nbsp;&nbsp;📛 Topic：{dev_topic}<br>" if dev_topic else "")
+                        + (f"&nbsp;&nbsp;📛 Static：{dev_sip}<br>"
+                           if dev_sip and dev_sip not in ("0.0.0.0", "255.255.255.255")
+                           else "")
+                        + f"<br>TCP 桥接：{bridge_html}"
+                    )
+                    info_txt.setTextFormat(Qt.TextFormat.RichText)
+                    info_txt.setWordWrap(True)
+                    info_txt.setStyleSheet(
+                        "padding:14px;background:#f8f9fa;border-radius:8px;")
+                    v2.addWidget(info_txt)
+
+                    actions = QHBoxLayout()
+                    open_web_btn = QPushButton("打开 Web 配置")
+                    open_ota_btn = QPushButton("打开 OTA 升级")
+                    ok_btn = QPushButton("完成")
+                    ok_btn.setStyleSheet(
+                        "padding:6px 12px;background:#087f5b;color:white;"
+                        "font-weight:700;border-radius:4px;")
+                    actions.addWidget(open_web_btn)
+                    actions.addWidget(open_ota_btn)
+                    actions.addStretch(1)
+                    actions.addWidget(ok_btn)
+                    v2.addLayout(actions)
+
+                    def _open(u: str) -> None:
+                        try:
+                            webbrowser.open(u)
+                        except Exception as _ex:  # noqa: BLE001
+                            log(f"[×] 打开浏览器失败：{_ex}")
+                            try:
+                                QMessageBox.warning(final_dlg, "打开失败", str(_ex))
+                            except Exception:
+                                pass
+
+                    open_web_btn.clicked.connect(lambda _c=False, u=http_url: _open(u))
+                    open_ota_btn.clicked.connect(lambda _c=False, u=update_url: _open(u))
+                    ok_btn.clicked.connect(final_dlg.accept)
+
+                    final_dlg.resize(560, 300)
+                    wait_ctx["stopped"] = True
+                    try:
+                        if final_dlg.exec() == 1:  # QDialog.DialogCode.Accepted == 1
+                            dlg.accept()
+                    except Exception:
+                        pass
+
+                except BaseException as _exc:  # noqa: BLE001
+                    wait_ctx["stopped"] = True
+                    tb = traceback.format_exc()
+                    log(f"[FATAL] _probe_once 异常：{_exc}\n{tb}")
+                    self.log_connection(f"[provision crash] probe: {_exc}")
+                    try:
+                        QMessageBox.warning(
+                            dlg, "等待上线阶段出错",
+                            f"{_exc}\n\n（已阻止闪退，详细信息见日志面板）")
+                    except Exception:
+                        # 如果连 dlg 都挂了，就只写主窗口日志
+                        try:
+                            self.statusBar().showMessage(
+                                f"探测流程异常：{_exc}", 6000)
+                        except Exception:
+                            pass
+
+            def _safe_reboot_phase() -> None:
+                try:
+                    _after_reboot_phase()
+                except BaseException as _exc:  # noqa: BLE001
+                    wait_ctx["stopped"] = True
+                    tb = traceback.format_exc()
+                    log(f"[FATAL] _after_reboot_phase 异常：{_exc}\n{tb}")
+                    self.log_connection(f"[provision crash] reboot: {_exc}")
+                    try:
+                        QMessageBox.warning(dlg, "等待上线阶段出错",
+                                            f"{_exc}\n\n（详细信息见日志面板，已阻止闪退）")
+                    except Exception:
+                        pass
+
+            # 用户若在等待期间点关闭按钮：停止探测定时器
+            def _on_close_clicked() -> None:
+                wait_ctx["stopped"] = True
+                try:
+                    dlg.reject()
+                except Exception:
+                    pass
+
+            try:
+                cancel_btn.clicked.disconnect()
+            except Exception:
+                pass
+            cancel_btn.clicked.connect(_on_close_clicked)
+
+            # 模块 POST /config 返回后 3 秒后才重启，等待这个延迟后再开始扫
+            QTimer.singleShot(4000, _safe_reboot_phase)
+
+        def clear_and_restart() -> None:
+            """POST /reconfig → 清除保存的 WiFi + 重启回到 AP 模式（Ban-IOT 协议）。"""
+            ans = QMessageBox.question(
+                dlg, "确认清除",
+                "这会清除模块已保存的 WiFi，并强制重启回到 AP 模式（需要重新配网）。\n是否继续？")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            temp_select_device()
+            try:
+                log("[>] POST /reconfig (清除 WiFi + 重启 AP 模式) ...")
+                result = self.http_json("/reconfig", {})
+                log(f"[√] {result}")
+                QMessageBox.information(dlg, "已清除",
+                                        "模块已清除 WiFi，即将重启。\n"
+                                        "重启后请重新执行向导，或手动从 WiFi 列表连模块热点："
+                                        f" {DEFAULT_DEVICE_NAME}XXXX  (pwd {DEFAULT_AP_PASSWORD})")
+                # 重新切到 AP，方便下一步再配
+                if target_is_ap:
+                    QTimer.singleShot(4000, lambda: self.try_auto_connect_hotspot())
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                log(f"[×] 清除失败：{exc}")
+                QMessageBox.warning(dlg, "清除失败", str(exc))
+            finally:
+                temp_restore_device()
+
+        def load_prefill_from_status() -> None:
+            """GET /status → 预填已保存的 SSID / Topic / 静态 IP / UID（Ban-IOT APP 逻辑）。"""
+            temp_select_device()
+            try:
+                log("[>] GET /status (读取模块状态与已保存字段)...")
+                s = self.http_json("/status")
+                if isinstance(s, dict):
+                    log(json.dumps(s, ensure_ascii=False, indent=2))
+                    saved_ssid = str(s.get("saved_ssid", ""))
+                    saved_pass = str(s.get("saved_pass", ""))
+                    saved_topic = str(s.get("device_topic", "")) or str(s.get("saved_topic", ""))
+                    saved_sip = str(s.get("static_ip", ""))
+                    saved_uid = str(s.get("device_uid", ""))
+                    if saved_ssid and scan_box.findText(saved_ssid) < 0:
+                        scan_box.insertItem(0, saved_ssid)
+                        scan_box.setCurrentIndex(0)
+                    if saved_pass:
+                        pass_edit.setText(saved_pass)
+                    if saved_topic:
+                        topic_edit.setText(saved_topic)
+                    if saved_sip and saved_sip not in ("", "0.0.0.0", "255.255.255.255"):
+                        static_ip_edit.setText(saved_sip)
+                    if saved_uid:
+                        uid_edit.setText(saved_uid)
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                log(f"[×] GET /status 失败：{exc}")
+                # GET /status 失败 → 可能是老固件（没新接口）。无论如何，用户要配网，
+                # 仍然帮用户推荐一个静态 IP（老固件会存 static_ip=0=DHCP，但值已经POST过）
+                QTimer.singleShot(100, _auto_fill_sip_if_empty)
+            finally:
+                temp_restore_device()
+
+            # GET /status 成功但没 saved static_ip → 自动推荐
+            if not static_ip_edit.text().strip():
+                QTimer.singleShot(100, _auto_fill_sip_if_empty)
+
+        scan_btn.clicked.connect(fill_from_esp_scan)
+        local_btn.clicked.connect(fill_from_local_scan)
+        save_btn.clicked.connect(save_and_reboot)
+        reconfig_btn.clicked.connect(clear_and_restart)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        # 打开后先试 GET /status 预填已有字段，再试一次 ESP 扫描
+        QTimer.singleShot(0, load_prefill_from_status)
+        if target_is_ap:
+            QTimer.singleShot(300, fill_from_esp_scan)
+
+        dlg.resize(520, 560)
+        dlg.exec()
 
     def _tcp_connect(self, host: str, port: int, timeout: float = 2.5) -> socket.socket:
         """非阻塞 TCP 连接，连接等待期间保持界面响应；失败抛 OSError。"""
@@ -1484,176 +2803,7 @@ class MainWindow(QMainWindow):
             raise
 
     def connect_wireless_device(self) -> None:
-        # 一键连接：自动搜索 -> 选设备 -> 连接；失败时自动切热点或弹配网
-        if getattr(self, "_connecting", False):
-            return
-        if self.bridge_socket:
-            self.statusBar().showMessage("已连接，无需重复连接", 2000)
-            return
-        # 连接过程中禁用两个按钮，避免等待期间用户点按触发重入导致状态错乱
-        self._connecting = True
-        self.connect_device_button.setEnabled(False)
-        self.disconnect_device_button.setEnabled(False)
-        device: WirelessDevice | None = None
-        try:
-            for _attempt in (1, 2):
-                try:
-                    self.discover_wireless_devices()
-                    QApplication.processEvents()
-                    device = self.selected_wireless_device()
-                    if not device:
-                        self.log_connection("connect error: no device")
-                        self.statusBar().showMessage("未发现设备，请确认模块已上电", 3000)
-                        return
-                    self.log_connection(
-                        f"connect: {device.name} {device.ip}:{device.bridge_port}")
-                    sock = self._tcp_connect(device.ip, device.bridge_port, timeout=2.5)
-                    self.bridge_socket = sock
-                    self.connected_device = device
-                    self.log_connection(
-                        f"connect ok: {device.name} {device.ip}:{device.bridge_port}")
-                    sock.sendall(b"@BPC HELLO\r\n")
-                    response = self.read_bridge_response(1.2)
-                    if response:
-                        self.log_connection(response)
-                    if "BanPCBTool" not in response and "@BPC OK" not in response:
-                        self.log_connection("warning: ESP8266 did not return the expected name")
-                    self.device_info_label.setText(f"已连接 {device.name} ({device.ip})")
-                    # 查询模块状态：处于 AP 模式且未连上路由器 = 尚未配网
-                    ap_mode = False
-                    sta_ok = False
-                    sock.sendall(b"@BPC STATUS\r\n")
-                    status_text = self.read_bridge_response(1.2)
-                    if "{" in status_text:
-                        try:
-                            info = json.loads(
-                                status_text[status_text.index("{"):status_text.rindex("}") + 1])
-                            ap_mode = bool(info.get("ap"))
-                            sta_ok = bool(info.get("wifi"))
-                            self.log_connection(f"status: {status_text.strip()}")
-                        except (ValueError, json.JSONDecodeError):
-                            pass
-                    if ap_mode and not sta_ok:
-                        self.statusBar().showMessage("模块尚未配网，请配网", 3000)
-                        self.show_provision_dialog(device)
-                    elif device.ip == DEFAULT_DEVICE_IP and not sta_ok:
-                        # 连上了 192.168.4.1（模块 AP 模式 = 未配网），但 STATUS 响应没解析出
-                        # 已连路由器的证据 → 兜底仍然弹配网窗，避免静默失败
-                        self.log_connection(f"status raw: {status_text!r}")
-                        self.statusBar().showMessage("模块尚未配网，请配网", 3000)
-                        self.show_provision_dialog(device)
-                    else:
-                        self.statusBar().showMessage("无线模块已连接", 2500)
-                    return
-                except OSError as exc:
-                    self.bridge_socket = None
-                    self.connected_device = None
-                    self.log_connection(f"connect error: {exc}")
-                    if not device or not device.ap:
-                        self.statusBar().showMessage(f"连接失败: {exc}", 3000)
-                        return
-                    cur = current_wifi_ssid()
-                    if cur.lower().startswith(DEFAULT_DEVICE_NAME.lower()):
-                        # 电脑已连模块热点但连接 8266 端口仍失败
-                        QMessageBox.warning(
-                            self, "连接超时",
-                            f"电脑已连接模块热点（当前 WiFi：{cur}），但连接 8266 端口超时。\n"
-                            "请确认：模块已通电、热点名称以 BanPCBTool 开头。\n"
-                            "可尝试给模块断电重启后，再点\"一键连接\"。")
-                        return
-                    # 电脑没连模块热点：自动扫描并切换热点，再重试连接
-                    self.log_connection("not on module hotspot, auto switching ...")
-                    if self.try_auto_connect_hotspot():
-                        self.statusBar().showMessage("已连上模块热点，正在连接模块...", 0)
-                        QApplication.processEvents()
-                        continue  # 第二轮重试连接
-                    return
-            self.statusBar().showMessage("自动连接热点失败，请手动连接后再试", 3000)
-        except Exception as exc:  # noqa: BLE001  未预期异常统一兜底，不再弹未处理异常窗
-            self.log_connection(f"connect error: {exc}")
-            self.statusBar().showMessage(f"连接失败: {exc}", 3000)
-        finally:
-            self._connecting = False
-            self.connect_device_button.setEnabled(True)
-            self.disconnect_device_button.setEnabled(True)
-
-    def show_provision_dialog(self, device: WirelessDevice | None = None) -> None:
-        """首次连接时的简洁配网弹窗：本地扫描 WiFi + 密码 + 保存。"""
-        target = (device or self.selected_wireless_device()
-                  or WirelessDevice("BanPCBTool", DEFAULT_DEVICE_IP))
-        dialog = QDialog(self)
-        dialog.setWindowTitle("WiFi 配网")
-        layout = QVBoxLayout(dialog)
-        hint = QLabel("模块尚未配网。请确认电脑已连接模块热点"
-                      f"（{DEFAULT_DEVICE_NAME}-xxxx，即 192.168.4.1）后再保存。\n"
-                      "选择要连接的 WiFi 并输入密码，保存后模块会自动重启并连接该 WiFi。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        row = QHBoxLayout()
-        scan_box = QComboBox()
-        scan_button = QPushButton("扫描")
-        row.addWidget(QLabel("WiFi:"))
-        row.addWidget(scan_box, 1)
-        row.addWidget(scan_button)
-        layout.addLayout(row)
-        pass_form = QFormLayout()
-        pass_edit = QLineEdit()
-        pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        pass_form.addRow("密码:", pass_edit)
-        layout.addLayout(pass_form)
-        buttons = QHBoxLayout()
-        save_button = QPushButton("保存配网")
-        cancel_button = QPushButton("取消")
-        buttons.addStretch(1)
-        buttons.addWidget(save_button)
-        buttons.addWidget(cancel_button)
-        layout.addLayout(buttons)
-
-        def fill_local() -> None:
-            scan_box.clear()
-            for name in scan_local_wifi():
-                scan_box.addItem(name)
-            if scan_box.count():
-                scan_box.setCurrentIndex(0)
-                scan_button.setText("重新扫描")
-                scan_button.setToolTip("从本机网卡重新扫描")
-            else:
-                scan_button.setText("扫描")
-                scan_box.setEditable(True)
-                scan_box.setPlaceholderText("未扫描到 WiFi，请手动输入名称")
-
-        def save() -> None:
-            ssid = scan_box.currentText().strip()
-            if not ssid:
-                QMessageBox.information(dialog, "缺少 WiFi", "请选择或输入 WiFi 名称。")
-                return
-            old_connected = self.connected_device
-            self.connected_device = target
-            try:
-                result = self.http_json("/api/wifi", {"ssid": ssid, "pass": pass_edit.text()})
-                self.log_connection(
-                    f"provision ok: ssid={ssid} -> {json.dumps(result, ensure_ascii=False)}")
-            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-                QMessageBox.warning(dialog, "保存失败", str(exc))
-                return
-            finally:
-                self.connected_device = old_connected
-            QMessageBox.information(
-                dialog, "配网成功",
-                f"已保存 WiFi「{ssid}」。\n模块正在重启并连接新 WiFi，"
-                "电脑会与模块热点断开，正在尝试自动切回原网络，"
-                "约 10 秒后点\"一键连接\"即可。")
-            prev = getattr(self, "_prev_ssid", "")
-            if prev and prev != ssid:
-                QTimer.singleShot(2000, lambda: reconnect_wifi(prev))
-            dialog.accept()
-
-        scan_button.clicked.connect(fill_local)
-        save_button.clicked.connect(save)
-        cancel_button.clicked.connect(dialog.reject)
-        fill_local()
-        dialog.resize(420, 170)
-        dialog.exec()
+        self.poll_device_status()
 
     def disconnect_wireless_device(self, show_status: bool = True) -> None:
         if self.bridge_socket:
@@ -1680,7 +2830,7 @@ class MainWindow(QMainWindow):
         while time.monotonic() < stop_at:
             try:
                 chunk = sock.recv(1024)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError):
                 QApplication.processEvents()
                 continue
             except OSError:
@@ -1689,7 +2839,8 @@ class MainWindow(QMainWindow):
                 break
             chunks.append(chunk)
             text = b"".join(chunks).decode("utf-8", errors="replace")
-            if "banux$ " in text or "OK block" in text or "OK clear" in text or "Error:" in text:
+            if ("banux$ " in text or "OK block" in text or "OK clear" in text or
+                    "@BPC PONG" in text or "@BPC OK" in text or "Error:" in text):
                 return text.strip()
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
 
@@ -1726,6 +2877,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
             return
         payload = self.generate_gcode().encode("ascii")
+        self._transfer_busy = True
+        self.update_device_actions()
         try:
             self.send_bridge_command(f"recv -c {path}", 3.0)
             for offset in range(0, len(payload), UPLOAD_CHUNK_SIZE):
@@ -1736,8 +2889,12 @@ class MainWindow(QMainWindow):
                 self.transfer_progress.setText(f"{percent}%  {offset + len(chunk)} / {len(payload)} bytes")
                 QApplication.processEvents()
         except OSError as exc:
+            self.mark_offline("设备连接中断")
             QMessageBox.warning(self, "传输失败", str(exc))
             return
+        finally:
+            self._transfer_busy = False
+            self.update_device_actions()
         self.statusBar().showMessage(f"已传输到 {path}", 3500)
 
     def execute_remote_gcode(self) -> None:
@@ -1745,11 +2902,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "未连接", "请先连接 BanPCBTool。")
             return
         path = self.remote_path_edit.text().strip()
+        self._transfer_busy = True
+        self.update_device_actions()
         try:
             self.send_bridge_command(f"gcode -f {path}", 4.0)
         except OSError as exc:
+            self.mark_offline("设备连接中断")
             QMessageBox.warning(self, "执行失败", str(exc))
             return
+        finally:
+            self._transfer_busy = False
+            self.update_device_actions()
         self.statusBar().showMessage(f"已发送执行命令：{path}", 3000)
 
     def send_manual_command(self, command: str, timeout_s: float = 2.5) -> bool:
@@ -1759,9 +2922,149 @@ class MainWindow(QMainWindow):
         try:
             self.send_bridge_command(command, timeout_s)
         except OSError as exc:
+            self.mark_offline("设备连接中断")
             QMessageBox.warning(self, "操作失败", str(exc))
             return False
         return True
+
+    def show_bridge_terminal(self) -> None:
+        """桥接命令行：把输入原样透传给 WiFi 模块，并实时显示模块回传的全部数据。
+
+        模块会把非控制行原样转发到自己的串口（给 STM32），也会把 STM32 发给它的
+        数据原样转发到 TCP，所以下位机回传的内容会实时出现在这个窗口里。
+
+        打开期间必须暂停 device_timer 的心跳轮询（PING / STATUS），
+        否则两边会争抢同一个 socket —— 轮询会把下位机的数据吞进自己的缓冲区。
+        """
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool 再打开命令行。")
+            return
+        if getattr(self, "_terminal_busy", False):
+            return
+
+        sock = self.bridge_socket
+        device = self.connected_device
+        if device:
+            host_text = f"{device.name}  {device.ip}:{device.bridge_port}"
+        else:
+            host_text = "已连接设备"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"命令行 · {host_text}")
+        dialog.resize(780, 520)
+        root = QVBoxLayout(dialog)
+
+        tip = QLabel("输入内容原样发送给 WiFi 模块；模块侧非 @BPC 开头的行会转发给 STM32，"
+                     "STM32 发给模块的数据也会实时显示在这里。")
+        tip.setObjectName("muted")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        output = QPlainTextEdit()
+        output.setReadOnly(True)
+        output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        output.setFont(QFont("Consolas", 10))
+        root.addWidget(output, 1)
+
+        input_row = QHBoxLayout()
+        cmd_edit = QLineEdit()
+        cmd_edit.setPlaceholderText("输入要发送的内容，回车发送（例如 G28 / M114）")
+        send_btn = QPushButton("发送")
+        input_row.addWidget(cmd_edit, 1)
+        input_row.addWidget(send_btn)
+        root.addLayout(input_row)
+
+        opt_row = QHBoxLayout()
+        crlf_box = QCheckBox("结尾加 \\r\\n")
+        crlf_box.setChecked(True)
+        hex_box = QCheckBox("HEX 显示")
+        clear_btn = QPushButton("清空")
+        close_btn = QPushButton("关闭")
+        opt_row.addWidget(crlf_box)
+        opt_row.addWidget(hex_box)
+        opt_row.addStretch(1)
+        opt_row.addWidget(clear_btn)
+        opt_row.addWidget(close_btn)
+        root.addLayout(opt_row)
+
+        state = {"alive": True}
+
+        def append_text(text: str) -> None:
+            output.moveCursor(QTextCursor.MoveOperation.End)
+            output.insertPlainText(text)
+            output.verticalScrollBar().setValue(output.verticalScrollBar().maximum())
+
+        def append_bytes(raw: bytes) -> None:
+            if hex_box.isChecked():
+                append_text(" ".join(f"{b:02X}" for b in raw) + " ")
+            else:
+                append_text(raw.decode("utf-8", errors="replace")
+                               .replace("\r\n", "\n").replace("\r", "\n"))
+
+        def note(text: str) -> None:
+            append_text(f"\n{text}\n")
+
+        timer = QTimer(dialog)
+
+        def stop(reason: str = "") -> None:
+            state["alive"] = False
+            timer.stop()
+            if reason:
+                note(reason)
+
+        def pump() -> None:
+            """把 socket 上待收的数据全部搬到终端（非阻塞）。"""
+            if not state["alive"]:
+                return
+            try:
+                for _ in range(64):  # 每轮最多搬 64 包，避免大流量时卡住界面
+                    readable, _, _ = select.select([sock], [], [], 0)
+                    if not readable:
+                        break
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        stop("[连接已断开]")
+                        self.mark_offline("设备连接中断")
+                        return
+                    append_bytes(chunk)
+            except (BlockingIOError, InterruptedError):
+                pass
+            except (OSError, ValueError) as exc:
+                stop(f"[连接已断开: {exc}]")
+                self.mark_offline("设备连接中断")
+
+        def do_send() -> None:
+            text = cmd_edit.text()
+            if not text:
+                return
+            payload = text.encode("utf-8") + (b"\r\n" if crlf_box.isChecked() else b"")
+            try:
+                sock.sendall(payload)
+            except OSError as exc:
+                stop(f"[发送失败: {exc}]")
+                self.mark_offline("设备连接中断")
+                return
+            note(f"> {text}")
+            cmd_edit.clear()
+
+        timer.setInterval(80)
+        timer.timeout.connect(pump)
+        send_btn.clicked.connect(do_send)
+        cmd_edit.returnPressed.connect(do_send)
+        clear_btn.clicked.connect(output.clear)
+        close_btn.clicked.connect(dialog.accept)
+
+        self._terminal_busy = True
+        try:
+            note("[已进入透传模式，等待数据…]")
+            timer.start()
+            dialog.exec()
+        finally:
+            timer.stop()
+            state["alive"] = False
+            self._terminal_busy = False
+            # 关闭后立刻刷新一次设备状态，不必等下一个 3 秒周期
+            QTimer.singleShot(300, self.poll_device_status)
 
     def jog_axis(self, axis: str, direction: float) -> None:
         amount = self.extruder_step.value() if axis == "E" else self.jog_step.value()
@@ -1789,112 +3092,304 @@ class MainWindow(QMainWindow):
         return json.loads(text) if text.strip().startswith(("{", "[")) else text
 
     def show_wireless_settings(self) -> None:
+        """无线设置（Ban-IOT 协议 + 老接口双兼容）。
+        新增字段：Topic / 静态 IP / UID；
+        新接口：GET /status, GET /scan, POST /config, POST /reconfig, POST /setip；
+        保留老接口：/api/wifi, /api/ap, /api/clear, /api/restart, /api/ota 以兼容未烧新固件的模块。
+        """
         dialog = QDialog(self)
-        dialog.setWindowTitle("无线设置")
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-        device = self.connected_device or self.selected_wireless_device()
-        host_edit = QLineEdit(device.ip if device else DEFAULT_DEVICE_IP)
+        dialog.setWindowTitle("无线设置  ·  Ban-IOT 协议")
+        dialog.resize(700, 500)
+        root_layout = QVBoxLayout(dialog)
+
+        base_device = self.connected_device or self.selected_wireless_device()
+
+        # ===== 主机 & 连接状态 =====
+        conn = QGroupBox("连接")
+        cf = QFormLayout(conn)
+        host_edit = QLineEdit(base_device.ip if base_device else DEFAULT_DEVICE_IP)
+        status_btn = QPushButton("读取状态")
+        status_wrap = QWidget()
+        sw = QHBoxLayout(status_wrap)
+        sw.setContentsMargins(0, 0, 0, 0)
+        sw.addWidget(host_edit, 1)
+        sw.addWidget(status_btn)
+        cf.addRow("模块 IP", status_wrap)
+        root_layout.addWidget(conn)
+
+        # ===== WiFi 配网（Ban-IOT /config 协议）=====
+        prov = QGroupBox("WiFi 配网  (POST /config)")
+        pf = QFormLayout(prov)
+
+        # SSID 下拉框 + 本机扫描 + 模块扫描
+        ssid_row = QHBoxLayout()
+        scan_box = QComboBox()
+        scan_box.setEditable(True)
         ssid_edit = QLineEdit()
+        ssid_edit.setPlaceholderText("为空则用右侧扫描结果")
+        esp_scan_btn = QPushButton("模块扫描")
+        local_scan_btn = QPushButton("本机扫描")
+        ssid_row.addWidget(scan_box, 1)
+        ssid_row.addWidget(esp_scan_btn)
+        ssid_row.addWidget(local_scan_btn)
+        ssid_wrap = QWidget()
+        ssid_wrap.setLayout(ssid_row)
+        pf.addRow("SSID 扫描", ssid_wrap)
+        pf.addRow("SSID 名称", ssid_edit)
+
         pass_edit = QLineEdit()
         pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pf.addRow("WiFi 密码", pass_edit)
+
+        topic_edit = QLineEdit()
+        topic_edit.setPlaceholderText("可选，如 pcbtool001")
+        pf.addRow("设备 Topic", topic_edit)
+
+        sip_edit = QLineEdit()
+        sip_edit.setPlaceholderText("可选，DHCP 留空；例如 192.168.1.200")
+        pf.addRow("静态 IP", sip_edit)
+
+        uid_edit = QLineEdit()
+        uid_edit.setPlaceholderText("可选，云端 UID")
+        uid_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pf.addRow("云端 UID", uid_edit)
+
+        prov_btns = QHBoxLayout()
+        save_config_btn = QPushButton("保存配网 (/config)")
+        save_config_btn.setStyleSheet(
+            "padding:6px 10px;background:#087f5b;color:white;font-weight:700;border-radius:4px;")
+        prov_btns.addWidget(save_config_btn)
+        prov_btns.addStretch(1)
+        pf.addRow(prov_btns)
+        root_layout.addWidget(prov)
+
+        # ===== 控制操作 =====
+        ctl = QGroupBox("控制")
+        cb = QHBoxLayout(ctl)
+        ap_btn = QPushButton("开启AP模式")
+        reconfig_btn = QPushButton("重置配网(/reconfig)")
+        clear_btn = QPushButton("旧版清除WiFi")
+        setip_btn = QPushButton("设置静态IP")
+        restart_btn = QPushButton("重启模块")
+        for b in (ap_btn, reconfig_btn, clear_btn, setip_btn, restart_btn):
+            cb.addWidget(b)
+        cb.addStretch(1)
+        root_layout.addWidget(ctl)
+
+        # ===== OTA =====
+        ota = QGroupBox("OTA")
+        of = QFormLayout(ota)
         ota_edit = QLineEdit()
-        scan_box = QComboBox()
-        form.addRow("模块 IP", host_edit)
-        form.addRow("WiFi", ssid_edit)
-        form.addRow("密码", pass_edit)
-        form.addRow("扫描结果", scan_box)
-        form.addRow("OTA URL", ota_edit)
-        layout.addLayout(form)
-        button_row = QHBoxLayout()
-        scan_button = QPushButton("扫描")
-        save_button = QPushButton("保存配网")
-        ap_button = QPushButton("进入配网")
-        clear_button = QPushButton("清除 WiFi")
-        ota_button = QPushButton("OTA")
-        restart_button = QPushButton("重启模块")
-        for button in (scan_button, save_button, ap_button, clear_button, ota_button, restart_button):
-            button_row.addWidget(button)
-        layout.addLayout(button_row)
+        of.addRow("固件 URL", ota_edit)
+        ob = QHBoxLayout()
+        ota_btn = QPushButton("执行 OTA (/api/ota)")
+        open_update_btn = QPushButton("浏览器打开 /update")
+        ob.addWidget(ota_btn)
+        ob.addWidget(open_update_btn)
+        ob.addStretch(1)
+        of.addRow(ob)
+        root_layout.addWidget(ota)
+
+        # ===== 日志窗口 =====
         info = QPlainTextEdit()
         info.setReadOnly(True)
-        layout.addWidget(info)
+        info.setFont(QFont("Consolas", 9))
+        root_layout.addWidget(info, 1)
+        close_btn = QPushButton("关闭")
+        right = QHBoxLayout()
+        right.addStretch(1)
+        right.addWidget(close_btn)
+        root_layout.addLayout(right)
 
-        def device_from_host() -> WirelessDevice:
+        # ===== helpers =====
+        def log(text: str) -> None:
+            info.appendPlainText(text)
+
+        def target_device() -> WirelessDevice:
             host = host_edit.text().strip()
             if not host:
-                raise OSError("请输入模块 IP")
-            if device:
-                device.ip = host
-                return device
-            return WirelessDevice("BanPCBTool", host)
+                raise OSError("请先填写模块 IP")
+            if base_device is not None:
+                base_device.ip = host
+                return base_device
+            return WirelessDevice(DEFAULT_DEVICE_NAME, host)
 
         def call(path: str, payload: dict[str, str] | None = None) -> Any:
-            old_connected = self.connected_device
-            old_devices = self.devices[:]
-            temp = device_from_host()
-            self.connected_device = temp
+            old_cd = self.connected_device
+            old_ds = self.devices[:]
+            self.connected_device = target_device()
             try:
                 result = self.http_json(path, payload)
             finally:
-                self.connected_device = old_connected
-                self.devices = old_devices
-            info.appendPlainText(json.dumps(result, ensure_ascii=False, indent=2) if not isinstance(result, str) else result)
+                self.connected_device = old_cd
+                self.devices = old_ds
+            if isinstance(result, (dict, list)):
+                log(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                log(str(result))
             return result
 
-        def scan_wifi() -> None:
-            # 优先从本机网卡扫描（AP 模式下模块 /api/scan 可能不可用）
-            local = scan_local_wifi()
-            scan_box.clear()
-            for name in local:
-                scan_box.addItem(name)
-            if local:
-                info.appendPlainText(f"本地扫描到 {len(local)} 个 WiFi，请从下拉框选择。")
-                return
+        def do_status() -> None:
+            log("[>] GET /status")
             try:
-                result = call("/api/scan")
-                for item in result if isinstance(result, list) else []:
-                    name = str(item.get("ssid", ""))
-                    if name:
-                        scan_box.addItem(name)
+                s = call("/status")
+                if isinstance(s, dict):
+                    # 预填表单
+                    saved_ssid = str(s.get("saved_ssid", ""))
+                    if saved_ssid and not ssid_edit.text().strip():
+                        ssid_edit.setText(saved_ssid)
+                        if scan_box.findText(saved_ssid) < 0:
+                            scan_box.insertItem(0, saved_ssid)
+                    saved_pass = str(s.get("saved_pass", ""))
+                    if saved_pass and not pass_edit.text():
+                        pass_edit.setText(saved_pass)
+                    dev_topic = str(s.get("device_topic", "")) or str(s.get("saved_topic", ""))
+                    if dev_topic and not topic_edit.text():
+                        topic_edit.setText(dev_topic)
+                    sip = str(s.get("static_ip", ""))
+                    if sip and sip not in ("", "0.0.0.0", "255.255.255.255") and not sip_edit.text():
+                        sip_edit.setText(sip)
+                    uid = str(s.get("device_uid", ""))
+                    if uid and not uid_edit.text():
+                        uid_edit.setText(uid)
             except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-                QMessageBox.warning(dialog, "扫描失败", str(exc))
+                log(f"[×] /status 失败：{exc}")
+                log("    尝试旧版 /api/info …")
+                try:
+                    call("/api/info")
+                except Exception as exc2:  # noqa: BLE001
+                    log(f"    [×] 也失败：{exc2}")
 
-        def save_wifi() -> None:
+        def do_local_scan() -> None:
+            names = scan_local_wifi()
+            scan_box.clear()
+            for n in names:
+                scan_box.addItem(n)
+            log(f"本机扫描到 {len(names)} 个 WiFi")
+
+        def do_esp_scan() -> None:
+            log("[>] GET /scan (模块侧)")
+            try:
+                result = call("/scan")
+                names: list[str] = []
+                if isinstance(result, list):
+                    def rssi(it: dict[str, Any]) -> int:
+                        try:
+                            return int(it.get("rssi", -100))
+                        except (TypeError, ValueError):
+                            return -100
+                    for item in sorted(result, key=rssi, reverse=True):
+                        name = str(item.get("ssid", "")).strip()
+                        if name and name not in names:
+                            names.append(name)
+                scan_box.clear()
+                for n in names:
+                    scan_box.addItem(n)
+                log(f"模块扫描到 {len(names)} 个 WiFi")
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                log(f"[×] {exc}；回退 /api/scan")
+                try:
+                    result2 = call("/api/scan")
+                    scan_box.clear()
+                    if isinstance(result2, list):
+                        for item in result2:
+                            n = str(item.get("ssid", "")).strip()
+                            if n:
+                                scan_box.addItem(n)
+                except Exception as exc2:  # noqa: BLE001
+                    log(f"[×] 回退也失败：{exc2}")
+
+        def do_save_config() -> None:
             ssid = ssid_edit.text().strip() or scan_box.currentText().strip()
             if not ssid:
-                QMessageBox.information(dialog, "缺少 WiFi", "请输入或选择 WiFi 名称。")
+                QMessageBox.information(dialog, "缺少 SSID", "请先选择或填写 WiFi 名称。")
                 return
+            payload: dict[str, str] = {"ssid": ssid, "pass": pass_edit.text()}
+            if topic_edit.text().strip():
+                payload["topic"] = topic_edit.text().strip()
+            if sip_edit.text().strip():
+                payload["static_ip"] = sip_edit.text().strip()
+            if uid_edit.text().strip():
+                payload["uid"] = uid_edit.text().strip()
+            log(f"[>] POST /config  {urllib.parse.urlencode(payload)}")
             try:
-                call("/api/wifi", {"ssid": ssid, "pass": pass_edit.text()})
-                QMessageBox.information(dialog, "已保存", "模块会尝试连接新 WiFi。")
+                try:
+                    call("/config", payload)
+                except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                    # Fallback 到老固件 /api/wifi；注意老固件不支持 topic/static_ip/uid
+                    log(f"[·] /config 不可用（{exc}），fallback 旧版 /api/wifi ...")
+                    call("/api/wifi", {"ssid": ssid, "pass": pass_edit.text()})
+                    log("[√] 旧版接口保存成功（注意：Topic/StaticIP/UID 未写入，新固件支持扩展字段）")
+                QMessageBox.information(dialog, "保存成功",
+                                        "已写入 WiFi 凭据，模块将在 3 秒后重启并尝试连接。")
             except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
                 QMessageBox.warning(dialog, "保存失败", str(exc))
 
-        def post_action(path: str) -> None:
+        def do_reconfig() -> None:
+            r = QMessageBox.question(dialog, "重置确认",
+                                     "会清空 WiFi 配置并让模块重启进入 AP 模式（BanPCBToolXXXX, 12345678）。\n确定？")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+            log("[>] POST /reconfig")
             try:
-                call(path, {})
+                call("/reconfig", {})
+                QMessageBox.information(dialog, "已重置",
+                                        "模块即将重启并进入 AP 模式。\n"
+                                        f"SSID：{DEFAULT_DEVICE_NAME}XXXX  密码：{DEFAULT_AP_PASSWORD}")
             except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-                QMessageBox.warning(dialog, "操作失败", str(exc))
+                QMessageBox.warning(dialog, "重置失败", str(exc))
 
-        def ota_action() -> None:
+        def do_setip() -> None:
+            ip = sip_edit.text().strip()
+            if not ip:
+                QMessageBox.information(dialog, "请填写 IP", "在「静态 IP」里填写地址后再设置。")
+                return
+            log(f"[>] POST /setip static_ip={ip}")
+            try:
+                call("/setip", {"static_ip": ip})
+                QMessageBox.information(dialog, "已保存静态 IP", "模块将在 1.5s 后重启。")
+            except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(dialog, "设置失败", str(exc))
+
+        def do_ota() -> None:
             url = ota_edit.text().strip()
             if not url:
-                QMessageBox.information(dialog, "缺少 URL", "请输入 ESP8266 固件 URL。")
+                QMessageBox.information(dialog, "缺少 URL", "请先输入 OTA 固件 URL。")
                 return
+            log(f"[>] POST /api/ota url={url}")
             try:
                 call("/api/ota", {"url": url})
             except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
                 QMessageBox.warning(dialog, "OTA 失败", str(exc))
 
-        scan_box.currentTextChanged.connect(ssid_edit.setText)
-        scan_button.clicked.connect(scan_wifi)
-        save_button.clicked.connect(save_wifi)
-        ap_button.clicked.connect(lambda _checked=False: post_action("/api/ap"))
-        clear_button.clicked.connect(lambda _checked=False: post_action("/api/clear"))
-        ota_button.clicked.connect(ota_action)
-        restart_button.clicked.connect(lambda _checked=False: post_action("/api/restart"))
-        dialog.resize(640, 430)
+        def open_browser_update() -> None:
+            try:
+                import webbrowser
+                dev = target_device()
+                webbrowser.open(f"http://{dev.ip}:{dev.http_port}/update")
+            except (OSError, Exception) as exc:  # noqa: BLE001
+                QMessageBox.warning(dialog, "打开失败", str(exc))
+
+        # ===== 信号连接 =====
+        scan_box.currentTextChanged.connect(lambda t: ssid_edit.setText(t) if not ssid_edit.text() else None)
+        status_btn.clicked.connect(do_status)
+        local_scan_btn.clicked.connect(do_local_scan)
+        esp_scan_btn.clicked.connect(do_esp_scan)
+        save_config_btn.clicked.connect(do_save_config)
+        reconfig_btn.clicked.connect(do_reconfig)
+        clear_btn.clicked.connect(lambda _=False: (log("[>] POST /api/clear (legacy)"),
+                                                    call("/api/clear", {})))
+        ap_btn.clicked.connect(lambda _=False: (log("[>] POST /api/ap (开启AP)"),
+                                                 call("/api/ap", {})))
+        setip_btn.clicked.connect(do_setip)
+        restart_btn.clicked.connect(lambda _=False: (log("[>] POST /api/restart"),
+                                                      call("/api/restart", {})))
+        ota_btn.clicked.connect(do_ota)
+        open_update_btn.clicked.connect(open_browser_update)
+        close_btn.clicked.connect(dialog.accept)
+
+        # 打开后自动读取一次状态
+        QTimer.singleShot(120, do_status)
         dialog.exec()
 
 

@@ -1,0 +1,8 @@
+{
+  "name": "BanPCBTool",
+  "ip": "192.168.1.215",
+  "bridge_port": 8266,
+  "http_port": 80,
+  "wifi": "1",
+  "ap": false
+}
