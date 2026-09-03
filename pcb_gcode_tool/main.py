@@ -54,7 +54,13 @@ DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_
 DEVICE_CONFIG_PATH = ROOT / "device_connection.json"
 DISCOVERY_PORT = 8267
 BRIDGE_PORT = 8266
-UPLOAD_CHUNK_SIZE = 48
+# 单个 recv -b 块的原始字节数。
+# 由 48 提高到 288：48 字节/块时传 94KB 的 gcode 要往返近 2000 次，无线链路被往返
+# 延迟拖垮（实测 ~48 B/s）。288 字节/块把往返次数降到 1/6。
+# 必须与固件同步：288 字节 -> 384 个 base64 字符，要求固件
+#   SHELL_CMD_MAX_LEN >= 命令行总长(512)  且  RECV_DECODE_MAX >= 288
+# 三者任一不匹配，模块会回 "recv: invalid base64"。
+UPLOAD_CHUNK_SIZE = 288
 DEFAULT_DEVICE_IP = "192.168.4.1"  # AP 模式固定 IP
 DEFAULT_DEVICE_NAME = "BanPCBTool"  # 模块热点名称前缀
 DEFAULT_AP_PASSWORD = "12345678"    # Ban-IOT 协议统一 AP 密码
@@ -3465,14 +3471,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
             return
         payload = self.generate_gcode().encode("ascii")
-        # 模块命令行缓冲为 128 字节（SHELL_CMD_MAX_LEN），超长会被静默截断导致
-        # base64 残缺，这里提前算一次最长行并拦截。
+        # 模块命令行缓冲为 512 字节（SHELL_CMD_MAX_LEN），超长会被静默截断导致
+        # base64 残缺，这里提前算一次最长行并拦截。留 12 字节余量。
         longest_cmd = len(f"recv -b {path} {len(payload)} ") + \
             len(base64.b64encode(bytes(UPLOAD_CHUNK_SIZE)))
-        if longest_cmd > 120:
+        if longest_cmd > 500:
             QMessageBox.warning(
                 self, "路径过长",
-                f"按此路径生成的命令行约 {longest_cmd} 字节，接近模块 128 字节上限。\n"
+                f"按此路径生成的命令行约 {longest_cmd} 字节，接近模块 512 字节上限。\n"
                 "请改用更短的文件名或更浅的目录。")
             return
         self._transfer_busy = True

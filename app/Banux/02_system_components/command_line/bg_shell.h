@@ -33,7 +33,15 @@ extern "C" {
 /*******************************************************************************
  * Configuration Definitions
  ******************************************************************************/
-#define SHELL_CMD_MAX_LEN       128     // Max command line length
+/* 命令行最大长度。由 128 提高到 512 是为了放开上位机的文件分块传输：
+ * `recv -b <path> <offset> <base64>` 中 base64 直接占据命令行，128 字节时最多只能
+ * 放约 83 个 base64 字符(=62 字节有效载荷)，传 94KB 的 gcode 要往返近 2000 次，
+ * 无线链路被往返延迟拖垮(实测 ~48 B/s)。512 可容纳 384 个 base64 字符(=288 字节/块)，
+ * 往返次数降到 1/6。
+ * 注意：历史条目长度用独立的 SHELL_HISTORY_LEN，避免 g_History[10][512] 吃掉 5KB RAM
+ * ——长命令本来就是上位机生成的 recv -b，没必要进历史。 */
+#define SHELL_CMD_MAX_LEN       512     // Max command line length
+#define SHELL_HISTORY_LEN       128     // 命令历史条目长度(与命令行长度解耦)
 #define SHELL_CMD_MAX_ARGS      15      // Max argument count
 #define SHELL_MODULE_MAX        40     // Max module count (increased for remind + future modules)
 #define SHELL_OUT_BUF_SIZE      256     // Output buffer size

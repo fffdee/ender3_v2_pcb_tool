@@ -766,7 +766,12 @@ DEFINE_MODULE(vim, "Edit filesystem text file", MOD_CAT_SYSTEM, vim_opts);
  * recv module - Chunked file receiver for wireless/serial upload
  *===========================================================================*/
 
-#define RECV_DECODE_MAX  64u
+/* 单个 recv -b 块解码后的最大字节数(栈数组，8KB 栈无压力)。
+ * 由 64 提高到 384：原值把分块死死卡在 48 字节(48 字节恰好 = 64 个 base64 字符)，
+ * 传输大文件需要近 2000 次往返，是无线传输缓慢的主因之一。
+ * 必须与上位机的 UPLOAD_CHUNK_SIZE 匹配：UPLOAD_CHUNK_SIZE(=288) 的 base64 长度
+ * 为 384 字符，解码后 288 字节 <= RECV_DECODE_MAX。固件与上位机需同步更新。 */
+#define RECV_DECODE_MAX  384u
 
 static int recv_b64_value(char ch)
 {

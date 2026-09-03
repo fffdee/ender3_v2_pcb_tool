@@ -52,11 +52,11 @@ static uint8_t g_CandCount = 0;
  * Command History
  ******************************************************************************/
 #define SHELL_HISTORY_MAX       10      /* 最多记录 10 条命令 */
-static char     g_History[SHELL_HISTORY_MAX][SHELL_CMD_MAX_LEN];
+static char     g_History[SHELL_HISTORY_MAX][SHELL_HISTORY_LEN];
 static uint8_t  g_HistoryCount = 0;     /* 已存储条数 (0..SHELL_HISTORY_MAX) */
 static uint8_t  g_HistoryHead  = 0;     /* 环形写入位置 */
 static int8_t   g_HistoryNav   = -1;    /* 上下键浏览位置 (-1=当前输入) */
-static char     g_SavedInput[SHELL_CMD_MAX_LEN]; /* 浏览历史时暂存当前输入 */
+static char     g_SavedInput[SHELL_HISTORY_LEN]; /* 浏览历史时暂存当前输入 */
 /* ESC序列状态机: 0=正常, 1=收到ESC, 2=收到ESC[ */
 static uint8_t  g_EscState = 0;
 
@@ -737,8 +737,8 @@ static void Shell_HistoryAdd(const char *cmd)
         if (strcmp(g_History[last], cmd) == 0) return;
     }
 
-    strncpy(g_History[g_HistoryHead], cmd, SHELL_CMD_MAX_LEN - 1);
-    g_History[g_HistoryHead][SHELL_CMD_MAX_LEN - 1] = '\0';
+    strncpy(g_History[g_HistoryHead], cmd, SHELL_HISTORY_LEN - 1);
+    g_History[g_HistoryHead][SHELL_HISTORY_LEN - 1] = '\0';
     g_HistoryHead = (g_HistoryHead + 1) % SHELL_HISTORY_MAX;
     if (g_HistoryCount < SHELL_HISTORY_MAX) g_HistoryCount++;
 }
@@ -759,8 +759,8 @@ static void Shell_HistoryRecall(int8_t direction)
         /* Up: 向更早的命令 */
         if (g_HistoryNav < 0) {
             /* 首次按Up: 暂存当前输入, 跳到最近一条 */
-            strncpy(g_SavedInput, g_CmdLine, SHELL_CMD_MAX_LEN - 1);
-            g_SavedInput[SHELL_CMD_MAX_LEN - 1] = '\0';
+            strncpy(g_SavedInput, g_CmdLine, SHELL_HISTORY_LEN - 1);
+            g_SavedInput[SHELL_HISTORY_LEN - 1] = '\0';
             g_HistoryNav = 0;
         } else if (g_HistoryNav < (int8_t)(g_HistoryCount - 1)) {
             g_HistoryNav++;
