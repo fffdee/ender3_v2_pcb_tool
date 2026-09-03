@@ -20,6 +20,12 @@ static void put_dword(uint8_t *buffer, uint16_t offset, uint32_t value)
     put_word(buffer, offset + 2u, (uint16_t)(value >> 16));
 }
 
+static uint16_t get_word(const uint8_t *buffer, uint16_t offset)
+{
+    return (uint16_t)((uint16_t)buffer[offset] |
+                      ((uint16_t)buffer[offset + 1u] << 8));
+}
+
 static int program_page(uint32_t address, const uint8_t *data)
 {
     FLASH_EraseInitTypeDef erase;
@@ -62,9 +68,13 @@ static int format_if_needed(void)
     uint32_t pageError = 0u;
     uint32_t primask;
 
+    /* 注意：总扇区数必须按 16 位字比较。原来用 boot[19] 单字节比较，
+       扩容到 400 扇区后 boot[19]=144、boot[20]=1，单字节比较恒不成立，
+       会导致每次上电都判定"未格式化"并重新擦写整块 Flash。 */
     if (boot[510] == 0x55u && boot[511] == 0xAAu &&
-        boot[11] == 0x00u && boot[12] == 0x02u &&
-        boot[19] == BANUX_FLASH_DISK_SECTOR_COUNT && boot[20] == 0u &&
+        get_word(boot, 11u) == BANUX_FLASH_DISK_SECTOR_SIZE &&
+        boot[13] == BANUX_FLASH_DISK_CLUSTER_SECTORS &&
+        get_word(boot, 19u) == BANUX_FLASH_DISK_SECTOR_COUNT &&
         boot[512] == 0xF8u && boot[513] == 0xFFu && boot[514] == 0xFFu) {
         return 0;
     }
@@ -75,7 +85,7 @@ static int format_if_needed(void)
     s_pageBuffer[2] = 0x90u;
     memcpy(&s_pageBuffer[3], "BANUX1.0", 8u);
     put_word(s_pageBuffer, 11u, BANUX_FLASH_DISK_SECTOR_SIZE);
-    s_pageBuffer[13] = 1u;       /* sectors per cluster */
+    s_pageBuffer[13] = BANUX_FLASH_DISK_CLUSTER_SECTORS;  /* sectors per cluster */
     put_word(s_pageBuffer, 14u, 1u);
     s_pageBuffer[16] = 1u;       /* one FAT */
     put_word(s_pageBuffer, 17u, 32u);

@@ -3,37 +3,38 @@
        300          0          0         16          0          0   banux.o
        432          0         44          1        128          0   banux_component.o
         60          0          0          4          0          0   banux_debug.o
-       372          0         80          0          0          0   banux_io.o
+       378          0         80          0          0          0   banux_io.o
         14          0          0          0          0          0   banux_scheduler.o
       2176          0          0          3        384          0   bg_event.o
-      3728          0        518         44       2592          0   bg_shell.o
-      6600          0       2228          0       2252          0   bg_shell_commands.o
+      3728          0        522         44       2592          0   bg_shell.o
+      6776          0       2288          0       2252          0   bg_shell_commands.o
        410          0          0          0        512          0   bsp_driver_sd.o
-      1616          0        367          8        576          0   command_parser.o
+        92          0       1216          0          0          0   ccsbcs.o
+      1622          0        367          8        576          0   command_parser.o
        160          0          0          0          0          0   diskio.o
        328          0         77          0          0          0   driver_init.o
       1818          0         53         40         64          0   drv_device.o
       1478          0        427         60          0          0   drv_eeprom.o
        476          0          0         44          0          0   drv_fs.o
        208          0         96          0          0          0   drv_init.o
-      1028          0        523         56        560          0   drv_sdio.o
+      1012          0        523         56        560          0   drv_sdio.o
       2234          0       1105        508          0          0   drv_stepper.o
         90          0        116         56          0          0   drv_timer1ms.o
        170          0        195        144          0          0   drv_uart.o
          0          0         78          0          0          0   event_component_manifest.o
         72          0         63         10       1120          0   fatfs.o
-      7038          0        172         12         24          0   ff.o
+      8430          0        186         12        154          0   ff.o
         70          0          0          0         16          0   ff_gen_drv.o
-      2392          0        214          0       1140          0   fs_sd.o
+      3048          0        150         12       1776          0   fs_sd.o
       2228          0        411          0         24          0   gcode.o
        128          0          0          0          0          0   gpio.o
-       832          0         20          1       2048          0   internal_flash_diskio.o
+       852          0         20          1       2048          0   internal_flash_diskio.o
        272          0         78          0          0          0   internal_flash_fs.o
        334          0         96          0          0          0   main.o
-       472          0        116          1        512          0   sd_diskio.o
+       564          0        216         12        512          0   sd_diskio.o
        192          0          0          0        132          0   sdio.o
        168          0         74          0          0          0   shell_io_uart.o
-        64          0        304          0       4608          0   startup_stm32f103xe.o
+        64          0        304          0       8704          0   startup_stm32f103xe.o
        164          0          0         12          0          0   stm32f1xx_hal.o
        232          0          0          0          0          0   stm32f1xx_hal_cortex.o
        374          0          0          0          0          0   stm32f1xx_hal_dma.o
@@ -42,23 +43,24 @@
        524          0          0          0          0          0   stm32f1xx_hal_gpio.o
         60          0          0          0          0          0   stm32f1xx_hal_msp.o
       1240          0         18          0          0          0   stm32f1xx_hal_rcc.o
-      2028          0          0          0          0          0   stm32f1xx_hal_sd.o
-      1556          0          0          0          0          0   stm32f1xx_hal_uart.o
+      2148          0          0          0          0          0   stm32f1xx_hal_sd.o
+      1552          0          0          0          0          0   stm32f1xx_hal_uart.o
         44          0          0          0          0          0   stm32f1xx_it.o
       1570          0          0          0          0          0   stm32f1xx_ll_sdmmc.o
+         0          0          0          0          0          0   syscall.o
          2          0         24          4          0          0   system_stm32f1xx.o
          0          0         80          0          0          0   upgrade_component_manifest.o
-       790          0         17          2       2200          0   usart.o
-      1894          0         52         12      20608          0   vfs.o
-      1052          0        578          0          0          0   wireless_control.o
+       668          0          0          2       8344          0   usart.o
+      1924          0         52         12      22656          0   vfs.o
+      1576          0       2860          0          0          0   wireless_control.o
 Object Totals
 
 Memory Map of the image
 
 	Load Region LR_IROM1 
 
-		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x000116A4, Max: 0x00070000, END)
+		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00013050, Max: 0x00070000, END)
 
-		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000A148, Max: 0x00010000, END)
+		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000D460, Max: 0x00010000, END)
 
 Image component sizes

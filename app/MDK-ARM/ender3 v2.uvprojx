@@ -704,6 +704,11 @@
               <FilePath>../Banux/02_system_components/fatfs/src/option/syscall.c</FilePath>
             </File>
             <File>
+              <FileName>ccsbcs.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/02_system_components/fatfs/src/option/ccsbcs.c</FilePath>
+            </File>
+            <File>
               <FileName>sd_diskio.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Banux/02_system_components/fatfs/src/drivers/sd_diskio.c</FilePath>

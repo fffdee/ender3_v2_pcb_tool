@@ -67,6 +67,10 @@ ESP8266WebServer httpServer(HTTP_PORT);
 ESP8266HTTPUpdateServer httpUpdater;
 WiFiServer bridgeServer(BRIDGE_TCP_PORT);
 WiFiClient bridgeClient;
+/* 桥接 TCP 空闲超时：PC 闪退/断网常不发 FIN，ESP 侧半开连接会长期占用唯一连接槽，
+ * 导致 PC 重连困难。超过该时长无任何桥接流量即主动断开（可按需调大以免误杀空闲会话）。 */
+#define BRIDGE_IDLE_TIMEOUT_MS  60000UL
+static unsigned long bridgeLastActivity = 0;
 WiFiUDP discoveryUdp;
 
 bool apModeActive = false;
@@ -601,7 +605,10 @@ static void feedSerialByte(uint8_t byte) {
             serialCtl[serialCtlLen] = '\0';
         } else {
             flushSerialControlToTcp();
-            if (bridgeClient && bridgeClient.connected()) bridgeClient.write(byte);
+            if (bridgeClient && bridgeClient.connected()) {
+                bridgeClient.write(byte);
+                bridgeLastActivity = millis();
+            }
             serialLineStart = (byte == '\n' || byte == '\r');
             return;
         }
@@ -615,6 +622,7 @@ static void feedSerialByte(uint8_t byte) {
         }
     } else if (bridgeClient && bridgeClient.connected()) {
         bridgeClient.write(byte);
+        bridgeLastActivity = millis();
     }
     serialLineStart = (byte == '\n' || byte == '\r');
 }
@@ -670,6 +678,7 @@ static void handleBridge() {
         }
         bridgeClient = incoming;
         bridgeClient.setNoDelay(true);
+        bridgeLastActivity = millis();
         sendTcpLine("@BPC CONNECTED " + apGetDeviceName());
     }
 
@@ -680,6 +689,15 @@ static void handleBridge() {
         while (bridgeClient.available()) {
             feedTcpByte((uint8_t)bridgeClient.read());
         }
+        bridgeLastActivity = millis();   /* 收到任意桥接数据 = 活跃 */
+    }
+
+    /* 空闲超时：PC 闪退/断网未发 FIN 时，半开连接会长期占用唯一连接槽，
+     * 导致 PC 重连困难。超过 BRIDGE_IDLE_TIMEOUT_MS 无流量即主动断开。 */
+    if (bridgeClient && bridgeClient.connected() &&
+        (unsigned long)(millis() - bridgeLastActivity) > BRIDGE_IDLE_TIMEOUT_MS) {
+        bridgeClient.stop();
+        bridgeLastActivity = 0;
     }
 }
 

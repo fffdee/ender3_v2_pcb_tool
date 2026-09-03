@@ -488,11 +488,22 @@ static int editor_delete_line(uint32_t wanted)
     return 0;
 }
 
+/* 统一的失败原因打印：自定义错误码给出可读说明，FatFs 码保留原始值 */
+static void fs_report_error(const char *prefix, const char *target, int ret)
+{
+    const char *reason = SdFs_ErrorText(ret);
+    if (reason) {
+        Shell_Printf("%s %s failed (%d): %s\r\n", prefix, target, ret, reason);
+    } else {
+        Shell_Printf("%s %s failed (%d)\r\n", prefix, target, ret);
+    }
+}
+
 static int editor_save(void)
 {
     int ret = SdFs_WriteFile(s_editor.path, s_editor.data, s_editor.length);
     if (ret != 0) {
-        Shell_Printf("vim: write failed (%d)\r\n", ret);
+        fs_report_error("vim: write", s_editor.path, ret);
         return ret;
     }
     s_editor.dirty = FALSE;
@@ -626,7 +637,7 @@ static int cmd_touch(int argc, char *argv[])
     for (i = 0; i < argc; i++) {
         int ret = SdFs_Touch(argv[i]);
         if (ret != 0) {
-            Shell_Printf("touch: %s: create failed (%d)\r\n", argv[i], ret);
+            fs_report_error("touch: create", argv[i], ret);
             return ret;
         }
     }
@@ -651,7 +662,7 @@ static int cmd_mkdir(int argc, char *argv[])
     for (i = 0; i < argc; i++) {
         int ret = SdFs_Mkdir(argv[i]);
         if (ret != 0) {
-            Shell_Printf("mkdir: %s: create failed (%d)\r\n", argv[i], ret);
+            fs_report_error("mkdir: create", argv[i], ret);
             return ret;
         }
     }
@@ -676,7 +687,7 @@ static int cmd_rm(int argc, char *argv[])
     for (i = 0; i < argc; i++) {
         int ret = SdFs_Remove(argv[i]);
         if (ret != 0) {
-            Shell_Printf("rm: %s: remove failed (%d)\r\n", argv[i], ret);
+            fs_report_error("rm: remove", argv[i], ret);
             return ret;
         }
     }
@@ -704,7 +715,7 @@ static int cmd_vim(int argc, char *argv[])
     if (!node) {
         int ret = SdFs_Touch(argv[0]);
         if (ret != 0) {
-            Shell_Printf("vim: %s: create failed (%d)\r\n", argv[0], ret);
+            fs_report_error("vim: create", argv[0], ret);
             return ret;
         }
         node = DrvFs_FindNode(argv[0]);
@@ -808,9 +819,12 @@ static int recv_b64_decode(const char *src, uint8_t *out, uint16_t outMax,
 
 static int recv_clear_path(const char *path)
 {
-    int ret = SdFs_WriteFile(path, NULL, 0u);
+    /* 分步提示：若只看到这一行而没有 "OK clear"，说明卡在 SdFs_RecvBegin 内部
+       （建文件/开句柄），上位机不应继续发 -b，否则两条命令会在串口侧叠加。 */
+    Shell_Printf("recv: creating %s\r\n", path);
+    int ret = SdFs_RecvBegin(path);   /* 建/清空并保持句柄，供后续 -b 复用 */
     if (ret != 0) {
-        Shell_Printf("recv: clear %s failed (%d)\r\n", path, ret);
+        fs_report_error("recv: clear", path, ret);
         return ret;
     }
     Shell_Printf("OK clear %s\r\n", path);
@@ -836,14 +850,29 @@ static int recv_write_block(const char *path, const char *offsetText,
         Shell_Printf("recv: invalid base64 (%d)\r\n", ret);
         return -5;
     }
-    ret = SdFs_WriteFileAt(path, data, dataLen, offset);
+    ret = SdFs_RecvWrite(path, data, dataLen, offset);
     if (ret != 0) {
-        Shell_Printf("recv: write %s @%lu failed (%d)\r\n",
-                     path, (unsigned long)offset, ret);
+        const char *reason = SdFs_ErrorText(ret);
+        if (reason) {
+            Shell_Printf("recv: write %s @%lu failed (%d): %s\r\n",
+                         path, (unsigned long)offset, ret, reason);
+        } else {
+            Shell_Printf("recv: write %s @%lu failed (%d)\r\n",
+                         path, (unsigned long)offset, ret);
+        }
         return ret;
     }
     Shell_Printf("OK block %lu %u\r\n", (unsigned long)offset,
                  (unsigned int)dataLen);
+    return 0;
+}
+
+static int cmd_recv_end(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+    SdFs_RecvEnd();
+    Shell_Print("OK end\r\n");
     return 0;
 }
 
@@ -853,6 +882,7 @@ static int cmd_recv(int argc, char *argv[])
         Shell_Print("Usage:\r\n");
         Shell_Print("  recv -c <path>\r\n");
         Shell_Print("  recv -b <path> <offset> <base64>\r\n");
+        Shell_Print("  recv -e\r\n");
         return -1;
     }
 
@@ -863,6 +893,10 @@ static int cmd_recv(int argc, char *argv[])
     if ((strcmp(argv[0], "-b") == 0 || strcmp(argv[0], "block") == 0) &&
         argc == 4) {
         return recv_write_block(argv[1], argv[2], argv[3]);
+    }
+
+    if (strcmp(argv[0], "-e") == 0 || strcmp(argv[0], "end") == 0) {
+        return cmd_recv_end(0, NULL);
     }
     Shell_Print("recv: unknown option\r\n");
     return -2;
@@ -891,6 +925,7 @@ static const ShellOpt_t recv_opts[] = {
         "Receive file chunks over shell", cmd_recv),
     OPT("c", "clear", "<path>", "Create/truncate destination file", cmd_recv_clear),
     OPT("b", "block", "<path> <offset> <base64>", "Write one base64 chunk", cmd_recv_block),
+    OPT("e", "end", NULL, "Close the receive session (flush)", cmd_recv_end),
     OPT_END()
 };
 

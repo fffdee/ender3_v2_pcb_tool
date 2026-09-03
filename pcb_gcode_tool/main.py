@@ -2853,7 +2853,10 @@ class MainWindow(QMainWindow):
         response = self.read_bridge_response(timeout_s)
         if response:
             self.log_connection(response)
-        if "Error:" in response or "failed" in response.lower():
+        # "invalid" 用于捕获模块的 "recv: invalid base64" / "recv: invalid offset"，
+        # 这两类报错既不含 "Error:" 也不含 "failed"，以前会被静默忽略
+        if ("Error:" in response or "failed" in response.lower()
+                or "invalid" in response.lower()):
             raise OSError(response or "命令执行失败")
         return response
 
@@ -2877,14 +2880,40 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
             return
         payload = self.generate_gcode().encode("ascii")
+        # 模块命令行缓冲为 128 字节（SHELL_CMD_MAX_LEN），超长会被静默截断导致
+        # base64 残缺，这里提前算一次最长行并拦截。
+        longest_cmd = len(f"recv -b {path} {len(payload)} ") + \
+            len(base64.b64encode(bytes(UPLOAD_CHUNK_SIZE)))
+        if longest_cmd > 120:
+            QMessageBox.warning(
+                self, "路径过长",
+                f"按此路径生成的命令行约 {longest_cmd} 字节，接近模块 128 字节上限。\n"
+                "请改用更短的文件名或更浅的目录。")
+            return
         self._transfer_busy = True
         self.update_device_actions()
         try:
-            self.send_bridge_command(f"recv -c {path}", 3.0)
+            # recv -c 要在 SD 卡上建/清空文件（长名还会写多个 LFN 目录项），慢卡可能
+            # 耗时几秒，超时设长一点；且必须确认模块回 "OK clear"。否则模块侧很可能
+            # 卡在 f_open 里没返回，此时绝不能继续发 recv -b，两条命令在串口侧叠加
+            # 正是"命令回显了却没有响应"的根因。
+            response = self.send_bridge_command(f"recv -c {path}", 15.0)
+            if "OK clear" not in response:
+                raise OSError(
+                    f"创建文件未确认（响应：{response.strip()!r}）")
             for offset in range(0, len(payload), UPLOAD_CHUNK_SIZE):
                 chunk = payload[offset:offset + UPLOAD_CHUNK_SIZE]
                 encoded = base64.b64encode(chunk).decode("ascii")
-                self.send_bridge_command(f"recv -b {path} {offset} {encoded}", 3.0)
+                response = self.send_bridge_command(
+                    f"recv -b {path} {offset} {encoded}", 5.0)
+                # 逐块确认：模块必须回 "OK block <offset>"，否则视为丢块/写失败。
+                # 之前只看有没有 "Error:"/"failed"，导致 invalid base64 这类
+                # 错误被忽略，最后照样提示传输成功但文件是坏的。
+                # 注意末尾带空格：模块回的是 "OK block <offset> <len>"，
+                # 不带空格会误把 "OK block 48 ..." 当成 offset=4 的成功响应
+                if f"OK block {offset} " not in response:
+                    raise OSError(
+                        f"块 {offset} 未确认写入（响应：{response.strip()!r}）")
                 percent = int(((offset + len(chunk)) * 100) / max(1, len(payload)))
                 self.transfer_progress.setText(f"{percent}%  {offset + len(chunk)} / {len(payload)} bytes")
                 QApplication.processEvents()
@@ -2893,6 +2922,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "传输失败", str(exc))
             return
         finally:
+            # 收尾：关闭模块侧接收会话。失败也要发，避免模块句柄悬挂。
+            try:
+                self.send_bridge_command("recv -e", 2.0)
+            except OSError:
+                pass
             self._transfer_busy = False
             self.update_device_actions()
         self.statusBar().showMessage(f"已传输到 {path}", 3500)

@@ -184,17 +184,19 @@ static int sdio_drv_init(void *priv)
 static int sdio_drv_read(void *priv, uint8_t *buf, uint32_t len)
 {
     SdioPriv_t *p = (SdioPriv_t *)priv;
-    uint32_t blkSize;
 
     if (!buf || len == 0 || !p->mounted) {
         return -1;
     }
-    blkSize = (p->cardInfo.BlockSize) ? p->cardInfo.BlockSize : 512u;
+    /* 扇区固定 512 字节（_MIN_SS/_MAX_SS = 512），必须按 s_blockBuffer 的实际
+       大小夹取长度：cardInfo.BlockSize 对 SDSC 卡取自 CSD 的 RdBlockLen，
+       常见值为 1024（SDHC 才是固定 512）。若拿它夹长度，disk_read 只填充了
+       512 字节，后面 memcpy 会越界读取 512 字节。 */
+    if (len > sizeof(s_blockBuffer)) {
+        len = sizeof(s_blockBuffer);
+    }
     if (disk_read(0u, s_blockBuffer, p->blockIndex, 1u) != RES_OK) {
         return -1;
-    }
-    if (len > blkSize) {
-        len = blkSize;
     }
     memcpy(buf, s_blockBuffer, len);
     return (int)len;
@@ -203,14 +205,15 @@ static int sdio_drv_read(void *priv, uint8_t *buf, uint32_t len)
 static int sdio_drv_write(void *priv, const uint8_t *buf, uint32_t len)
 {
     SdioPriv_t *p = (SdioPriv_t *)priv;
-    uint32_t blkSize;
 
     if (!buf || len == 0 || !p->mounted) {
         return -1;
     }
-    blkSize = (p->cardInfo.BlockSize) ? p->cardInfo.BlockSize : 512u;
-    if (len > blkSize) {
-        len = blkSize;
+    /* 同上：必须按缓冲区实际大小夹取，否则 SDSC 卡（BlockSize=1024）下
+       memcpy 会写穿 s_blockBuffer，踩坏紧邻的 s_sdio（mounted/blockIndex/
+       cardInfo 等）。 */
+    if (len > sizeof(s_blockBuffer)) {
+        len = sizeof(s_blockBuffer);
     }
     memset(s_blockBuffer, 0xFF, sizeof(s_blockBuffer));
     memcpy(s_blockBuffer, buf, len);

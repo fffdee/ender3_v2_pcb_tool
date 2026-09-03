@@ -77,7 +77,39 @@ DRESULT SD_read (BYTE, BYTE*, DWORD, UINT);
 #endif  /* _USE_IOCTL == 1 */
 
 static DRESULT SD_WaitCardReady(void);
-  
+
+/* 错误打印限流：SD 写/读失败时若逐扇区 DBG，传输中会以几百行/秒的速度
+ * 淹没 USART，导致上位机被冲垮/掉线（表现为"无法探测在线"）。这里只在首次
+ * 失败和之后每 50 次时打印，并在某个扇区成功时清零计数，使偶发错误仍能暴露。 */
+static uint32_t s_sdWriteErrs = 0U;
+static uint32_t s_sdReadErrs  = 0U;
+
+static void sd_report_write_error(DWORD sector)
+{
+  if (s_sdWriteErrs == 0U || (s_sdWriteErrs % 50U) == 0U) {
+    DBG("[SD diskio] write failed: sector=%lu error=0x%08lX "
+        "state=%lu STA=0x%08lX DCTRL=0x%08lX edge=%s (%lu total)\n",
+        (unsigned long)sector, (unsigned long)hsd.ErrorCode,
+        (unsigned long)hsd.State, (unsigned long)SDIO->STA,
+        (unsigned long)SDIO->DCTRL,
+        hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_FALLING ? "falling" : "rising",
+        (unsigned long)s_sdWriteErrs);
+  }
+  s_sdWriteErrs++;
+}
+
+static void sd_report_read_error(DWORD sector)
+{
+  if (s_sdReadErrs == 0U || (s_sdReadErrs % 50U) == 0U) {
+    DBG("[SD diskio] read failed: sector=%lu error=0x%08lX "
+        "state=%lu STA=0x%08lX (%lu total)\n",
+        (unsigned long)sector, (unsigned long)hsd.ErrorCode,
+        (unsigned long)hsd.State, (unsigned long)SDIO->STA,
+        (unsigned long)s_sdReadErrs);
+  }
+  s_sdReadErrs++;
+}
+
 const Diskio_drvTypeDef  SD_Driver =
 {
   SD_initialize,
@@ -160,9 +192,11 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
     if (BSP_SD_ReadBlocks((uint32_t *)s_sectorBuffer, (uint32_t)sector,
                           1U, SD_DATATIMEOUT) != MSD_OK ||
         SD_WaitCardReady() != RES_OK) {
-      DBG("[SD diskio] read failed: sector=%lu\n", (unsigned long)sector);
+      sd_report_read_error(sector);
+      (void)HAL_SD_Abort(&hsd);   /* 读超时后外设可能卡在 BUSY，主动中止恢复 */
       return RES_ERROR;
     }
+    s_sdReadErrs = 0U;            /* 本扇区成功 → 重置，下次错误仍会立即打印 */
     memcpy(buff, s_sectorBuffer, sizeof(s_sectorBuffer));
     buff += sizeof(s_sectorBuffer);
     sector++;
@@ -187,14 +221,14 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
     if (BSP_SD_WriteBlocks((uint32_t *)s_sectorBuffer, (uint32_t)sector,
                            1U, SD_DATATIMEOUT) != MSD_OK ||
         SD_WaitCardReady() != RES_OK) {
-      DBG("[SD diskio] write failed: sector=%lu error=0x%08lX "
-          "state=%lu STA=0x%08lX DCTRL=0x%08lX edge=%s\n",
-          (unsigned long)sector, (unsigned long)hsd.ErrorCode,
-          (unsigned long)hsd.State, (unsigned long)SDIO->STA,
-          (unsigned long)SDIO->DCTRL,
-          hsd.Init.ClockEdge == SDIO_CLOCK_EDGE_FALLING ? "falling" : "rising");
+      sd_report_write_error(sector);
+      /* 写超时后 SDIO 外设常处于未完成态，后续每次写都会立即失败形成死循环
+       * （STA 一直 DTIMEOUT）。主动中止当前传输，把 hsd 复位到 READY，
+       * 给下一次写恢复的机会。 */
+      (void)HAL_SD_Abort(&hsd);
       return RES_ERROR;
     }
+    s_sdWriteErrs = 0U;          /* 本扇区成功 → 重置，下次错误仍会立即打印 */
     buff += sizeof(s_sectorBuffer);
     sector++;
   }

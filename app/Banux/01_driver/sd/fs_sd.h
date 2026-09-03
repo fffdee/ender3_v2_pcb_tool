@@ -57,6 +57,23 @@ int SdFs_Mkdir(const char *vfsPath);
 /** Remove one SD file or an empty directory. */
 int SdFs_Remove(const char *vfsPath);
 
+/** 开始分块接收：创建/清空文件并保持句柄打开（避免每块都 f_open 扫目录）。 */
+int SdFs_RecvBegin(const char *vfsPath);
+
+/** 在当前接收会话内写入一个数据块（每块都会 f_sync 落盘）。 */
+int SdFs_RecvWrite(const char *vfsPath, const uint8_t *data, uint32_t len,
+                   uint32_t offset);
+
+/** 结束接收会话：刷新并关闭文件句柄。 */
+void SdFs_RecvEnd(void);
+
+/**
+ * @brief  把 SdFs_* 的返回值翻译成可读原因
+ * @return 自定义错误码返回对应英文说明；FatFs 错误码（负值，1..20）返回 NULL，
+ *         由调用方按原有方式打印原始码。
+ */
+const char *SdFs_ErrorText(int err);
+
 #ifdef __cplusplus
 }
 #endif

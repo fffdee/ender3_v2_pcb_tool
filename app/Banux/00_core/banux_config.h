@@ -86,7 +86,7 @@ extern "C" {
 #endif
 
 #ifndef VFS_MAX_NAME_LEN
-#define VFS_MAX_NAME_LEN            16
+#define VFS_MAX_NAME_LEN            32
 #endif
 
 #ifndef VFS_MAX_CHILDREN

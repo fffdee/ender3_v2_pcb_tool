@@ -2,7 +2,8 @@
 /**
   ******************************************************************************
   * @file    usart.c
-  * @brief   UART1 / UART3 异步收发，2M baud，与 Bootloader 协议链路一致。
+  * @brief   UART1 / UART3 异步收发。UART1 = 2M（Bootloader / 直连调试链路）；
+  *          UART3 = 115200（ESP 桥接，突发流下 2M 易触发硬件溢出丢字节）。
   *          中断接收 + 环形缓冲，用于嗅探上位机的 ENTER_BOOT 命令；
   *          阻塞发送用于调试打印。
   ******************************************************************************
@@ -11,7 +12,7 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-#define UART_RB_SIZE 1024u
+#define UART_RB_SIZE 4096u
 
 typedef struct {
     uint8_t  buf[UART_RB_SIZE];
@@ -101,32 +102,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
-/* 调试：UART 错误回调。波特率不匹配/线路干扰时打印 "1E:0x..." 错误标志，
- * 并重新启动接收（否则 HAL 会停在错误态不再收数据）。 */
+/* 重要：本回调运行在 USART 中断上下文。严禁在此调用任何阻塞式发送
+ * (HAL_UART_Transmit / uart_tx)，否则会长时间占用中断，使同优先级的串口
+ * 接收中断无法嵌套而持续硬件溢出(ORE)，进而触发 "3E:0x00000008" 刷屏死循环。
+ * 这里只做：按 STM32F1 要求"先读 SR 再读 DR"清除错误标志，并重启接收。 */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    char s[16];
-    uint32_t err = HAL_UART_GetError(huart);
-    uint8_t i;
+    volatile uint32_t tmp;
 
-    s[0] = (huart == &huart1) ? '1' : '3';
-    s[1] = 'E';
-    s[2] = ':';
-    s[3] = '0';
-    s[4] = 'x';
-    for (i = 0; i < 8; i++) {
-        s[5 + i] = hex[(err >> (28u - i * 4u)) & 0xFu];
-    }
-    s[13] = '\r';
-    s[14] = '\n';
-    s[15] = '\0';
-    uart_tx(&huart1, (const uint8_t *)s, 15);
-    uart_tx(&huart3, (const uint8_t *)s, 15);
+    /* 读 SR 再读 DR 才能清除 ORE/FE/NE（F1 手册要求此顺序） */
+    tmp = huart->Instance->SR;
+    tmp = huart->Instance->DR;
+    (void)tmp;
+    /* PE 可写 0 清除 */
+    __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_PE);
 
-    /* 清除错误标志并重启接收 */
-    __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_ORE | UART_FLAG_NE |
-                                 UART_FLAG_FE | UART_FLAG_PE);
+    /* 错误后 HAL 已中止当前 Receive_IT，必须重新开启接收 */
     if (huart == &huart1) {
         (void)HAL_UART_Receive_IT(&huart1, &s_rx1, 1);
     } else if (huart == &huart3) {
@@ -157,6 +148,9 @@ void MX_USART1_Init(void)
 void MX_USART3_Init(void)
 {
   huart3.Instance = USART3;
+  /* ESP 桥接串口：维持 115200。2M 下每字节中断在突发流中会被其他中断/主循环
+   * 延迟，导致硬件 RX 溢出(ORE)丢字节（表现为命令中丢字符、recv 块失败）。
+   * 115200 每字节 87us 窗口，中断只需数 us，余量极大，不会出现 ORE。 */
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
