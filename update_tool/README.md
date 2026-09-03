@@ -1,11 +1,13 @@
 # update_tool — BG Bootloader 上位机
 
-USB CDC 固件升级工具（PyQt5 GUI），用于识别 BG Bootloader 设备并烧录 APP 固件。
+USB CDC / 无线(WiFi 桥接) 固件升级工具（PyQt5 GUI），用于识别 BG Bootloader 设备并烧录 APP 固件。无线模式把 ESP8266 的 TCP 透传链路当作“经 WiFi 转发的串口”，复用同一套升级协议。
 
 ## 依赖
 
 ```bash
 pip install pyserial PyQt5
+# 可选：提升无线设备(UDP 广播)发现命中率（多网卡子网定向广播）
+pip install netifaces
 ```
 
 Python 3.8+ 推荐。
@@ -38,24 +40,36 @@ python bg_bootloader.py
 - **顶部 Banner**
   - 未连接：红色「未连接」
   - 已连接：绿色「已连接 · \<产品名\> (COMx)」
-- **设备连接**：串口选择、刷新、自动扫描、「进入 Boot 模式」
+- **设备连接**：
+  - **连接方式**下拉：`无线 (WiFi 桥接)` / `串口 (USB 直连)`，切换后自动记忆到 `device_connection.json`
+  - 无线模式：「搜索设备」UDP 广播发现 BanPCBTool，设备下拉选择目标（IP:8266）
+  - 串口模式：串口选择、波特率、刷新、自动扫描
+  - 「进入 Boot 模式」：两种模式通用（串口发 `boot`，无线经 TCP 透传发 `boot`）
 - **固件操作**：选择 `.bin` → 升级；双分区模式额外支持握手/查询/擦除/跳转/重启
 - **日志**：实时操作日志
 
 ## 典型流程
 
+### 串口直连（USB CDC）
 1. 设备进入 Bootloader（烧录 BL，或 APP 串口发 `boot` / 点「进入 Boot 模式」）
 2. 打开本工具，自动扫描或手动选串口
 3. Banner 显示绿色产品名后，选择固件并升级
+
+### 无线（WiFi 桥接透传）
+1. 连接方式选「无线 (WiFi 桥接)」→「搜索设备」发现目标（或直接用上次记忆的 IP）
+2. 选中设备后点「升级」：上位机 TCP 连到模块 `IP:8266`，`@BPC PING` 握手，随后升级协议帧经模块逐字节透传到下位机 UART3
+3. 与串口模式行为一致（握手/查询/擦除/升级/跳转），仅承载通道不同
 
 ## 目录结构
 
 ```
 update_tool/
-├── README.md           ← 本说明
-├── bg_bootloader.py    ← GUI 入口
-├── bl_core.py          ← CDC 升级协议 + USB 身份识别
-└── worker.py           ← 后台扫描 / 升级线程
+├── README.md               ← 本说明
+├── bg_bootloader.py        ← GUI 入口（无线/串口双模式）
+├── bl_core.py              ← CDC 升级协议 + USB 身份识别（传输后端可切换）
+├── wireless.py             ← 无线连接层：UDP 发现 + TCP 握手 + SocketSerialAdapter
+├── worker.py               ← 后台扫描 / 升级线程（含 WirelessScanWorker）
+└── device_connection.json  ← 连接偏好（运行时生成，与 pcb_gcode_tool 结构兼容）
 ```
 
 ## 协议概要
@@ -63,6 +77,22 @@ update_tool/
 - 帧头 SOF：`0xAA`
 - 主要命令：SYNC / START / DATA / FINISH / JUMP / ERASE / QUERY_INFO / SET_PART / REBOOT
 - 详情实现见 `bl_core.py`
+
+## 无线升级原理
+
+从上位机视角，**无线链路等价于“经过 WiFi 模块转发的串口”**：升级协议帧（`0xAA …`）原样发出，只是承载通道从 COM 口换成 TCP socket。
+
+```
+上位机 BLComm  ──0xAA 协议帧──▶  TCP socket (IP:8266)
+                                     │  ESP8266 wireless.ino 逐字节透传
+                                     ▼
+                               下位机 UART3 ──▶ app_bl_poll 嗅探
+```
+
+- **传输抽象**：`wireless.SocketSerialAdapter` 把 TCP socket 适配成 pyserial.Serial 的最小子集（`write`/`read`/`reset_input_buffer`/`close`/`is_open`），因此 `BLComm` 协议层零改动即可跑在无线上（`BLComm(transport=adapter)`）。
+- **连接兼容 `wireless.ino`**：UDP 发现端口 `8267`（查询串 `BANPCBTOOL?`）、TCP 桥接端口 `8266`、链路握手 `@BPC PING`→`@BPC PONG`。升级二进制帧首字节是 `0xAA`，不会与模块的行首 `@BPC` 控制前缀冲突。
+
+> **固件侧前提**：无线升级要求下位机固件能通过 **UART3** 处理完整升级协议。当前 `app/Core/Src/app_bl.c` 的 `app_bl_poll()` 对 UART3 仅嗅探 `ENTER_BOOT`(0x0B) 帧与 `boot` 文本；若要在无线下完成 SYNC/START/DATA/FINISH 全流程，需在固件侧为 UART3 增加升级通道（参考 `app_upgrade.c` 的 `UpgradeChannel_t` 抽象）。上位机侧已按“串口式”就绪，固件通道补齐后即可直接无线升级。
 
 ## 防变砖逻辑（升级中断 / 拔线）
 

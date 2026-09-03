@@ -11,6 +11,7 @@ from bl_core import (
     list_bootloader_devices, probe_port, Cmd, build_packet,
     is_serial_disconnect,
 )
+from wireless import discover_devices, open_wireless
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +85,38 @@ class AutoScanWorker(QThread):
         self.scan_finished.emit(False, "未发现 Bootloader 设备")
 
 
+class WirelessScanWorker(QThread):
+    """
+    信号:
+        log(str)                 — 日志
+        found(object)            — WirelessDevice
+        scan_finished(bool, str) — (是否发现, 消息)
+    """
+    log           = pyqtSignal(str)
+    found         = pyqtSignal(object)
+    scan_finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        self.log.emit("正在搜索无线设备（UDP 广播 BANPCBTOOL?）…")
+        devices = discover_devices(log=self.log.emit)
+        if self._abort:
+            self.scan_finished.emit(False, "已取消")
+            return
+        if devices:
+            for device in devices:
+                self.found.emit(device)
+            self.scan_finished.emit(True, f"发现 {len(devices)} 台无线设备")
+        else:
+            self.scan_finished.emit(False, "未发现无线设备")
+
+
 class UpgradeWorker(QThread):
     """
     信号:
@@ -111,13 +144,15 @@ class UpgradeWorker(QThread):
 
     def __init__(self, port: str, baud: int, operation: str,
                  firmware: bytes = b"", auto_jump: bool = True,
-                 parent=None):
+                 mode: str = "serial", device=None, parent=None):
         super().__init__(parent)
         self._port      = port
         self._baud      = baud
         self._operation = operation
         self._firmware  = firmware
         self._auto_jump = auto_jump
+        self._mode      = mode       # "serial"（COM 直连）| "wireless"（ESP8266 TCP 透传）
+        self._device    = device     # WirelessDevice，仅无线模式使用
         self._abort     = False
 
     def abort(self):
@@ -135,13 +170,22 @@ class UpgradeWorker(QThread):
     def _emit_info(self, info: dict):
         self.info.emit(info)
 
+    def _open_comm(self) -> BLComm:
+        """按连接模式建立通信：无线走 TCP 透传适配器，串口走 pyserial。"""
+        if self._mode == "wireless":
+            if self._device is None:
+                raise RuntimeError("未选择无线设备")
+            adapter = open_wireless(self._device, log=self._emit_log)
+            return BLComm(transport=adapter)
+        self._emit_log(f"正在连接 {self._port} @ {self._baud} bps …")
+        return BLComm(self._port, self._baud)
+
     # ─── 线程入口 ─────────────────────────────────────────────────────────────
 
     def run(self):
         comm = None
         try:
-            self._emit_log(f"正在连接 {self._port} @ {self._baud} bps …")
-            comm = BLComm(self._port, self._baud)
+            comm = self._open_comm()
             # 让 Bootloader 把 info 字典通过信号回传 UI
             bl = Bootloader(
                 comm,

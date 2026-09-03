@@ -15,8 +15,13 @@ USB CDC 固件升级 & 跳转上位机
 
 import sys
 import os
+import json
 import time
 from pathlib import Path
+
+# 连接偏好持久化（结构与 pcb_gcode_tool 的 device_connection.json 兼容）
+DEVICE_CONFIG_PATH  = Path(__file__).resolve().parent / "device_connection.json"
+DEFAULT_SERIAL_BAUD = 2000000
 
 from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtGui import QFont, QColor, QIcon, QPalette, QLinearGradient, QBrush, QGuiApplication
@@ -32,7 +37,8 @@ from bl_core import (
     list_ports, list_bootloader_ports, identify_port, identify_usb_ids,
     is_bg_bootloader_id, BL_VID, BL_PID, BG_USB_PID,
 )
-from worker import AutoScanWorker, UpgradeWorker
+from worker import AutoScanWorker, UpgradeWorker, WirelessScanWorker
+from wireless import WirelessDevice, discover_devices, open_wireless
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -323,22 +329,27 @@ def make_info_pair(key: str, value: str = "—") -> tuple:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BG Bootloader — USB CDC 升级工具 v2.1")
-        self.setMinimumSize(820, 640)
+        self.setWindowTitle("BG Bootloader — USB / 无线 升级工具 v2.2")
+        self.setMinimumSize(860, 640)
 
         self._fw_path: str = ""
         self._worker: UpgradeWorker | None = None
         self._scan_worker: AutoScanWorker | None = None
+        self._wscan_worker: WirelessScanWorker | None = None
         self._boot_mode: int = 0   # 0 = single, 1 = dual
         self._connected_product: str = ""
         self._connected_port: str = ""
+        # 连接方式：wireless（ESP8266 TCP 透传）| serial（USB CDC 直连）
+        self._conn_mode: str = "serial"
+        self._wireless_device: WirelessDevice | None = None
 
         self._build_ui()
         self._connect_signals()
+        self._load_conn_prefs()      # 读偏好并应用连接方式
         self._set_banner_disconnected()
 
-        # 启动后自动扫描
-        QTimer.singleShot(200, self._on_auto_scan)
+        # 启动后按当前模式自动扫描
+        QTimer.singleShot(200, self._auto_scan_current_mode)
 
     # ────────────────────────────────────────────────────────────────────────
     #  UI 构建 — 三层结构：①连接 ②操作 ③日志
@@ -374,42 +385,66 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.lbl_status, alignment=Qt.AlignRight | Qt.AlignVCenter)
         card_conn_layout.addLayout(title_row)
 
-        # 控件行：串口 / 波特率 / 刷新 / 自动扫描
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(8)
-
-        ctrl_row.addWidget(make_caption("串口"))
-        self.combo_port = QComboBox()
-        self.combo_port.setMinimumWidth(240)
-        ctrl_row.addWidget(self.combo_port, 1)
-
-        ctrl_row.addSpacing(12)
-        ctrl_row.addWidget(make_caption("波特率"))
-        self.combo_baud = QComboBox()
-        self.combo_baud.addItems(["9600", "19200", "38400", "57600",
-                                  "115200", "230400", "460800", "921600",
-                                  "2000000"])
-        self.combo_baud.setCurrentText("2000000")
-        self.combo_baud.setFixedWidth(96)
-        ctrl_row.addWidget(self.combo_baud)
-
-        ctrl_row.addSpacing(12)
-        self.btn_refresh = QPushButton("刷新")
-        self.btn_refresh.setFixedWidth(64)
-        ctrl_row.addWidget(self.btn_refresh)
-
-        self.btn_scan = QPushButton("自动扫描")
-        self.btn_scan.setFixedWidth(88)
-        ctrl_row.addWidget(self.btn_scan)
+        # 控件行①：连接方式（无线 / 串口）+ 进入 Boot 模式
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_row.addWidget(make_caption("连接方式"))
+        self.combo_conn_mode = QComboBox()
+        self.combo_conn_mode.addItem("无线 (WiFi 桥接)", "wireless")
+        self.combo_conn_mode.addItem("串口 (USB 直连)", "serial")
+        self.combo_conn_mode.setFixedWidth(180)
+        mode_row.addWidget(self.combo_conn_mode)
+        mode_row.addStretch()
 
         self.btn_enter_boot = QPushButton("进入 Boot 模式")
         self.btn_enter_boot.setObjectName("BootMode")
         self.btn_enter_boot.setFixedWidth(120)
         self.btn_enter_boot.setVisible(False)  # 默认隐藏，非 Bootloader 设备才显示
         self.btn_enter_boot.setToolTip("发送 'boot' 命令让 APP 重启到 Bootloader 升级模式")
-        ctrl_row.addWidget(self.btn_enter_boot)
+        mode_row.addWidget(self.btn_enter_boot)
+        card_conn_layout.addLayout(mode_row)
 
-        card_conn_layout.addLayout(ctrl_row)
+        # 控件行②：无线面板（设备下拉 + 搜索）
+        self.wireless_panel = QWidget()
+        wp = QHBoxLayout(self.wireless_panel)
+        wp.setContentsMargins(0, 0, 0, 0)
+        wp.setSpacing(8)
+        wp.addWidget(make_caption("设备"))
+        self.combo_device = QComboBox()
+        self.combo_device.setMinimumWidth(240)
+        wp.addWidget(self.combo_device, 1)
+        self.btn_wireless_scan = QPushButton("搜索设备")
+        self.btn_wireless_scan.setFixedWidth(88)
+        wp.addWidget(self.btn_wireless_scan)
+        card_conn_layout.addWidget(self.wireless_panel)
+
+        # 控件行③：串口面板（串口 / 波特率 / 刷新 / 自动扫描）
+        self.serial_panel = QWidget()
+        sp = QHBoxLayout(self.serial_panel)
+        sp.setContentsMargins(0, 0, 0, 0)
+        sp.setSpacing(8)
+        sp.addWidget(make_caption("串口"))
+        self.combo_port = QComboBox()
+        self.combo_port.setMinimumWidth(240)
+        sp.addWidget(self.combo_port, 1)
+        sp.addSpacing(12)
+        sp.addWidget(make_caption("波特率"))
+        self.combo_baud = QComboBox()
+        self.combo_baud.addItems(["9600", "19200", "38400", "57600",
+                                  "115200", "230400", "460800", "921600",
+                                  "2000000"])
+        self.combo_baud.setCurrentText("2000000")
+        self.combo_baud.setFixedWidth(96)
+        sp.addWidget(self.combo_baud)
+        sp.addSpacing(12)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setFixedWidth(64)
+        sp.addWidget(self.btn_refresh)
+        self.btn_scan = QPushButton("自动扫描")
+        self.btn_scan.setFixedWidth(88)
+        sp.addWidget(self.btn_scan)
+        card_conn_layout.addWidget(self.serial_panel)
+
         root.addWidget(card_conn)
 
         # ════════════════════════════════════════════════════════════════════
@@ -584,6 +619,8 @@ class MainWindow(QMainWindow):
         self.btn_browse.clicked.connect(self._browse_firmware)
         self.btn_enter_boot.clicked.connect(self._on_enter_boot)
         self.combo_port.currentIndexChanged.connect(self._on_port_changed)
+        self.combo_conn_mode.currentIndexChanged.connect(self._on_conn_mode_changed)
+        self.btn_wireless_scan.clicked.connect(self._on_wireless_scan)
 
         self.btn_ping.clicked.connect(lambda: self._start_op(UpgradeWorker.OP_PING))
         self.btn_query.clicked.connect(lambda: self._start_op(UpgradeWorker.OP_QUERY))
@@ -595,6 +632,145 @@ class MainWindow(QMainWindow):
         self.btn_set_part_b.clicked.connect(lambda: self._start_op(UpgradeWorker.OP_SET_PART_B))
 
         self.btn_clear_log.clicked.connect(self.txt_log.clear)
+
+    # ─────────────────────────────────────────────
+    #  连接方式切换 / 无线设备发现 / 配置持久化
+    # ─────────────────────────────────────────────
+    def _load_conn_prefs(self):
+        """读取上次连接偏好（conn_mode / serial_port / serial_baud / 无线设备）。"""
+        mode, port, baud = "serial", "", DEFAULT_SERIAL_BAUD
+        w_ip, w_name = "", ""
+        try:
+            data = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                saved = str(data.get("conn_mode", "")).lower()
+                if saved in ("serial", "wireless"):
+                    mode = saved
+                port = str(data.get("serial_port", "") or "")
+                try:
+                    baud = int(data.get("serial_baud", DEFAULT_SERIAL_BAUD))
+                except (TypeError, ValueError):
+                    baud = DEFAULT_SERIAL_BAUD
+                w_ip   = str(data.get("wireless_ip", "") or "")
+                w_name = str(data.get("wireless_name", "") or "")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+        # 应用到控件（阻断信号，避免加载期反复触发切换）
+        self.combo_conn_mode.blockSignals(True)
+        idx = self.combo_conn_mode.findData(mode)
+        self.combo_conn_mode.setCurrentIndex(idx if idx >= 0 else 1)
+        self.combo_conn_mode.blockSignals(False)
+        self._conn_mode = mode
+
+        if port:
+            pi = self.combo_port.findData(port)
+            if pi >= 0:
+                self.combo_port.setCurrentIndex(pi)
+        self.combo_baud.setCurrentText(str(baud))
+
+        # 预填上次无线设备（可直接连，无需重新搜索）
+        if w_ip:
+            dev = WirelessDevice(name=w_name or "BanPCBTool", ip=w_ip)
+            self.combo_device.addItem(dev.label, dev)
+            self.combo_device.setCurrentIndex(0)
+
+        self._apply_conn_mode()
+
+    def _merge_device_config(self, patch: dict):
+        """把 patch 合并写入 device_connection.json（保留其它已有键）。"""
+        data = {}
+        try:
+            loaded = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            data = {}
+        data.update(patch)
+        try:
+            DEVICE_CONFIG_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._append_log(f"保存配置失败: {exc}")
+
+    def _save_conn_prefs(self):
+        """保存当前连接方式与端口/设备偏好。"""
+        patch = {"conn_mode": self._conn_mode}
+        if self._conn_mode == "serial":
+            patch["serial_port"] = self.combo_port.currentData() or ""
+            try:
+                patch["serial_baud"] = int(self.combo_baud.currentText())
+            except (ValueError, TypeError):
+                patch["serial_baud"] = DEFAULT_SERIAL_BAUD
+        else:
+            dev = self._selected_wireless_device()
+            if dev:
+                patch["wireless_ip"]   = dev.ip
+                patch["wireless_name"] = dev.name
+        self._merge_device_config(patch)
+
+    def _on_conn_mode_changed(self, index: int):
+        mode = self.combo_conn_mode.itemData(index) or "serial"
+        if mode == self._conn_mode:
+            return
+        self._conn_mode = mode
+        self._apply_conn_mode()
+        self._save_conn_prefs()
+        self._set_status("● 未连接", "StatusDisconnected")
+        # 切换后按新模式自动扫描一次
+        self._auto_scan_current_mode()
+
+    def _apply_conn_mode(self):
+        """按当前连接方式显隐无线/串口面板。"""
+        wireless = (self._conn_mode == "wireless")
+        self.wireless_panel.setVisible(wireless)
+        self.serial_panel.setVisible(not wireless)
+
+    def _auto_scan_current_mode(self):
+        if self._conn_mode == "wireless":
+            self._on_wireless_scan()
+        else:
+            self._on_auto_scan()
+
+    def _selected_wireless_device(self):
+        """取当前选中的无线设备（WirelessDevice 或 None）。"""
+        data = self.combo_device.currentData()
+        return data if isinstance(data, WirelessDevice) else None
+
+    def _on_wireless_scan(self):
+        """UDP 广播搜索无线设备（后台线程）。"""
+        if self._wscan_worker and self._wscan_worker.isRunning():
+            return
+        self.combo_device.clear()
+        self._wscan_worker = WirelessScanWorker(parent=self)
+        self._wscan_worker.log.connect(self._append_log)
+        self._wscan_worker.found.connect(self._on_wireless_device_found)
+        self._wscan_worker.scan_finished.connect(self._on_wireless_scan_finished)
+        self._set_busy(True, scanning=True)
+        self._wscan_worker.start()
+
+    def _on_wireless_device_found(self, device):
+        if not isinstance(device, WirelessDevice):
+            return
+        for i in range(self.combo_device.count()):
+            d = self.combo_device.itemData(i)
+            if isinstance(d, WirelessDevice) and d.ip == device.ip:
+                return
+        self.combo_device.addItem(device.label, device)
+        if self.combo_device.count() == 1:
+            self.combo_device.setCurrentIndex(0)
+
+    def _on_wireless_scan_finished(self, found: bool, msg: str):
+        self._set_busy(False)
+        if found and self.combo_device.count() > 0:
+            dev = self._selected_wireless_device()
+            if dev:
+                self._append_log(f"已发现设备: {dev.label}（选择后点击“升级”）")
+            self.lbl_status.setText(f"● 已发现 {self.combo_device.count()} 台")
+            self._polish_label(self.lbl_status, "StatusConnected")
+        else:
+            self._append_log(msg)
+            self._set_status("● 未发现设备", "StatusDisconnected")
 
     # ────────────────────────────────────────────────────────────────────────
     #  串口列表
@@ -634,7 +810,10 @@ class MainWindow(QMainWindow):
         self.btn_enter_boot.setVisible(not is_bootloader)
 
     def _on_enter_boot(self):
-        """发送 'boot' shell 命令让 APP 进入 Bootloader 烧录模式。"""
+        """发送 'boot' 命令让 APP 进入 Bootloader 烧录模式（串口 / 无线均可）。"""
+        if self._conn_mode == "wireless":
+            self._enter_boot_wireless()
+            return
         import serial as pyserial
         port_data = self.combo_port.currentData()
         if not port_data:
@@ -674,6 +853,39 @@ class MainWindow(QMainWindow):
         # 等待设备重新枚举（APP→复位→Bootloader，VID/PID 变化）
         self._append_log("  等待设备重新枚举 (3s) …")
         QTimer.singleShot(3000, self._after_enter_boot)
+
+    def _enter_boot_wireless(self):
+        """无线模式：经 TCP 透传发送 'boot' 命令让 APP 复位进入 Bootloader。"""
+        device = self._selected_wireless_device()
+        if device is None:
+            QMessageBox.warning(self, "未选择设备", "请先搜索并选择无线设备")
+            return
+        self._append_log(f"发送 'boot' 命令到无线设备 {device.ip} …")
+        self._set_busy(True)
+        self._set_status("● 正在进入 Boot 模式 …", "StatusBusy")
+        try:
+            adapter = open_wireless(device, log=self._append_log)
+            try:
+                adapter.write(b"boot\r\n")
+                time.sleep(0.3)
+                try:
+                    resp = adapter.read(256)
+                    if resp:
+                        text = resp.decode("utf-8", errors="replace").strip()
+                        if text:
+                            self._append_log(f"  响应: {text}")
+                except OSError:
+                    pass
+            finally:
+                adapter.close()
+            self._append_log("  ✓ 已发送 boot 命令，设备将复位进入 Bootloader")
+            self._append_log("  提示：若 Bootloader 未启用无线(UART3)升级通道，请改用 USB 直连完成升级")
+            self._set_status("● 已发送 boot", "StatusConnected")
+        except OSError as exc:
+            self._append_log(f"✗ 无线进入 Boot 失败: {exc}")
+            self._set_status("● 操作失败", "StatusError")
+        finally:
+            self._set_busy(False)
 
     def _after_enter_boot(self):
         """进入 Boot 模式后重新扫描设备。"""
@@ -760,10 +972,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "操作进行中", "请等待当前操作完成")
             return
 
-        port_data = self.combo_port.currentData()
-        if not port_data:
-            QMessageBox.warning(self, "未选择串口", "请先选择串口或等待自动扫描完成")
-            return
+        # 按连接方式取目标：无线=设备(TCP透传)，串口=端口(USB CDC)
+        if self._conn_mode == "wireless":
+            device = self._selected_wireless_device()
+            if device is None:
+                QMessageBox.warning(self, "未选择设备", "请先搜索并选择无线设备")
+                return
+            port_data = device.ip      # 仅用于日志/显示
+            baud = 0
+        else:
+            device = None
+            port_data = self.combo_port.currentData()
+            if not port_data:
+                QMessageBox.warning(self, "未选择串口", "请先选择串口或等待自动扫描完成")
+                return
+            baud = int(self.combo_baud.currentText())
 
         firmware = b""
         if operation == UpgradeWorker.OP_UPGRADE:
@@ -785,7 +1008,6 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.Yes:
                 return
 
-        baud = int(self.combo_baud.currentText())
         auto_jump = self.chk_auto_jump.isChecked()
 
         self.progress.setValue(0)
@@ -796,7 +1018,8 @@ class MainWindow(QMainWindow):
 
         self._worker = UpgradeWorker(
             port_data, baud, operation,
-            firmware=firmware, auto_jump=auto_jump, parent=self)
+            firmware=firmware, auto_jump=auto_jump,
+            mode=self._conn_mode, device=device, parent=self)
         self._worker.log.connect(self._append_log)
         self._worker.progress.connect(self._on_progress)
         self._worker.info.connect(self._on_device_info)
@@ -861,6 +1084,9 @@ class MainWindow(QMainWindow):
             self._set_status("● 已连接", "StatusConnected")
             if self._connected_product:
                 self._set_banner_connected(self._connected_product, self._connected_port)
+            elif self._conn_mode == "wireless":
+                dev = self._selected_wireless_device()
+                self._set_connected(dev.ip if dev else "", "BG (无线)")
             else:
                 port = self.combo_port.currentData() or ""
                 info = identify_port(port) if port else None
@@ -917,6 +1143,10 @@ class MainWindow(QMainWindow):
         elif object_name == "StatusConnected":
             if self._connected_product:
                 self._set_banner_connected(self._connected_product, self._connected_port)
+            elif self._conn_mode == "wireless":
+                dev = self._selected_wireless_device()
+                if dev:
+                    self._set_banner_connected("BG (无线)", dev.ip)
             else:
                 port = self.combo_port.currentData() or ""
                 info = identify_port(port) if port else None
@@ -955,12 +1185,17 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(enabled)
         self.btn_refresh.setEnabled(enabled)
         self.btn_enter_boot.setEnabled(enabled)
+        self.btn_wireless_scan.setEnabled(enabled)
+        self.combo_conn_mode.setEnabled(enabled)
 
     def closeEvent(self, event):
         # 确保后台线程退出
         if self._scan_worker and self._scan_worker.isRunning():
             self._scan_worker.abort()
             self._scan_worker.wait(2000)
+        if self._wscan_worker and self._wscan_worker.isRunning():
+            self._wscan_worker.abort()
+            self._wscan_worker.wait(2000)
         if self._worker and self._worker.isRunning():
             self._worker.abort()
             self._worker.wait(2000)

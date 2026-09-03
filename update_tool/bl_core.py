@@ -127,8 +127,15 @@ def is_serial_disconnect(exc: BaseException) -> bool:
 class BLComm:
     """封装串口读写，提供"发送并等待响应"语义。"""
 
-    def __init__(self, port: str, baudrate: int = 2000000):
-        self._ser = serial.Serial(port, baudrate=baudrate, timeout=0.05)
+    def __init__(self, port: str = "", baudrate: int = 2000000, transport=None):
+        if transport is not None:
+            # 无线：transport 是 wireless.SocketSerialAdapter（TCP 透传，鸭子类型 serial），
+            # 只需提供 write/read/reset_input_buffer/close/is_open，协议层与串口完全一致。
+            self._ser = transport
+            self.is_wireless = True
+        else:
+            self._ser = serial.Serial(port, baudrate=baudrate, timeout=0.05)
+            self.is_wireless = False
         self._buf = bytearray()
 
     def close(self):

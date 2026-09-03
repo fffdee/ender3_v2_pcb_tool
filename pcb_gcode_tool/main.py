@@ -24,7 +24,7 @@ from typing import Any
 import openpyxl
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (QAction, QColor, QFont, QPainter, QPainterPath, QPen,
-                         QPolygonF, QTextCursor)
+                         QPolygonF, QTextCharFormat, QTextCursor)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -706,6 +706,138 @@ def list_serial_ports() -> list[tuple[str, str]]:
     return found
 
 
+class AnsiTextRenderer:
+    """把含 ANSI SGR 转义序列的文本增量渲染到只读 QPlainTextEdit（保留颜色与粗体）。
+
+    下位机 ls 等命令用 ANSI 颜色码给条目上色（目录 SGR 1;34 蓝、设备 1;32 绿、
+    0 复位；clear 命令发 2J 清屏）。串口终端能渲染这些码，但 QPlainTextEdit 的
+    appendPlainText 会把它们原样显示成 "[1;34mdriver[0m" 乱码。这里改用
+    QTextCursor.insertText + QTextCharFormat 逐段上色插入：既保留对齐空格与换行，
+    又能显示颜色；解析器带状态，可正确处理流式 chunk 把一个转义序列拆成两半
+    的情况（桥接终端窗口逐块接收时）。配色按上位机白底 (#f5f7f7) 调校：bold 用
+    加粗，不用在白底发虚的亮色。
+    """
+
+    _FG = {30: "#000000", 31: "#c00000", 32: "#008000", 33: "#a06800",
+           34: "#0000cd", 35: "#a000a0", 36: "#008080", 37: "#707070"}
+    _FG_BRIGHT = {90: "#606060", 91: "#e00000", 92: "#00a000", 93: "#c09000",
+                  94: "#2050e0", 95: "#c000c0", 96: "#00a0a0", 97: "#303030"}
+
+    def __init__(self, view: QPlainTextEdit):
+        self._view = view
+        self._esc = ""                       # 跨 chunk 残留的半截转义序列
+        self._color: str | None = None       # 当前前景色（None = 默认）
+        self._bold = False
+
+    def _fmt(self) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        if self._color:
+            fmt.setForeground(QColor(self._color))
+        if self._bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        return fmt
+
+    def _apply_sgr(self, params: str) -> None:
+        params = params.strip()
+        codes = [int(p) for p in params.split(";") if p.isdigit()] if params else [0]
+        if not codes:
+            codes = [0]
+        for c in codes:
+            if c == 0:
+                self._color, self._bold = None, False
+            elif c == 1:
+                self._bold = True
+            elif c == 22:
+                self._bold = False
+            elif c == 39:
+                self._color = None
+            elif 30 <= c <= 37:
+                self._color = self._FG[c]
+            elif 90 <= c <= 97:
+                self._color = self._FG_BRIGHT[c]
+
+    def feed(self, text: str) -> None:
+        """流式续写：解析转义序列，普通文本按当前格式上色插入（不自动分段）。"""
+        if not text:
+            return
+        buf = self._esc + text
+        self._esc = ""
+        seg: list[str] = []
+        i, n = 0, len(buf)
+        while i < n:
+            if buf[i] == "\x1b":
+                j = i + 1
+                if j < n and buf[j] == "[":          # CSI: ESC [ params final
+                    j += 1
+                    while j < n and not ("\x40" <= buf[j] <= "\x7e"):
+                        j += 1
+                    if j >= n:                        # 序列被 chunk 截断，留待下次
+                        self._flush(seg)
+                        self._esc = buf[i:]
+                        return
+                    self._flush(seg)
+                    self._handle_csi(buf[i + 2:j], buf[j])
+                    i = j + 1
+                else:                                 # ESC + 单字符，忽略
+                    if j >= n:
+                        self._flush(seg)
+                        self._esc = buf[i:]
+                        return
+                    self._flush(seg)
+                    i = j + 1
+            else:
+                seg.append(buf[i])
+                i += 1
+        self._flush(seg)
+
+    def append_block(self, text: str) -> None:
+        """分段追加（等价 appendPlainText 的每条一段语义，但带颜色渲染）。"""
+        if self._view.document().characterCount() > 1:   # 非空文档：先换行分段
+            self._insert("\n")
+        self.feed(text)
+
+    def _flush(self, seg: list[str]) -> None:
+        if seg:
+            self._insert("".join(seg))
+            seg.clear()
+
+    def _handle_csi(self, params: str, final: str) -> None:
+        if final == "m":
+            self._apply_sgr(params)
+        elif final == "J" and params.strip() in ("2", "3"):
+            self._clear_view()                        # clear 命令：ESC[2J 清屏
+        # 其余（H 归位 / K 清行 / A·B 光标移动）在追加式日志里无意义，忽略
+
+    def _insert(self, text: str) -> None:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")   # 规范化换行
+        if not text:
+            return
+        view = self._view
+        was_ro = view.isReadOnly()
+        if was_ro:
+            view.setReadOnly(False)                   # 只读控件需临时解除才能编程插入
+        try:
+            cursor = view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text, self._fmt())
+        finally:
+            if was_ro:
+                view.setReadOnly(True)
+        bar = view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _clear_view(self) -> None:
+        view = self._view
+        was_ro = view.isReadOnly()
+        if was_ro:
+            view.setReadOnly(False)
+        try:
+            view.clear()
+        finally:
+            if was_ro:
+                view.setReadOnly(True)
+
+
 class SerialBridge:
     """将 pyserial 串口包装成与 socket 相同的收发接口。
 
@@ -787,6 +919,14 @@ class SerialBridge:
             return self._ser.in_waiting if self._ser and self._ser.is_open else 0
         except (OSError, AttributeError):
             return 0
+
+    def drain_input(self) -> None:
+        """清空接收缓冲中的残留字节（发送新命令前调用，避免上一帧尾巴污染本次响应）。"""
+        try:
+            if self._ser is not None and self._ser.is_open:
+                self._ser.reset_input_buffer()
+        except (OSError, AttributeError, serial.SerialException):
+            pass
 
     def __repr__(self) -> str:
         return f"<SerialBridge {self.port}@{self.baud}>"
@@ -1830,9 +1970,11 @@ class MainWindow(QMainWindow):
         self.remote_path_edit.setText(f"{root}/{filename}")
 
     def log_connection(self, text: str) -> None:
-        self.connection_log.appendPlainText(text.rstrip())
-        self.connection_log.verticalScrollBar().setValue(
-            self.connection_log.verticalScrollBar().maximum())
+        # 经 AnsiTextRenderer 渲染：把 ls 等命令的 ANSI 颜色码（目录蓝/设备绿）
+        # 转成富文本上色，而不是原样显示 "[1;34mdriver[0m" 乱码。
+        if getattr(self, "_log_renderer", None) is None:
+            self._log_renderer = AnsiTextRenderer(self.connection_log)
+        self._log_renderer.append_block(text.rstrip())
 
     @staticmethod
     def parse_discovery_packet(data: bytes, source_ip: str) -> WirelessDevice | None:
@@ -3173,7 +3315,9 @@ class MainWindow(QMainWindow):
             ok = False
             for _ in range(3):
                 try:
-                    adapter.sendall(b"\r\n")
+                    # 单个 "\n" 触发一次提示符即可；发 "\r\n" 会回两个 banux$ ，
+                    # 第二个残留污染后续命令响应（详见 send_bridge_command 注释）。
+                    adapter.sendall(b"\n")
                 except OSError as exc:
                     resp = str(exc)
                     break
@@ -3220,6 +3364,27 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError):
             return False
 
+    def _drain_input(self, sock: Any) -> None:
+        """发送命令前清空接收缓冲里的残留字节，防止上一帧未读尽的尾巴造成收发错位。"""
+        if sock is None:
+            return
+        try:
+            if getattr(sock, "is_serial", False):
+                sock.drain_input()
+                return
+            sock.setblocking(False)
+            try:
+                while True:
+                    if not sock.recv(4096):
+                        break
+            except (BlockingIOError, InterruptedError, socket.timeout, TimeoutError, OSError):
+                pass
+            finally:
+                sock.setblocking(True)
+                sock.settimeout(0.6)
+        except (OSError, AttributeError):
+            pass
+
     def read_bridge_response(self, timeout_s: float = 2.0) -> str:
         sock = self.bridge_socket
         if sock is None:
@@ -3242,8 +3407,12 @@ class MainWindow(QMainWindow):
                 break
             chunks.append(chunk)
             text = b"".join(chunks).decode("utf-8", errors="replace")
-            if ("banux$ " in text or "OK block" in text or "OK clear" in text or
-                    "@BPC PONG" in text or "@BPC OK" in text or "Error:" in text):
+            # 结束判定只认 shell 提示符 "banux$ "（命令的最后一行）与模块控制应答，
+            # 不再用 "OK block"/"OK clear" 子串提前返回——那会在 "OK block <offset> <len>"
+            # 尚未收全时就返回，既让 offset 校验失败，又把 "\r\nbanux$ " 残留在缓冲里，
+            # 导致下一条命令读到上一帧的尾巴（错位，如串口侧只收到 "$ \r\nbanux$"）。
+            if ("banux$ " in text
+                    or "@BPC PONG" in text or "@BPC OK" in text or "Error:" in text):
                 return text.strip()
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
 
@@ -3252,7 +3421,14 @@ class MainWindow(QMainWindow):
         if not sock:
             raise OSError("设备未连接")
         self.log_connection(f"> {command}")
-        sock.sendall(command.encode("ascii") + b"\r\n")
+        self._drain_input(sock)
+        # 只发单个 "\n" 作行结束符。固件 Shell_ProcessChar 把 '\r' 和 '\n' 各自当作
+        # 一次行结束、各打印一个 "banux$ " 提示符：发 "\r\n" 时命令执行完后会连着回
+        # 两个提示符。串口 @2M 两个提示符同批到达被一次消费；无线 @115200 逐字节透传
+        # 下第二个提示符迟到，_drain_input 清了个空、它随后才到，滞留在缓冲里被下一条
+        # 命令的 read 误当响应（正是 "块 0 未确认写入，响应 'banux$'"）。单个 "\n" 让
+        # 每条命令只回一个提示符，从源头消除残留。@BPC 控制行走 ESP 协议不经此函数。
+        sock.sendall(command.encode("ascii") + b"\n")
         response = self.read_bridge_response(timeout_s)
         if response:
             self.log_connection(response)
@@ -3429,11 +3605,10 @@ class MainWindow(QMainWindow):
         root.addLayout(opt_row)
 
         state = {"alive": True}
+        renderer = AnsiTextRenderer(output)   # 流式续写渲染 ANSI 颜色
 
         def append_text(text: str) -> None:
-            output.moveCursor(QTextCursor.MoveOperation.End)
-            output.insertPlainText(text)
-            output.verticalScrollBar().setValue(output.verticalScrollBar().maximum())
+            renderer.feed(text)
 
         def append_bytes(raw: bytes) -> None:
             if hex_box.isChecked():

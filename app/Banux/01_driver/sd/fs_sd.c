@@ -277,6 +277,14 @@ static int sd_dir_load(VfsNode_t *node, void *userData)
     FRESULT fres;
     char path[VFS_MAX_PATH_LEN];
     VfsNode_t *child;
+    const char *displayName;
+#if _USE_LFN
+    /* f_readdir 仅在调用方提供 LFN 缓冲时才返回长文件名（保留原始大小写）；
+     * 否则只回 8.3 短名（如 PCB_SO~1.GCO），既截断又大小写不分。
+     * 缓冲取 VFS_MAX_NAME_LEN：超过它的长名 FatFs 会放弃 LFN（lfname[0]=0），
+     * 自动回退短名，避免超长名被 is_valid_name/Vfs_CreateFile 拒收而从列表消失。 */
+    static TCHAR lfnBuf[VFS_MAX_NAME_LEN];
+#endif
 
     (void)userData;
     if (!node) return -1;
@@ -294,6 +302,11 @@ static int sd_dir_load(VfsNode_t *node, void *userData)
     /* 物理目录打开成功后再替换缓存，失败时保留原 VFS 子树。 */
     Vfs_ClearChildren(node);
 
+#if _USE_LFN
+    s_fileInfo.lfname = lfnBuf;
+    s_fileInfo.lfsize = sizeof(lfnBuf) / sizeof(lfnBuf[0]);
+#endif
+
     for (;;) {
         fres = f_readdir(&s_dir, &s_fileInfo);
         if (fres != FR_OK || s_fileInfo.fname[0] == '\0') {
@@ -303,16 +316,23 @@ static int sd_dir_load(VfsNode_t *node, void *userData)
         if (s_fileInfo.fattrib & (AM_VOL | AM_HID)) {
             continue;
         }
-        if (!is_valid_name(s_fileInfo.fname)) {
+#if _USE_LFN
+        /* 有长名用长名（完整、保留原始大小写），无长名项（本就是短名）用 fname */
+        displayName = (s_fileInfo.lfname[0] != '\0')
+                      ? s_fileInfo.lfname : s_fileInfo.fname;
+#else
+        displayName = s_fileInfo.fname;
+#endif
+        if (!is_valid_name(displayName)) {
             log_invalid_sfn(path, &s_fileInfo);
             continue;
         }
         if (s_fileInfo.fattrib & AM_DIR) {
-            child = Vfs_CreateNode(node, s_fileInfo.fname, VFS_NODE_DIR, NULL);
+            child = Vfs_CreateNode(node, displayName, VFS_NODE_DIR, NULL);
             if (!child) break;                       /* 子节点数/节点池耗尽 */
             child->dirLoad = sd_dir_load;            /* 子目录同样懒加载 */
         } else {
-            child = Vfs_CreateFile(node, s_fileInfo.fname, s_fileInfo.fsize,
+            child = Vfs_CreateFile(node, displayName, s_fileInfo.fsize,
                                    sd_file_read, NULL);
             if (!child) break;
         }

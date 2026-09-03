@@ -25,7 +25,7 @@
         72          0         63         10       1120          0   fatfs.o
       8430          0        186         12        154          0   ff.o
         70          0          0          0         16          0   ff_gen_drv.o
-      3048          0        150         12       1776          0   fs_sd.o
+      3080          0        150         12       1808          0   fs_sd.o
       2228          0        411          0         24          0   gcode.o
        128          0          0          0          0          0   gpio.o
        852          0         20          1       2048          0   internal_flash_diskio.o
@@ -59,8 +59,8 @@ Memory Map of the image
 
 	Load Region LR_IROM1 
 
-		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00013658, Max: 0x00070000, END)
+		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00013678, Max: 0x00070000, END)
 
-		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000D8E8, Max: 0x00010000, END)
+		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000D908, Max: 0x00010000, END)
 
 Image component sizes
