@@ -71,6 +71,10 @@ WiFiClient bridgeClient;
  * 导致 PC 重连困难。超过该时长无任何桥接流量即主动断开（可按需调大以免误杀空闲会话）。 */
 #define BRIDGE_IDLE_TIMEOUT_MS  60000UL
 static unsigned long bridgeLastActivity = 0;
+/* 透传批量写出缓冲的冲刷函数（定义在文件后段），此处前置声明以便 sendTcpLine
+ * 等前段代码能先冲刷缓冲、保证字节顺序。 */
+static void serialBatchFlush();
+static void tcpBatchFlush();
 WiFiUDP discoveryUdp;
 
 bool apModeActive = false;
@@ -194,6 +198,7 @@ static String ipText() {
 }
 
 static void sendTcpLine(const String &line) {
+    serialBatchFlush();   /* 先冲刷透传缓冲，避免控制应答插到透传数据前面 */
     if (bridgeClient && bridgeClient.connected()) {
         bridgeClient.print(line);
         if (!line.endsWith("\n")) bridgeClient.print("\n");
@@ -581,7 +586,50 @@ static bool controlPrefixMatches(const char *buf, uint16_t len) {
     return true;
 }
 
+/* ---- 透传批量写出缓冲 ----------------------------------------------------
+ * 原实现每收到一个字节就单独调用 Serial.write(byte) / bridgeClient.write(byte)。
+ * bridgeClient 开了 setNoDelay(true)(TCP_NODELAY)，等于每字节一个独立 TCP 包，
+ * 40+ 字节的 IP/TCP 头远大于 1 字节载荷，WiFi 侧吞吐被严重拖垮；Serial.write
+ * 逐字节调用同样有大量函数开销。
+ * 改为：控制行判定仍然逐字节进行（语义与字节顺序完全不变），但确定要透传的字节
+ * 先攒进批量缓冲，缓冲满或在每轮 handleBridge() 末尾整段写出。
+ * 顺序保证：所有直接写 bridgeClient / Serial 的地方（控制行刷新、sendTcpLine）
+ * 都先冲刷对应批量缓冲，避免乱序。 */
+#define BRIDGE_BATCH  128
+static uint8_t  serialOut[BRIDGE_BATCH];   /* Serial(设备) → TCP(上位机) */
+static uint16_t serialOutLen = 0;
+static uint8_t  tcpOut[BRIDGE_BATCH];      /* TCP(上位机) → Serial(设备) */
+static uint16_t tcpOutLen = 0;
+
+static void serialBatchFlush() {
+    if (serialOutLen > 0) {
+        if (bridgeClient && bridgeClient.connected()) {
+            bridgeClient.write((const uint8_t *)serialOut, serialOutLen);
+            bridgeLastActivity = millis();
+        }
+        serialOutLen = 0;
+    }
+}
+
+static void tcpBatchFlush() {
+    if (tcpOutLen > 0) {
+        Serial.write((const uint8_t *)tcpOut, tcpOutLen);
+        tcpOutLen = 0;
+    }
+}
+
+static void serialBatchPush(uint8_t byte) {
+    serialOut[serialOutLen++] = byte;
+    if (serialOutLen >= (uint16_t)sizeof(serialOut)) serialBatchFlush();
+}
+
+static void tcpBatchPush(uint8_t byte) {
+    tcpOut[tcpOutLen++] = byte;
+    if (tcpOutLen >= (uint16_t)sizeof(tcpOut)) tcpBatchFlush();
+}
+
 static void flushSerialControlToTcp() {
+    serialBatchFlush();   /* 先冲刷已攒的透传字节，保证字节顺序 */
     if (bridgeClient && bridgeClient.connected() && serialCtlLen > 0) {
         bridgeClient.write((const uint8_t *)serialCtl, serialCtlLen);
     }
@@ -605,10 +653,7 @@ static void feedSerialByte(uint8_t byte) {
             serialCtl[serialCtlLen] = '\0';
         } else {
             flushSerialControlToTcp();
-            if (bridgeClient && bridgeClient.connected()) {
-                bridgeClient.write(byte);
-                bridgeLastActivity = millis();
-            }
+            serialBatchPush(byte);
             serialLineStart = (byte == '\n' || byte == '\r');
             return;
         }
@@ -620,14 +665,14 @@ static void feedSerialByte(uint8_t byte) {
             serialMaybeControl = false;
             serialSkipLf = (byte == '\r');
         }
-    } else if (bridgeClient && bridgeClient.connected()) {
-        bridgeClient.write(byte);
-        bridgeLastActivity = millis();
+    } else {
+        serialBatchPush(byte);
     }
     serialLineStart = (byte == '\n' || byte == '\r');
 }
 
 static void flushTcpControlToSerial() {
+    tcpBatchFlush();   /* 先冲刷已攒的透传字节，保证字节顺序 */
     if (tcpCtlLen > 0) Serial.write((const uint8_t *)tcpCtl, tcpCtlLen);
     tcpCtlLen = 0;
     tcpMaybeControl = false;
@@ -649,7 +694,7 @@ static void feedTcpByte(uint8_t byte) {
             tcpCtl[tcpCtlLen] = '\0';
         } else {
             flushTcpControlToSerial();
-            Serial.write(byte);
+            tcpBatchPush(byte);
             tcpLineStart = (byte == '\n' || byte == '\r');
             return;
         }
@@ -662,7 +707,7 @@ static void feedTcpByte(uint8_t byte) {
             tcpSkipLf = (byte == '\r');
         }
     } else {
-        Serial.write(byte);
+        tcpBatchPush(byte);
     }
     tcpLineStart = (byte == '\n' || byte == '\r');
 }
@@ -691,6 +736,11 @@ static void handleBridge() {
         }
         bridgeLastActivity = millis();   /* 收到任意桥接数据 = 活跃 */
     }
+
+    /* 本轮透传字节整段写出：把逐字节 write 聚合成少量大包。
+     * 放在两个读循环之后，保证本轮已到达的字节不会滞留到下一轮 loop()（低延迟）。 */
+    serialBatchFlush();
+    tcpBatchFlush();
 
     /* 空闲超时：PC 闪退/断网未发 FIN 时，半开连接会长期占用唯一连接槽，
      * 导致 PC 重连困难。超过 BRIDGE_IDLE_TIMEOUT_MS 无流量即主动断开。 */

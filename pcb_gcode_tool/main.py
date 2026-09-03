@@ -1215,7 +1215,13 @@ class MainWindow(QMainWindow):
         transfer_grid = QGridLayout(transfer)
         self.storage_combo = QComboBox()
         self.storage_combo.addItems(["/flash", "/sd"])
-        self.remote_path_edit = QLineEdit("/flash/pcb_solder_paste.gcode")
+        # 默认改为 SD 卡：/flash 是片内 Flash，每写一个 512B 扇区都要把整个 2KB 页
+        # 读-擦-重编一遍（约 50~100ms，且全程关中断），无线实测仅 ~48 B/s；
+        # SD 卡写入无需擦除，快几个数量级。
+        # 注意：必须在下方 storage_combo 信号 connect 之前设置，否则会触发
+        # update_remote_path_root 把路径重新改回根目录下。
+        self.storage_combo.setCurrentText("/sd")
+        self.remote_path_edit = QLineEdit("/sd/pcb_solder_paste.gcode")
         self.upload_button = QPushButton("传到设备")
         self.execute_button = QPushButton("执行")
         self.transfer_progress = QLabel("0%")
