@@ -38,6 +38,16 @@ try:
 except ImportError:
     from .gerber_parser import GerberPad, parse_gerber_file
 
+# 串口直连模式依赖 pyserial；未安装时无线模式仍可用，只是无法启用串口模式。
+try:
+    import serial  # type: ignore
+    from serial.tools import list_ports  # type: ignore
+    SERIAL_AVAILABLE = True
+except ImportError:  # pragma: no cover - 取决于运行环境
+    serial = None  # type: ignore
+    list_ports = None  # type: ignore
+    SERIAL_AVAILABLE = False
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_2_2026_08_27.xlsx"
@@ -48,6 +58,9 @@ UPLOAD_CHUNK_SIZE = 48
 DEFAULT_DEVICE_IP = "192.168.4.1"  # AP 模式固定 IP
 DEFAULT_DEVICE_NAME = "BanPCBTool"  # 模块热点名称前缀
 DEFAULT_AP_PASSWORD = "12345678"    # Ban-IOT 协议统一 AP 密码
+# 串口直连模式：下位机 UART1/UART3 均为 2M，故默认 2000000。
+DEFAULT_SERIAL_BAUD = 2000000
+BAUD_OPTIONS = [2000000, 1000000, 921600, 460800, 230400, 115200, 57600, 38400, 19200, 9600]
 
 
 def _pump_sleep(seconds: float) -> None:
@@ -671,6 +684,114 @@ class PathPreview(QWidget):
                 painter.drawEllipse(map_xy(point.x, point.y), 3.8, 3.8)
 
 
+def list_serial_ports() -> list[tuple[str, str]]:
+    """枚举可用串口，返回 [(设备名, 描述), ...]，按端口号排序。
+
+    pyserial 缺失或枚举失败时返回空列表，不抛异常。
+    """
+    if not SERIAL_AVAILABLE:
+        return []
+    found: list[tuple[str, str]] = []
+    try:
+        for info in list_ports.comports():
+            found.append((info.device, (info.description or "").strip()))
+    except Exception:  # noqa: BLE001 - 驱动异常不应影响主流程
+        return []
+
+    def _key(item: tuple[str, str]) -> tuple[int, int, str]:
+        match = re.search(r"(\d+)", item[0])
+        return (0, int(match.group(1)), item[0]) if match else (1, 0, item[0])
+
+    found.sort(key=_key)
+    return found
+
+
+class SerialBridge:
+    """将 pyserial 串口包装成与 socket 相同的收发接口。
+
+    这样 send_bridge_command / read_bridge_response / 命令行透传都能
+    无缝工作在“串口直连”模式下：PC → USB转串口 → STM32 UART，
+    直连下位机 shell（提示符 banux$ ），没有 @BPC 无线模块协议。
+
+    只实现代码实际用到的 socket 子集：sendall / recv / settimeout / close，
+    以及 in_waiting（供终端轮询代替 select.select，Windows 上 select 不支持串口句柄）。
+    """
+
+    is_serial = True
+
+    def __init__(self, port: str, baud: int, timeout: float = 0.2) -> None:
+        if not SERIAL_AVAILABLE:
+            raise OSError("未安装 pyserial，无法使用串口模式（pip install pyserial）")
+        self.port = port
+        self.baud = int(baud)
+        self._timeout = timeout
+        self._ser = serial.Serial(
+            port=port,
+            baudrate=int(baud),
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.02,          # 底层读超时；recv 自己控制整体超时
+            write_timeout=2.0,
+        )
+        # 打开后清掉上电/残留字节，避免握手读到旧数据
+        try:
+            self._ser.reset_input_buffer()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- socket 兼容接口 ----
+    def settimeout(self, seconds: float | None) -> None:
+        self._timeout = 0.05 if seconds is None else float(seconds)
+
+    def gettimeout(self) -> float:
+        return self._timeout
+
+    def sendall(self, data: bytes) -> None:
+        ser = self._ser
+        if ser is None or not ser.is_open:
+            raise OSError("串口已关闭")
+        view = memoryview(bytes(data))
+        sent = 0
+        while sent < len(view):
+            written = ser.write(view[sent:])
+            if not written:
+                raise OSError("串口写入失败")
+            sent += written
+
+    def recv(self, size: int) -> bytes:
+        ser = self._ser
+        if ser is None or not ser.is_open:
+            raise OSError("串口已关闭")
+        timeout = self._timeout if self._timeout and self._timeout > 0 else 0.2
+        deadline = time.monotonic() + timeout
+        while True:
+            waiting = ser.in_waiting
+            if waiting > 0:
+                return ser.read(min(waiting, max(1, size)))
+            if time.monotonic() >= deadline:
+                # 与 socket 一致：超时报 socket.timeout（= TimeoutError），供调用方 continue
+                raise socket.timeout("timed out")
+            time.sleep(0.004)
+
+    def close(self) -> None:
+        try:
+            if self._ser is not None and self._ser.is_open:
+                self._ser.close()
+        finally:
+            self._ser = None
+
+    @property
+    def in_waiting(self) -> int:
+        try:
+            return self._ser.in_waiting if self._ser and self._ser.is_open else 0
+        except (OSError, AttributeError):
+            return 0
+
+    def __repr__(self) -> str:
+        return f"<SerialBridge {self.port}@{self.baud}>"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, initial_file: Path | None = None, initial_gerber: Path | None = None) -> None:
         super().__init__()
@@ -686,7 +807,9 @@ class MainWindow(QMainWindow):
         self.devices: list[WirelessDevice] = []
         self.connected_device: WirelessDevice | None = None
         self.saved_device: WirelessDevice | None = self.load_saved_device()
-        self.bridge_socket: socket.socket | None = None
+        self.bridge_socket: socket.socket | SerialBridge | None = None
+        # 连接方式：wireless=WiFi 桥接(TCP)，serial=USB 串口直连下位机；从配置恢复上次选择。
+        self.conn_mode, self.serial_port_name, self.serial_baud = self._load_conn_prefs()
         self._connecting = False
         self._transfer_busy = False
         self._terminal_busy = False
@@ -697,8 +820,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._apply_style()
-        # 启动后如果已经有 saved_device，先预填 UI 让用户感知"已记住设备"
-        if self.saved_device and self.saved_device.ip:
+        # 启动后如果已经有 saved_device，先预填 UI 让用户感知"已记住设备"（仅无线模式）
+        if self.conn_mode == "wireless" and self.saved_device and self.saved_device.ip:
             self.device_name_label.setText(self.saved_device.name or DEFAULT_DEVICE_NAME)
             suffix = " AP" if self.saved_device.ap else ""
             hint = (
@@ -718,9 +841,19 @@ class MainWindow(QMainWindow):
         self.device_timer = QTimer(self)
         self.device_timer.setInterval(3000)
         self.device_timer.timeout.connect(self.poll_device_status)
-        self.device_timer.start()
-        # 延时 900ms 再做首次探测（给 Windows 多网卡/WiFi 栈就绪留时间）
-        QTimer.singleShot(900, self.poll_device_status)
+        self._apply_conn_mode()
+        if self.conn_mode == "wireless":
+            self.device_timer.start()
+            # 延时 900ms 再做首次探测（给 Windows 多网卡/WiFi 栈就绪留时间）
+            QTimer.singleShot(900, self.poll_device_status)
+        else:
+            # 串口模式：不跑无线轮询，刷新端口列表并提示用户手动连接。
+            self.device_name_label.setText(
+                f"串口 {self.serial_port_name}" if self.serial_port_name else "串口直连")
+            self.refresh_serial_ports()
+            last = self.serial_port_name or "未设置"
+            self.set_device_state("offline", f"串口模式：选择端口后点“连接”（上次 {last}）")
+            self.update_serial_connect_button()
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("主工具栏")
@@ -908,11 +1041,35 @@ class MainWindow(QMainWindow):
         self.device_name_label.setObjectName("statValue")
         self.device_info_label = QLabel("正在查找设备")
         self.device_info_label.setObjectName("muted")
+        # 连接方式切换：无线(WiFi 桥接) / 串口直连(USB)
+        self.conn_mode_combo = QComboBox()
+        self.conn_mode_combo.addItems(["无线 (WiFi)", "串口直连 (USB)"])
+        self.conn_mode_combo.blockSignals(True)
+        self.conn_mode_combo.setCurrentIndex(1 if self.conn_mode == "serial" else 0)
+        self.conn_mode_combo.blockSignals(False)
         self.first_setup_button = QPushButton("首次设置")
         grid.addWidget(self.device_status_label, 0, 0)
-        grid.addWidget(self.device_name_label, 0, 1, 1, 3)
+        grid.addWidget(self.device_name_label, 0, 1, 1, 2)
+        grid.addWidget(self.conn_mode_combo, 0, 3)
         grid.addWidget(self.first_setup_button, 0, 4)
         grid.addWidget(self.device_info_label, 1, 0, 1, 5)
+
+        # 串口直连控件（仅串口模式显示）
+        self.serial_port_label = QLabel("串口")
+        self.serial_port_combo = QComboBox()
+        self.serial_port_combo.setEditable(True)
+        self.serial_port_combo.setMinimumWidth(140)
+        self.serial_baud_combo = QComboBox()
+        self.serial_baud_combo.setEditable(True)
+        self.serial_baud_combo.addItems([str(b) for b in BAUD_OPTIONS])
+        self.serial_baud_combo.setCurrentText(str(self.serial_baud or DEFAULT_SERIAL_BAUD))
+        self.serial_refresh_button = QPushButton("刷新")
+        self.serial_connect_button = QPushButton("连接")
+        grid.addWidget(self.serial_port_label, 2, 0)
+        grid.addWidget(self.serial_port_combo, 2, 1, 1, 2)
+        grid.addWidget(self.serial_baud_combo, 2, 3)
+        grid.addWidget(self.serial_refresh_button, 2, 4)
+        grid.addWidget(self.serial_connect_button, 3, 3, 1, 2)
 
         transfer = QGroupBox("G-code 传输与执行")
         transfer_grid = QGridLayout(transfer)
@@ -1070,6 +1227,9 @@ class MainWindow(QMainWindow):
         self.copy_button.clicked.connect(self.copy_gcode)
         self.go_start_button.clicked.connect(self.show_start_page)
         self.first_setup_button.clicked.connect(self.start_first_setup)
+        self.conn_mode_combo.currentIndexChanged.connect(self.on_conn_mode_changed)
+        self.serial_refresh_button.clicked.connect(self.refresh_serial_ports)
+        self.serial_connect_button.clicked.connect(self.toggle_serial_connection)
         self.storage_combo.currentTextChanged.connect(self.update_remote_path_root)
         self.upload_button.clicked.connect(self.upload_gcode_to_device)
         self.execute_button.clicked.connect(self.execute_remote_gcode)
@@ -1616,11 +1776,8 @@ class MainWindow(QMainWindow):
             val = getattr(device, extra, None)
             if val:
                 payload[extra] = val
-        try:
-            DEVICE_CONFIG_PATH.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as exc:
-            self.log_connection(f"save device failed: {exc}")
+        # 用合并写入，避免覆盖 conn_mode / serial_* 等串口模式偏好
+        self._merge_device_config(payload)
 
     def has_prepared_job(self) -> bool:
         if self.mode_combo.currentIndex() == 1:
@@ -1838,7 +1995,7 @@ class MainWindow(QMainWindow):
             address = f"{device.ip}:{device.bridge_port}"
             self.set_device_state("online", f"{device.name} 已在线  {address}")
 
-    def mark_offline(self, detail: str = "设备离线，开机后会自动重连") -> None:
+    def mark_offline(self, detail: str | None = None) -> None:
         self.connected_device = None
         if self.bridge_socket:
             try:
@@ -1846,9 +2003,15 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
         self.bridge_socket = None
-        name = self.saved_device.name if self.saved_device else DEFAULT_DEVICE_NAME
-        self.device_name_label.setText(name)
+        if detail is None:
+            detail = ("串口连接中断，请重新连接" if self.conn_mode == "serial"
+                      else "设备离线，开机后会自动重连")
+        if self.conn_mode != "serial":
+            name = self.saved_device.name if self.saved_device else DEFAULT_DEVICE_NAME
+            self.device_name_label.setText(name)
         self.set_device_state("offline", detail)
+        if self.conn_mode == "serial":
+            self.update_serial_connect_button()
 
     def try_open_device(self, device: WirelessDevice, timeout: float = 0.9) -> bool:
         if not device or not device.ip:
@@ -1878,6 +2041,9 @@ class MainWindow(QMainWindow):
            （跳过 UDP 广播，保证即便路由器屏蔽 255.255.255.255 也能秒重连）
         3) saved_device 不通 → UDP 广播(3 轮 + 子网定向广播 + AP 兜底) + 自动挑选一台连接
         """
+        # 串口直连模式不参与无线轮询/自动重连（否则会关掉串口去连 WiFi）
+        if getattr(self, "conn_mode", "wireless") != "wireless":
+            return
         if (getattr(self, "_connecting", False)
                 or getattr(self, "_transfer_busy", False)
                 or getattr(self, "_terminal_busy", False)):
@@ -2817,6 +2983,243 @@ class MainWindow(QMainWindow):
             self.device_info_label.setText("已断开")
             self.statusBar().showMessage("无线连接已断开", 2000)
 
+    # ==================== 双模式（无线 / 串口直连）====================
+    def _load_conn_prefs(self) -> tuple[str, str, int]:
+        """读取连接方式偏好：(conn_mode, serial_port, serial_baud)。"""
+        mode, port, baud = "wireless", "", DEFAULT_SERIAL_BAUD
+        try:
+            data = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                saved_mode = str(data.get("conn_mode", "")).lower()
+                if saved_mode in ("serial", "wireless"):
+                    mode = saved_mode
+                port = str(data.get("serial_port", "") or "")
+                try:
+                    baud = int(data.get("serial_baud", DEFAULT_SERIAL_BAUD))
+                except (TypeError, ValueError):
+                    baud = DEFAULT_SERIAL_BAUD
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return mode, port, baud
+
+    def _merge_device_config(self, patch: dict[str, Any]) -> None:
+        """把 patch 合并进 device_connection.json（保留其它已有键）。"""
+        data: dict[str, Any] = {}
+        try:
+            loaded = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            data = {}
+        data.update(patch)
+        try:
+            DEVICE_CONFIG_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self.log_connection(f"save config failed: {exc}")
+
+    def _save_conn_prefs(self) -> None:
+        port = self._selected_serial_port() or self.serial_port_name
+        try:
+            baud = int(str(self.serial_baud_combo.currentText()).strip())
+        except (ValueError, AttributeError):
+            baud = self.serial_baud
+        self.serial_port_name, self.serial_baud = port, baud
+        self._merge_device_config({
+            "conn_mode": self.conn_mode,
+            "serial_port": self.serial_port_name,
+            "serial_baud": self.serial_baud,
+        })
+
+    def _selected_serial_port(self) -> str:
+        """从下拉框取当前串口设备名（兼容手动输入与“COM3 - 描述”显示格式）。"""
+        if not hasattr(self, "serial_port_combo"):
+            return self.serial_port_name or ""
+        data = self.serial_port_combo.currentData()
+        if isinstance(data, str) and data:
+            return data
+        text = self.serial_port_combo.currentText().strip()
+        if not text:
+            return ""
+        match = re.match(r"^(COM\d+|/dev/\S+|tty[.\w]+)", text)
+        return match.group(1) if match else text.split(" ")[0]
+
+    def _conn_hint(self) -> str:
+        return ("请先选择串口并连接下位机。" if self.conn_mode == "serial"
+                else "请先搜索并连接 BanPCBTool。")
+
+    def _apply_conn_mode(self) -> None:
+        """根据当前连接方式显示/隐藏对应控件，并联动无线设置入口。"""
+        serial_mode = (self.conn_mode == "serial")
+        for widget in (getattr(self, "serial_port_label", None),
+                       getattr(self, "serial_port_combo", None),
+                       getattr(self, "serial_baud_combo", None),
+                       getattr(self, "serial_refresh_button", None),
+                       getattr(self, "serial_connect_button", None)):
+            if widget is not None:
+                widget.setVisible(serial_mode)
+        if hasattr(self, "first_setup_button"):
+            self.first_setup_button.setVisible(not serial_mode)
+        # 无线设置（配网/OTA）只对无线模式有意义
+        if hasattr(self, "settings_action"):
+            self.settings_action.setEnabled(not serial_mode)
+
+    def _disconnect_current_transport(self) -> None:
+        """关闭当前传输（无论串口还是无线 socket），不弹提示。"""
+        if self.bridge_socket is not None:
+            try:
+                self.bridge_socket.close()
+            except OSError:
+                pass
+        self.bridge_socket = None
+        self.connected_device = None
+
+    def on_conn_mode_changed(self, index: int) -> None:
+        new_mode = "serial" if index == 1 else "wireless"
+        if new_mode == self.conn_mode:
+            return
+        # 切换前先断开当前连接，避免两套传输同时占用下位机
+        self._disconnect_current_transport()
+        self.conn_mode = new_mode
+        self._save_conn_prefs()
+        self._apply_conn_mode()
+        if new_mode == "serial":
+            self.device_timer.stop()
+            self.refresh_serial_ports()
+            self.set_device_state("offline", "串口模式：选择端口后点“连接”")
+        else:
+            self.set_device_state("offline", "无线模式：正在自动查找设备…")
+            if not self.device_timer.isActive():
+                self.device_timer.start()
+            QTimer.singleShot(200, self.poll_device_status)
+        self.update_serial_connect_button()
+
+    def refresh_serial_ports(self) -> None:
+        if not hasattr(self, "serial_port_combo"):
+            return
+        current = self._selected_serial_port()
+        combo = self.serial_port_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for device, desc in list_serial_ports():
+            combo.addItem(f"{device} - {desc}" if desc else device, device)
+        combo.blockSignals(False)
+        if not SERIAL_AVAILABLE:
+            combo.setEditText("未安装 pyserial")
+            return
+        target = current or self.serial_port_name
+        if target:
+            idx = combo.findData(target)
+            if idx < 0:
+                for i in range(combo.count()):
+                    if combo.itemText(i).split(" ")[0] == target:
+                        idx = i
+                        break
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(target)
+        elif combo.count() > 0:
+            # 默认挑一个 USB 转串口（CH340/CH343/CP210x/USB Serial），否则第一个
+            picked = 0
+            for i in range(combo.count()):
+                text = combo.itemText(i).upper()
+                if any(k in text for k in ("USB", "CH34", "CP210", "SERIAL", "UART")):
+                    picked = i
+                    break
+            combo.setCurrentIndex(picked)
+
+    def update_serial_connect_button(self) -> None:
+        if not hasattr(self, "serial_connect_button"):
+            return
+        connected = self.bridge_socket is not None and getattr(self.bridge_socket, "is_serial", False)
+        self.serial_connect_button.setText("断开" if connected else "连接")
+        self.serial_port_combo.setEnabled(not connected)
+        self.serial_baud_combo.setEnabled(not connected)
+        self.serial_refresh_button.setEnabled(not connected)
+
+    def toggle_serial_connection(self) -> None:
+        if self.bridge_socket is not None and getattr(self.bridge_socket, "is_serial", False):
+            self.disconnect_serial_device()
+        else:
+            self.connect_serial_device()
+
+    def connect_serial_device(self) -> None:
+        """打开选定串口并与下位机 shell 握手（发空回车，期望 banux$ 提示符）。"""
+        if not SERIAL_AVAILABLE:
+            QMessageBox.warning(
+                self, "缺少依赖",
+                "串口直连模式需要 pyserial。\n\n请先在运行环境执行：\n    pip install pyserial")
+            return
+        port = self._selected_serial_port()
+        if not port:
+            QMessageBox.information(self, "未选择串口", "请选择或输入一个串口（例如 COM3）。")
+            return
+        try:
+            baud = int(str(self.serial_baud_combo.currentText()).strip())
+        except ValueError:
+            baud = DEFAULT_SERIAL_BAUD
+        self._disconnect_current_transport()
+        self._connecting = True
+        try:
+            try:
+                adapter = SerialBridge(port, baud)
+            except Exception as exc:  # noqa: BLE001 - SerialException 等
+                QMessageBox.warning(self, "串口打开失败", f"无法打开 {port} @ {baud}：\n{exc}")
+                return
+            self.bridge_socket = adapter
+            adapter.settimeout(0.4)
+            resp = ""
+            ok = False
+            for _ in range(3):
+                try:
+                    adapter.sendall(b"\r\n")
+                except OSError as exc:
+                    resp = str(exc)
+                    break
+                resp += self.read_bridge_response(0.9)
+                if "banux$" in resp or "Banux" in resp:
+                    ok = True
+                    break
+            if not ok:
+                adapter.close()
+                self.bridge_socket = None
+                QMessageBox.warning(
+                    self, "串口无响应",
+                    f"已打开 {port} @ {baud}，但未收到下位机 banux$ 提示符。\n\n请检查：\n"
+                    f"· 波特率是否为 {DEFAULT_SERIAL_BAUD}（与固件 UART 一致）\n"
+                    "· 该串口是否接到 STM32 调试口（UART1/UART3）\n"
+                    "· 下位机是否已上电并运行 APP")
+                return
+            self.mark_serial_connected(port, baud)
+        finally:
+            self._connecting = False
+
+    def mark_serial_connected(self, port: str, baud: int) -> None:
+        self.connected_device = WirelessDevice(name=f"Serial {port}", ip=port, bridge_port=baud)
+        self.device_name_label.setText(f"串口 {port}")
+        self.set_device_state("online", f"串口直连 {port} @ {baud} bps")
+        self.serial_port_name, self.serial_baud = port, baud
+        self._save_conn_prefs()
+        self.update_serial_connect_button()
+        self.statusBar().showMessage(f"串口 {port} 已连接 @ {baud}", 3000)
+
+    def disconnect_serial_device(self) -> None:
+        self._disconnect_current_transport()
+        self.set_device_state("offline", "串口已断开")
+        self.update_serial_connect_button()
+        self.statusBar().showMessage("串口已断开", 2000)
+
+    def _transport_readable(self, sock: Any, timeout: float = 0.0) -> bool:
+        """统一判断传输层是否有待收数据：串口用 in_waiting，socket 用 select。"""
+        if getattr(sock, "is_serial", False):
+            return sock.in_waiting > 0
+        try:
+            readable, _, _ = select.select([sock], [], [], timeout)
+            return bool(readable)
+        except (OSError, ValueError):
+            return False
+
     def read_bridge_response(self, timeout_s: float = 2.0) -> str:
         sock = self.bridge_socket
         if sock is None:
@@ -2847,7 +3250,7 @@ class MainWindow(QMainWindow):
     def send_bridge_command(self, command: str, timeout_s: float = 2.5) -> str:
         sock = self.bridge_socket
         if not sock:
-            raise OSError("无线设备未连接")
+            raise OSError("设备未连接")
         self.log_connection(f"> {command}")
         sock.sendall(command.encode("ascii") + b"\r\n")
         response = self.read_bridge_response(timeout_s)
@@ -2868,7 +3271,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法传输", "请至少选择一个点胶坐标。")
             return False
         if not self.bridge_socket:
-            QMessageBox.information(self, "未连接", "请先搜索并连接 BanPCBTool。")
+            QMessageBox.information(self, "未连接", self._conn_hint())
             return False
         return True
 
@@ -2933,7 +3336,7 @@ class MainWindow(QMainWindow):
 
     def execute_remote_gcode(self) -> None:
         if not self.bridge_socket:
-            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool。")
+            QMessageBox.information(self, "未连接", self._conn_hint())
             return
         path = self.remote_path_edit.text().strip()
         self._transfer_busy = True
@@ -2951,7 +3354,7 @@ class MainWindow(QMainWindow):
 
     def send_manual_command(self, command: str, timeout_s: float = 2.5) -> bool:
         if not self.bridge_socket:
-            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool。")
+            QMessageBox.information(self, "未连接", self._conn_hint())
             return False
         try:
             self.send_bridge_command(command, timeout_s)
@@ -2971,25 +3374,29 @@ class MainWindow(QMainWindow):
         否则两边会争抢同一个 socket —— 轮询会把下位机的数据吞进自己的缓冲区。
         """
         if not self.bridge_socket:
-            QMessageBox.information(self, "未连接", "请先连接 BanPCBTool 再打开命令行。")
+            QMessageBox.information(self, "未连接", self._conn_hint())
             return
         if getattr(self, "_terminal_busy", False):
             return
 
         sock = self.bridge_socket
         device = self.connected_device
-        if device:
-            host_text = f"{device.name}  {device.ip}:{device.bridge_port}"
+        is_serial = getattr(sock, "is_serial", False)
+        if is_serial:
+            host_text = f"串口 {device.ip} @ {device.bridge_port}" if device else "串口直连"
+            tip_text = ("串口直连模式：输入内容原样发送给 STM32 shell（下位机命令行），"
+                        "回传数据实时显示。@BPC 是无线模块专用前缀，直连时无需使用。")
         else:
-            host_text = "已连接设备"
+            host_text = f"{device.name}  {device.ip}:{device.bridge_port}" if device else "已连接设备"
+            tip_text = ("输入内容原样发送给 WiFi 模块；模块侧非 @BPC 开头的行会转发给 STM32，"
+                        "STM32 发给模块的数据也会实时显示在这里。")
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"命令行 · {host_text}")
         dialog.resize(780, 520)
         root = QVBoxLayout(dialog)
 
-        tip = QLabel("输入内容原样发送给 WiFi 模块；模块侧非 @BPC 开头的行会转发给 STM32，"
-                     "STM32 发给模块的数据也会实时显示在这里。")
+        tip = QLabel(tip_text)
         tip.setObjectName("muted")
         tip.setWordWrap(True)
         root.addWidget(tip)
@@ -3052,8 +3459,7 @@ class MainWindow(QMainWindow):
                 return
             try:
                 for _ in range(64):  # 每轮最多搬 64 包，避免大流量时卡住界面
-                    readable, _, _ = select.select([sock], [], [], 0)
-                    if not readable:
+                    if not self._transport_readable(sock):
                         break
                     chunk = sock.recv(4096)
                     if not chunk:

@@ -37,20 +37,20 @@
         64          0        304          0       8704          0   startup_stm32f103xe.o
        164          0          0         12          0          0   stm32f1xx_hal.o
        232          0          0          0          0          0   stm32f1xx_hal_cortex.o
-       374          0          0          0          0          0   stm32f1xx_hal_dma.o
+      1236          0          0          0          0          0   stm32f1xx_hal_dma.o
        392          0          0          0         32          0   stm32f1xx_hal_flash.o
        240          0          0          0          0          0   stm32f1xx_hal_flash_ex.o
        524          0          0          0          0          0   stm32f1xx_hal_gpio.o
         60          0          0          0          0          0   stm32f1xx_hal_msp.o
       1240          0         18          0          0          0   stm32f1xx_hal_rcc.o
       2148          0          0          0          0          0   stm32f1xx_hal_sd.o
-      1552          0          0          0          0          0   stm32f1xx_hal_uart.o
-        44          0          0          0          0          0   stm32f1xx_it.o
+      1908          0          0          0          0          0   stm32f1xx_hal_uart.o
+        68          0          0          0          0          0   stm32f1xx_it.o
       1570          0          0          0          0          0   stm32f1xx_ll_sdmmc.o
          0          0          0          0          0          0   syscall.o
          2          0         24          4          0          0   system_stm32f1xx.o
          0          0         80          0          0          0   upgrade_component_manifest.o
-       668          0          0          2       8344          0   usart.o
+       964          0          0          0       9508          0   usart.o
       1924          0         52         12      22656          0   vfs.o
       1576          0       2860          0          0          0   wireless_control.o
 Object Totals
@@ -59,8 +59,8 @@ Memory Map of the image
 
 	Load Region LR_IROM1 
 
-		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00013050, Max: 0x00070000, END)
+		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00013658, Max: 0x00070000, END)
 
-		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000D460, Max: 0x00010000, END)
+		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000D8E8, Max: 0x00010000, END)
 
 Image component sizes

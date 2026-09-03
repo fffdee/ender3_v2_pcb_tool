@@ -1,3 +1,4 @@
 openpyxl>=3.1,<4
 PyQt6>=6.6,<7
 gerbonara>=1.6,<2
+pyserial>=3.5,<4

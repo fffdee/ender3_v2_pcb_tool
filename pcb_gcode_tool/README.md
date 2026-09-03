@@ -10,7 +10,18 @@
 & "C:\Users\admin\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" .\pcb_gcode_tool\main.py
 ```
 
-程序启动时自动读取仓库根目录中的默认坐标表，也可以通过“导入 XLSX”读取其他文件。Gerber 焊盘铺膏请点击“导入 Gerber”，优先选择 Top Paste `.GTP` 或 Bottom Paste `.GBP` 文件。依赖记录在 `requirements.txt`。
+程序启动时自动读取仓库根目录中的默认坐标表，也可以通过“导入 XLSX”读取其他文件。Gerber 焊盘铺膏请点击“导入 Gerber”，优先选择 Top Paste `.GTP` 或 Bottom Paste `.GBP` 文件。依赖记录在 `requirements.txt`（串口直连模式需要 `pyserial`）。
+
+## 设备连接（无线 / 串口双模式）
+
+在“开始”页的“设备”区可通过下拉框在两种连接方式间随时切换，切换会自动断开当前连接：
+
+- **无线 (WiFi)**：经 ESP8266 桥接，UDP 自动发现 + TCP(8266) 连接模块，模块再转发到下位机 `UART3`。支持“首次设置”配网、“无线设置”（配网/静态 IP/OTA）。
+- **串口直连 (USB)**：PC 经 USB 转串口直接连下位机 `UART1/UART3`，绕开无线链路，适合无线不稳定或现场调试。选择串口（如 `COM3`）与波特率后点“连接”，工具会发空回车并等待下位机 `banux$` 提示符确认链路。
+
+> 下位机 `UART1` 与 `UART3` 均为 **2000000** 波特，串口模式默认即 `2000000`；若波特率与固件不一致会握手失败（无 `banux$` 回复）。
+
+两种模式共用同一套 G-code 传输、执行、手动点动与“命令行”透传逻辑（串口模式下命令行直连 STM32 shell，无 `@BPC` 前缀）。连接方式、串口与波特率会记住在 `device_connection.json`，下次启动自动恢复。
 
 ## 使用流程
 
