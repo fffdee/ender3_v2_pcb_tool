@@ -165,7 +165,9 @@ int bl_upg_start(uint32_t total)
 
     s_total = total;
     s_written = 0;
-    s_use_sd = s_sd_ok;
+    /* UART 下载（串口直连 / 无线桥接）一律直写 Flash，不落 SD。
+     * SD 卡仍用于"放 UPGRADE.BIN 自动升级"(bl_sd_try_upgrade)，不受影响。 */
+    s_use_sd = 0;
 
     if (bl_cfg_set_pending(1, total) != 0) {
         return BL_ERR_FLASH;

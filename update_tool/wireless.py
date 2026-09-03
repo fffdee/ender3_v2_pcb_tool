@@ -322,6 +322,16 @@ def open_wireless(device, bridge_port: int = BRIDGE_PORT,
             pass
         raise
 
+    # 独占桥接槽：告知模块本次连接用于固件升级，期间拒绝其它 TCP 连接抢占。
+    # 否则后台工具（如 pcb_gcode_tool 每 3s 的 @BPC PING 心跳 / 8266 端口探测）
+    # 建连时会抢走模块唯一的 bridgeClient 槽，把正在进行的升级掐断
+    # （上位机报 WinError 10053 你的主机中的软件中止了一个已建立的连接）。
+    try:
+        sock.sendall(b"@BPC LOCK\r\n")
+        time.sleep(0.05)   # 给模块时间回 @BPC OK LOCK
+    except OSError:
+        pass
+
     adapter = SocketSerialAdapter(sock, read_timeout=_DEFAULT_READ_TIMEOUT)
-    adapter.reset_input_buffer()   # 清握手残留，避免污染首个协议帧
+    adapter.reset_input_buffer()   # 清握手 + LOCK 响应残留，避免污染首个协议帧
     return adapter

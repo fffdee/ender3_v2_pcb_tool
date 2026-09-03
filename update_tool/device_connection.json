@@ -1,3 +1,7 @@
 {
-  "conn_mode": "wireless"
+  "conn_mode": "wireless",
+  "serial_port": "",
+  "serial_baud": 2000000,
+  "wireless_ip": "192.168.1.215",
+  "wireless_name": "BanPCBTool"
 }

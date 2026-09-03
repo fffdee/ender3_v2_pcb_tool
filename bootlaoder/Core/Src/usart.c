@@ -104,8 +104,8 @@ void MX_USART1_Init(void)
 void MX_USART3_Init(void)
 {
   huart3.Instance = USART3;
-  /* 115200 @APB1=32MHz：BRR=32M/(16*115200)=17.36，取 17 → 实际 117647，误差 +2.12%（边际，可工作） */
-  huart3.Init.BaudRate = 115200;
+  /* 2000000 @APB1=32MHz：BRR=32M/(16*115200)=17.36，取 17 → 实际 117647，误差 +2.12%（边际，可工作） */
+  huart3.Init.BaudRate = 2000000;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;

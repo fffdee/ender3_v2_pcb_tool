@@ -56,7 +56,7 @@
 
 /* Bridge / legacy parameters */
 #define DEVICE_DEFAULT_NAME   "BanPCBTool"
-#define UART_BAUD            115200UL
+#define UART_BAUD            2000000UL
 #define BRIDGE_TCP_PORT      8266
 #define DISCOVERY_UDP_PORT   8267
 #define HTTP_PORT            80
@@ -71,6 +71,13 @@ WiFiClient bridgeClient;
  * 导致 PC 重连困难。超过该时长无任何桥接流量即主动断开（可按需调大以免误杀空闲会话）。 */
 #define BRIDGE_IDLE_TIMEOUT_MS  60000UL
 static unsigned long bridgeLastActivity = 0;
+/* 桥接槽独占锁：上位机在开始固件升级等独占操作前发送 "@BPC LOCK"。
+ * 锁定期间拒绝其它 TCP 连接抢占——后台工具的探测/心跳每几秒建连一次，
+ * 一旦抢占就会掐断正在进行的升级（上位机报 WinError 10053）。
+ * 未锁定时保持「新连接接管」的原行为，保证任何工具随时都能连上
+ * （不然先占槽的工具会让升级工具握手失败）。
+ * 客户端断开或空闲超时会自动解锁，避免 PC 闪退后永久锁死。 */
+static bool bridgeLocked = false;
 /* 透传批量写出缓冲的冲刷函数（定义在文件后段），此处前置声明以便 sendTcpLine
  * 等前段代码能先冲刷缓冲、保证字节顺序。 */
 static void serialBatchFlush();
@@ -528,6 +535,11 @@ static void handleControlLine(const String &line, bool fromTcp) {
         if (fromTcp) sendTcpLine("@BPC PONG " + apGetDeviceName());
     } else if (cmd.startsWith("HELLO")) {
         if (fromTcp) sendTcpLine("@BPC OK " + apGetDeviceName());
+    } else if (cmd.startsWith("LOCK")) {
+        /* 独占桥接槽（固件升级用）：期间拒绝其它连接抢占 */
+        if (fromTcp) { bridgeLocked = true;  sendTcpLine("@BPC OK LOCK"); }
+    } else if (cmd.startsWith("UNLOCK")) {
+        if (fromTcp) { bridgeLocked = false; sendTcpLine("@BPC OK UNLOCK"); }
     } else if (cmd == "STATUS") {
         if (fromTcp) sendTcpLine("@BPC " + fullStatusJson());
     } else if (cmd == "AP" || cmd == "CONFIG") {
@@ -615,6 +627,7 @@ static void tcpBatchFlush() {
     if (tcpOutLen > 0) {
         Serial.write((const uint8_t *)tcpOut, tcpOutLen);
         tcpOutLen = 0;
+        bridgeLastActivity = millis();   /* TCP→设备方向有数据 = 活跃 */
     }
 }
 
@@ -716,25 +729,48 @@ static void feedTcpByte(uint8_t byte) {
  *  Bridge: accept new TCP client + pass bytes between UART & TCP
  * ============================================================ */
 static void handleBridge() {
+    /* 客户端已断开（PC 正常关闭 / 闪退）→ 自动解锁，避免独占锁永久残留 */
+    if (bridgeClient && !bridgeClient.connected()) {
+        bridgeLocked = false;
+    }
+
     if (bridgeServer.hasClient()) {
         WiFiClient incoming = bridgeServer.available();
-        if (bridgeClient && bridgeClient.connected()) {
-            bridgeClient.stop();
+
+        /* 当前会话被上位机显式锁定（固件升级等独占场景）→ 拒绝抢占，
+         * 否则后台工具的探测/心跳连接会掐断升级（上位机报 WinError 10053）。
+         * 未锁定时保持「新连接接管」的原行为，保证任何工具随时都能连上。 */
+        if (bridgeClient && bridgeClient.connected() && bridgeLocked) {
+            incoming.stop();
+        } else {
+            if (bridgeClient && bridgeClient.connected()) {
+                bridgeClient.stop();
+            }
+            bridgeClient = incoming;
+            bridgeLocked = false;
+            bridgeClient.setNoDelay(true);
+            bridgeLastActivity = millis();
+            /* 新连接重置 TCP→串口 的行解析状态：否则上一连接残留的
+             * tcpLineStart/tcpMaybeControl 会让首条控制行(@BPC PING)被误判为
+             * 普通数据转发给 STM32，污染二进制升级协议流（串口出现 @BPC PING）。 */
+            tcpLineStart    = true;
+            tcpMaybeControl = false;
+            tcpCtlLen       = 0;
+            tcpSkipLf       = false;
+            sendTcpLine("@BPC CONNECTED " + apGetDeviceName());
         }
-        bridgeClient = incoming;
-        bridgeClient.setNoDelay(true);
-        bridgeLastActivity = millis();
-        sendTcpLine("@BPC CONNECTED " + apGetDeviceName());
     }
 
     while (Serial.available()) {
         feedSerialByte((uint8_t)Serial.read());
     }
     if (bridgeClient && bridgeClient.connected()) {
-        while (bridgeClient.available()) {
-            feedTcpByte((uint8_t)bridgeClient.read());
+        if (bridgeClient.available()) {
+            while (bridgeClient.available()) {
+                feedTcpByte((uint8_t)bridgeClient.read());
+            }
+            bridgeLastActivity = millis();   /* 仅真实收到数据时才算活跃 */
         }
-        bridgeLastActivity = millis();   /* 收到任意桥接数据 = 活跃 */
     }
 
     /* 本轮透传字节整段写出：把逐字节 write 聚合成少量大包。
@@ -747,6 +783,7 @@ static void handleBridge() {
     if (bridgeClient && bridgeClient.connected() &&
         (unsigned long)(millis() - bridgeLastActivity) > BRIDGE_IDLE_TIMEOUT_MS) {
         bridgeClient.stop();
+        bridgeLocked = false;      /* 空闲回收时同步解锁，避免锁死桥接槽 */
         bridgeLastActivity = 0;
     }
 }
