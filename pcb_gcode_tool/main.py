@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (QAction, QColor, QFont, QPainter, QPainterPath, QPen,
                          QPolygonF, QTextCharFormat, QTextCursor)
 from PyQt6.QtWidgets import (
@@ -52,6 +52,10 @@ except ImportError:  # pragma: no cover - 取决于运行环境
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WORKBOOK = ROOT.parent / "PickAndPlace_PCB_PCB_1048_looper_2_2025_10_07_2_2026_08_27.xlsx"
 DEVICE_CONFIG_PATH = ROOT / "device_connection.json"
+TERM_HISTORY_MAX = 100      # 终端命令历史最多持久化条数（存于 device_connection.json 的 term_history 键）
+# 各轴每毫米脉冲数，必须与固件 banux_config.h 的 GCODE_X/Y/Z/E_STEPS_PER_MM 一致；
+# 操作台把 mm 步距换算成 motion 命令的 steps（脉冲），并把读回的 position 换算回 mm 显示。
+STEPPER_STEPS_PER_MM = {"X": 80, "Y": 80, "Z": 400, "E": 95}
 DISCOVERY_PORT = 8267
 BRIDGE_PORT = 8266
 # 单个 recv -b 块的原始字节数。
@@ -982,8 +986,11 @@ class MainWindow(QMainWindow):
         target = initial_file
         if target:
             QTimer.singleShot(0, lambda: self.import_workbook(target, show_error=False))
-        if initial_gerber:
-            QTimer.singleShot(50, lambda: self.import_gerber(initial_gerber, show_error=False))
+        # Gerber 自动恢复：命令行 --gerber 优先；否则回退到上次记住的 Gerber（文件存在才导），
+        # 实现“不用每次打开软件都重新导入 Gerber”。
+        gerber_target = initial_gerber or self._load_last_gerber()
+        if gerber_target:
+            QTimer.singleShot(50, lambda: self.import_gerber(gerber_target, show_error=False))
         self.device_timer = QTimer(self)
         self.device_timer.setInterval(3000)
         self.device_timer.timeout.connect(self.poll_device_status)
@@ -1296,16 +1303,25 @@ class MainWindow(QMainWindow):
         self.motor_on_button = QPushButton("使能")
         self.motor_off_button = QPushButton("释放")
         self.status_button = QPushButton("状态")
+        self.home_button = QPushButton("回0 (XYZ 回限位零点)")
         self.manual_buttons = [
             self.y_plus_button, self.y_minus_button, self.x_minus_button,
             self.x_plus_button, self.z_plus_button, self.z_minus_button,
             self.e_minus_button, self.e_plus_button, self.motor_on_button,
-            self.motor_off_button, self.status_button,
+            self.motor_off_button, self.status_button, self.home_button,
         ]
         utility_row.addWidget(self.motor_on_button)
         utility_row.addWidget(self.motor_off_button)
         utility_row.addWidget(self.status_button)
         layout.addLayout(utility_row)
+        layout.addWidget(self.home_button)
+
+        # 位置显示：motion 移动后 cat 读回该轴软件脉冲位置，换算 mm 刷新
+        self.axis_steps = {"X": None, "Y": None, "Z": None, "E": None}
+        self.position_label = QLabel("X —   Y —   Z —   E —")
+        self.position_label.setObjectName("muted")
+        layout.addWidget(self.position_label)
+
         layout.addStretch()
         return panel
 
@@ -1393,9 +1409,10 @@ class MainWindow(QMainWindow):
         self.z_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("Z", 1.0))
         self.e_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("E", -1.0))
         self.e_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("E", 1.0))
-        self.motor_on_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode M17"))
-        self.motor_off_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode M84"))
-        self.status_button.clicked.connect(lambda _checked=False: self.send_manual_command("gcode -s"))
+        self.motor_on_button.clicked.connect(lambda _checked=False: self.set_motors_enabled(True))
+        self.motor_off_button.clicked.connect(lambda _checked=False: self.set_motors_enabled(False))
+        self.status_button.clicked.connect(lambda _checked=False: self.refresh_all_positions())
+        self.home_button.clicked.connect(lambda _checked=False: self.home_axes())
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
@@ -1473,6 +1490,7 @@ class MainWindow(QMainWindow):
         self.gerber_pads = result.pads
         self.selected_pad_ids = {pad.pad_id for pad in result.pads}
         self.current_gerber = path
+        self._merge_device_config({"last_gerber": str(path)})   # 记住，下次启动自动恢复
         self.gerber_warnings = result.warnings
         self.mode_combo.setCurrentIndex(1)
         self.refresh()
@@ -2132,7 +2150,11 @@ class MainWindow(QMainWindow):
         except (ValueError, json.JSONDecodeError):
             return {}
 
-    def mark_connected(self, device: WirelessDevice, info: dict[str, Any] | None = None) -> None:
+    def mark_connected(self, device: WirelessDevice | None, info: dict[str, Any] | None = None) -> None:
+        # device 可能在轮询线程调用期间被其他线程置 None（见 poll_device_status 的
+        # query_bridge_info 耗时窗口），此处守卫避免 'NoneType' has no attribute 'name' 闪退。
+        if device is None:
+            return
         info = info or {}
         device.name = str(info.get("name", device.name or DEFAULT_DEVICE_NAME))
         device.ip = str(info.get("ip", device.ip))
@@ -2211,10 +2233,14 @@ class MainWindow(QMainWindow):
                 response = self.read_bridge_response(0.6)
                 if "@BPC PONG" in response or "@BPC OK" in response:
                     alive = True
-                    if self.connected_device:
+                    # 先捕获本地引用：query_bridge_info() 耗时约 0.8s，期间
+                    # self.connected_device 可能被其他线程置 None（掉线/重连），
+                    # 直接把 self.connected_device 传下去会在 mark_connected 里崩。
+                    dev = self.connected_device
+                    if dev is not None:
                         info = self.query_bridge_info()
                         if info:
-                            self.mark_connected(self.connected_device, info)
+                            self.mark_connected(dev, info)
             except OSError:
                 alive = False
             if not alive:
@@ -3172,6 +3198,36 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.log_connection(f"save config failed: {exc}")
 
+    def _load_term_history(self) -> list[str]:
+        """从 device_connection.json 读取终端命令历史（最多 TERM_HISTORY_MAX 条）。"""
+        try:
+            data = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                hist = data.get("term_history", [])
+                if isinstance(hist, list):
+                    return [str(x) for x in hist if x][-TERM_HISTORY_MAX:]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return []
+
+    def _save_term_history(self, history: list[str]) -> None:
+        """把终端命令历史写回 device_connection.json（只保留最近 TERM_HISTORY_MAX 条）。"""
+        self._merge_device_config({"term_history": list(history)[-TERM_HISTORY_MAX:]})
+
+    def _load_last_gerber(self) -> Path | None:
+        """读取上次导入的 Gerber 路径；仅当文件仍存在才返回，用于启动时自动恢复。"""
+        try:
+            data = json.loads(DEVICE_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                raw = str(data.get("last_gerber", "") or "")
+                if raw:
+                    path = Path(raw)
+                    if path.exists():
+                        return path
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return None
+
     def _save_conn_prefs(self) -> None:
         port = self._selected_serial_port() or self.serial_port_name
         try:
@@ -3593,14 +3649,14 @@ class MainWindow(QMainWindow):
         output.setReadOnly(True)
         output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         output.setFont(QFont("Consolas", 10))
+        output.setStyleSheet(
+            "QPlainTextEdit { color: #1c282d; background: white; border: 1px solid #bdc7ca; }")
         root.addWidget(output, 1)
 
         input_row = QHBoxLayout()
         cmd_edit = QLineEdit()
-        cmd_edit.setPlaceholderText("输入要发送的内容，回车发送（例如 G28 / M114）")
-        send_btn = QPushButton("发送")
+        cmd_edit.setPlaceholderText("输入要发送的内容，回车发送 / Tab 补全命令（例如 G28 / M114）")
         input_row.addWidget(cmd_edit, 1)
-        input_row.addWidget(send_btn)
         root.addLayout(input_row)
 
         opt_row = QHBoxLayout()
@@ -3609,6 +3665,13 @@ class MainWindow(QMainWindow):
         hex_box = QCheckBox("HEX 显示")
         clear_btn = QPushButton("清空")
         close_btn = QPushButton("关闭")
+        # QDialog 里的 QPushButton 默认 autoDefault=True：当焦点不在输入框（例如刚点过
+        # HEX/换行复选框、或在输出区滚动）时按回车，会“默认”触发第一个按钮（清空），
+        # 表现就是“一回车就清屏”。关掉 autoDefault，让回车只用于发送命令。
+        clear_btn.setAutoDefault(False)
+        close_btn.setAutoDefault(False)
+        clear_btn.setDefault(False)
+        close_btn.setDefault(False)
         opt_row.addWidget(crlf_box)
         opt_row.addWidget(hex_box)
         opt_row.addStretch(1)
@@ -3617,6 +3680,13 @@ class MainWindow(QMainWindow):
         root.addLayout(opt_row)
 
         state = {"alive": True}
+        # 命令历史：实例级持久（跨终端多次开关保留），供输入框上下键回溯。
+        # term_hist[0] 最早、[-1] 最新；hist_state["idx"]==len 表示停在“草稿位”（未浏览历史）。
+        term_hist = getattr(self, "_term_history", None)
+        if term_hist is None:
+            term_hist = self._load_term_history()   # 首次打开：从磁盘载入上次保存的历史
+            self._term_history = term_hist
+        hist_state = {"idx": len(term_hist), "draft": ""}
         renderer = AnsiTextRenderer(output)   # 流式续写渲染 ANSI 颜色
 
         def append_text(text: str) -> None:
@@ -3625,9 +3695,14 @@ class MainWindow(QMainWindow):
         def append_bytes(raw: bytes) -> None:
             if hex_box.isChecked():
                 append_text(" ".join(f"{b:02X}" for b in raw) + " ")
-            else:
-                append_text(raw.decode("utf-8", errors="replace")
-                               .replace("\r\n", "\n").replace("\r", "\n"))
+                return
+            text = raw.decode("utf-8", errors="replace") \
+                      .replace("\r\n", "\n").replace("\r", "\n")
+            # 过滤 @BPC 心跳保活响应，避免刷屏（不影响 STM32 shell 回显）
+            if "@BPC" in text:
+                text = "\n".join(ln for ln in text.split("\n")
+                                 if not ln.strip().startswith("@BPC"))
+            append_text(text)
 
         def note(text: str) -> None:
             append_text(f"\n{text}\n")
@@ -3654,11 +3729,17 @@ class MainWindow(QMainWindow):
                         self.mark_offline("设备连接中断")
                         return
                     append_bytes(chunk)
-            except (BlockingIOError, InterruptedError):
+            except (BlockingIOError, InterruptedError, socket.timeout):
+                # 串口/读取超时 = 暂时无数据，继续轮询即可，不要当断线处理
                 pass
             except (OSError, ValueError) as exc:
-                stop(f"[连接已断开: {exc}]")
-                self.mark_offline("设备连接中断")
+                # 终端只是透传读数，连接生命周期由主连接(心跳定时器)掌管；
+                # 这里绝不能调用 mark_offline() 去关闭共享的 bridge_socket，
+                # 否则会把整个上位机主连接一起掐掉（现象：终端一报错就掉线，
+                # 必须关掉终端主连接才恢复）。读取异常时只停掉本窗口轮询。
+                note(f"[连接读取异常: {exc}]")
+                state["alive"] = False
+                timer.stop()
 
         def do_send() -> None:
             text = cmd_edit.text()
@@ -3673,13 +3754,219 @@ class MainWindow(QMainWindow):
                 return
             note(f"> {text}")
             cmd_edit.clear()
+            _dir_cache.clear()      # 命令可能改变 cwd/文件系统，作废路径缓存
+            # 记入历史（跳过与上一条完全相同的连续重复），并复位到草稿位，
+            # 使下次按 Up 从最新一条开始回溯。
+            if not term_hist or term_hist[-1] != text:
+                term_hist.append(text)
+                del term_hist[:-TERM_HISTORY_MAX]   # 只保留最近 N 条，防止无限增长
+                self._save_term_history(term_hist)  # 落盘，下次开软件自动载入
+            hist_state["idx"] = len(term_hist)
+
+        # 命令补全词表：覆盖固件已注册的全部 shell 模块 + 常用 gcode 字。
+        # 与固件保持一致（bg_shell.c 的 help；bg_shell_commands.c 的 sys/banux/event/
+        # ls/pwd/cd/cat/touch/mkdir/rm/vim/recv/echo/tree/drivers/boot；command_parser.c
+        # 的 run/delay；gcode.c 的 gcode；motion_control.c 的 motion；wireless_control.c
+        # 的 wifi）。固件新增命令时同步补进来。
+        _COMPLETIONS = [
+            # 文件系统 / 目录
+            "ls", "cd", "pwd", "cat", "echo", "tree", "touch", "mkdir", "rm", "vim",
+            # 系统 / 诊断 / 传输
+            "help", "sys", "banux", "event", "drivers", "boot", "recv", "run", "delay",
+            # 运动 / 无线
+            "motion", "gcode", "wifi",
+            # gcode 字（配合 "gcode <line>" 使用）
+            "G0", "G1", "G4", "G28", "G90", "G91", "G92",
+            "M17", "M18", "M84", "M114",
+        ]
+
+        # 连续按 Tab 在多个候选间循环；一旦输入变化（文本 != 上次填入的候选）自动重置。
+        comp_state: dict[str, Any] = {"head": "", "frag": None, "matches": [],
+                                      "idx": 0, "filled": None}
+
+        # 路径补全：固件端已有完整的 VFS 路径补全（bg_shell.c Shell_TabCompleteVfs），
+        # 但本终端是“本地整行缓冲”模式——Tab 被 _TabFilter 拦在本地、从不转发给固件，
+        # 固件的行缓冲此刻是空的，转发过去也补不出东西。因此这里按需向设备发
+        # “ls <dir>” 拉目录项在本地补全；结果按目录缓存，连续 Tab 循环不再重复查询。
+        _PATH_CMDS = {"cat", "cd", "ls", "run", "vim", "rm",
+                      "touch", "mkdir", "tree", "recv"}
+        _dir_cache: dict[str, list[tuple[str, bool]]] = {}
+        _ansi_item = re.compile(r"\x1b\[1;(?:34|32)m(.+?)\x1b\[0m")
+        _file_item = re.compile(r"(.+?)\s+\(\d+\)$")
+
+        def parse_ls(raw: str) -> list[tuple[str, bool]]:
+            """解析固件 ls 输出为 [(名字, 是否目录)]：目录=蓝 1;34 / 设备=绿 1;32，
+            文件=“名字 (大小)”，参数=纯名字；每行两项、2+ 空格分隔，末尾带 banux$。"""
+            entries: list[tuple[str, bool]] = []
+            for line in raw.split("\n"):
+                line = line.replace("\r", "").split("banux$")[0].strip()
+                if not line:
+                    continue
+                for item in re.split(r"\s{2,}", line):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    m = _ansi_item.match(item)
+                    if m:
+                        entries.append((m.group(1), True))
+                        continue
+                    fm = _file_item.match(item)
+                    entries.append((fm.group(1) if fm else item, False))
+            return entries
+
+        def query_dir(dirpath: str) -> list[tuple[str, bool]] | None:
+            """向设备查询 dirpath 的目录项；未连接/超时/异常返回 None（不缓存失败）。"""
+            key = dirpath or "."
+            if key in _dir_cache:
+                return _dir_cache[key]
+            qcmd = ("ls " + dirpath).rstrip() if dirpath else "ls"
+            was_running = timer.isActive()
+            timer.stop()                       # 暂停 pump，避免它抢走本次查询的响应
+            entries: list[tuple[str, bool]] | None = None
+            try:
+                self._drain_input(sock)
+                sock.sendall(qcmd.encode("utf-8") + b"\n")   # 单换行符：兼容未烧录新固件
+                resp = self.read_bridge_response(1.2)
+                if resp:
+                    if resp.startswith(qcmd):  # 去掉固件对命令行的逐字符回显
+                        resp = resp[len(qcmd):]
+                    entries = parse_ls(resp)
+            except (OSError, socket.timeout, TimeoutError, ValueError):
+                entries = None
+            finally:
+                if was_running and state["alive"]:
+                    timer.start()
+            if entries is not None:
+                _dir_cache[key] = entries
+            return entries
+
+        def path_candidates(frag: str) -> list[str] | None:
+            """按 frag 的目录部分查设备，返回整段路径候选（目录带 '/' 便于下钻）。"""
+            cut = frag.rfind("/")
+            dirpart, nameprefix = frag[:cut + 1], frag[cut + 1:]
+            stripped = dirpart.rstrip("/")
+            querypath = stripped or ("/" if dirpart.startswith("/") else "")
+            entries = query_dir(querypath)
+            if entries is None:
+                return None
+            up = nameprefix.upper()
+            return [dirpart + name + ("/" if isdir else "")
+                    for name, isdir in entries if name.upper().startswith(up)]
+
+        def do_complete() -> None:
+            cur = cmd_edit.text()
+            if comp_state["frag"] is not None and cur == comp_state["filled"]:
+                # 延续上一次循环：候选集不变，切到下一个
+                head, matches = comp_state["head"], comp_state["matches"]
+                comp_state["idx"] = (comp_state["idx"] + 1) % len(matches)
+            else:
+                head, _, frag = cur.rpartition(" ")
+                if not frag:                      # 空片段不补全，否则会列出整张词表
+                    comp_state["frag"] = None
+                    return
+                cmd_word = head.split(" ", 1)[0] if head else ""
+                if "/" in frag or (head and cmd_word in _PATH_CMDS):
+                    found = path_candidates(frag)  # 路径上下文：查设备文件系统
+                    if found is None:              # 未连接/查询失败 → 放弃本次补全
+                        comp_state["frag"] = None
+                        return
+                    matches = found
+                else:
+                    matches = [w for w in _COMPLETIONS
+                               if w.upper().startswith(frag.upper())]
+                if not matches:
+                    comp_state["frag"] = None
+                    return
+                comp_state.update({"head": head, "frag": frag,
+                                   "matches": matches, "idx": 0})
+                if len(matches) > 1:
+                    note("  ".join(matches))      # 多候选：先在输出区列出全部
+            prefix = (head + " ") if head else ""
+            filled = prefix + matches[comp_state["idx"]]
+            if len(matches) == 1:
+                # 唯一匹配：目录(以 '/' 结尾)不补空格且复位，再按 Tab 可下钻；
+                # 文件/命令补空格方便继续输入参数。
+                if not filled.endswith("/"):
+                    filled += " "
+                comp_state["frag"] = None
+            comp_state["filled"] = filled
+            cmd_edit.setText(filled)
+
+        class _TabFilter(QObject):
+            def eventFilter(self, obj, event):
+                if obj is cmd_edit and event.type() == QEvent.Type.KeyPress \
+                        and event.key() == Qt.Key.Key_Tab:
+                    do_complete()
+                    return True
+                return False
+
+        class _FocusFilter(QObject):
+            def eventFilter(self, obj, event):
+                # 鼠标进入命令行窗口即把键盘焦点交给输入框
+                if event.type() == QEvent.Type.Enter:
+                    cmd_edit.setFocus()
+                elif event.type() == QEvent.Type.KeyPress and event.key() in (
+                        Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    # 焦点不在输入框时（复选框/输出区/按钮），回车冒泡到对话框：
+                    # 一律当作“发送”，而不是触发默认按钮（“一回车就清屏” bug 的兜底）。
+                    # 输入框自身的回车已由 returnPressed 消费，不会走到这里，无重复发送。
+                    do_send()
+                    return True
+                return False
+
+        class _HistoryFilter(QObject):
+            def eventFilter(self, obj, event):
+                # 输入框上下键回溯命令历史：Up 往更早、Down 往更新，
+                # 回到最新之后恢复用户浏览前输入的草稿。
+                if obj is not cmd_edit or event.type() != QEvent.Type.KeyPress:
+                    return False
+                key = event.key()
+                if key == Qt.Key.Key_Up:
+                    if term_hist:
+                        if hist_state["idx"] >= len(term_hist):
+                            hist_state["idx"] = len(term_hist)
+                            hist_state["draft"] = cmd_edit.text()
+                        if hist_state["idx"] > 0:
+                            hist_state["idx"] -= 1
+                            cmd_edit.setText(term_hist[hist_state["idx"]])
+                            cmd_edit.setCursorPosition(len(cmd_edit.text()))
+                    return True
+                if key == Qt.Key.Key_Down:
+                    if hist_state["idx"] < len(term_hist):
+                        hist_state["idx"] += 1
+                        if hist_state["idx"] >= len(term_hist):
+                            cmd_edit.setText(hist_state["draft"])
+                        else:
+                            cmd_edit.setText(term_hist[hist_state["idx"]])
+                        cmd_edit.setCursorPosition(len(cmd_edit.text()))
+                    return True
+                # 其它按键（含手动编辑/回车）：退出历史浏览态，下次 Up 从最新开始
+                hist_state["idx"] = len(term_hist)
+                return False
 
         timer.setInterval(80)
         timer.timeout.connect(pump)
-        send_btn.clicked.connect(do_send)
+        # 终端打开时心跳被 _terminal_busy 挡掉（poll_device_status 提前返回），
+        # 这里用独立的保活定时器继续发 @BPC PING，避免模块侧 TCP 空闲超时掉线。
+        if not is_serial:
+            ka_timer = QTimer(dialog)
+            ka_timer.setInterval(2500)
+
+            def _keepalive() -> None:
+                try:
+                    sock.sendall(b"@BPC PING\r\n")
+                except OSError:
+                    pass
+
+            ka_timer.timeout.connect(_keepalive)
+            ka_timer.start()
         cmd_edit.returnPressed.connect(do_send)
+        cmd_edit.installEventFilter(_TabFilter(cmd_edit))
+        cmd_edit.installEventFilter(_HistoryFilter(cmd_edit))
+        dialog.installEventFilter(_FocusFilter(cmd_edit))
         clear_btn.clicked.connect(output.clear)
         close_btn.clicked.connect(dialog.accept)
+        cmd_edit.setFocus()
 
         self._terminal_busy = True
         try:
@@ -3694,14 +3981,113 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(300, self.poll_device_status)
 
     def jog_axis(self, axis: str, direction: float) -> None:
-        amount = self.extruder_step.value() if axis == "E" else self.jog_step.value()
-        value = gcode_number(amount * direction, 4 if axis == "E" else 3)
-        feed = gcode_number(self.jog_feed.value(), 0)
-        if not self.send_manual_command("gcode G91", 1.5):
+        """操作台方向键：改用固件 motion 命令。
+        gcode G1 走 stepper_group 组写入（stepper_move_group），实测恒返回 -5，故弃用；
+        motion → MotionControl_Move → DrvStepper_Step 单轴打脉冲，实测可用。
+        流程：直接写 enable 参数使能 → motion 打脉冲 → cat position 读回该轴位置刷新显示。
+        mm→steps 用与固件一致的 STEPPER_STEPS_PER_MM；速度(mm/min)→vmax(steps/s)。"""
+        axis_l = axis.lower()
+        spm = STEPPER_STEPS_PER_MM[axis]
+        amount_mm = self.extruder_step.value() if axis == "E" else self.jog_step.value()
+        steps = int(round(amount_mm * direction * spm))
+        if steps == 0:
+            self.statusBar().showMessage(f"{axis} 步距过小，未产生脉冲", 2500)
             return
-        if not self.send_manual_command(f"gcode G1 {axis}{value} F{feed}", 3.0):
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", self._conn_hint())
             return
-        self.send_manual_command("gcode G90", 1.5)
+        vmax = max(1, min(int(round(self.jog_feed.value() * spm / 60.0)), 20000))
+        # 读到提示符即返回，小步距不会等满；大步距按 脉冲数/速度 给足超时
+        timeout = min(20.0, 3.0 + abs(steps) / vmax * 1.5)
+        try:
+            # 使能走直接参数写（echo enable 1 → DrvStepper_EnableAll），不用 gcode M17：
+            # M17 经 stepper_group 的 ioctl，与 G1 -5 同源、实测不可靠；enable 为共享 EN
+            # 引脚，写任一轴即全局生效。已使能再写幂等无害。
+            self.send_bridge_command(f"echo /driver/gpio/stepper_{axis_l}/enable 1", 2.0)
+            resp = self.send_bridge_command(f"motion {axis_l} {steps} {vmax}", timeout)
+        except OSError as exc:
+            QMessageBox.warning(self, "移动失败", str(exc))
+            return
+        if "done" not in resp:
+            # motion: step rejected（未使能/忙）或 motion: failed（参数/方向错误）
+            QMessageBox.warning(self, "移动未完成", resp.strip() or "motion 无响应")
+            return
+        self._refresh_axis_position(axis)
+
+    def set_motors_enabled(self, enabled: bool) -> None:
+        """使能/释放电机：直接写 enable 参数（共享 EN 引脚 PC3），不经 stepper_group。
+        gcode M17/M84 走 stepper_group 的 ioctl，与 G1 -5 同源、实测不可靠，故改用此路径。"""
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", self._conn_hint())
+            return
+        try:
+            self.send_bridge_command(
+                f"echo /driver/gpio/stepper_x/enable {1 if enabled else 0}", 2.0)
+        except OSError as exc:
+            QMessageBox.warning(self, "操作失败", str(exc))
+            return
+        self.statusBar().showMessage("电机已使能" if enabled else "电机已释放", 2500)
+        if enabled:
+            self.refresh_all_positions()
+
+    def refresh_all_positions(self) -> None:
+        """读回 X/Y/Z/E 四轴软件脉冲位置并刷新显示（“状态”按钮 / 使能后调用）。"""
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", self._conn_hint())
+            return
+        for ax in ("X", "Y", "Z", "E"):
+            self._refresh_axis_position(ax)
+
+    def home_axes(self) -> None:
+        """回0：先使能，再让固件把 X/Y/Z 依次移动到触发 min 限位处、position 置 0。
+        逐轴下发 home <axis>（每轴阻塞走到限位才回提示符），期间禁用按钮防重入、
+        刷新该轴位置；固件返回含 "ok" 视为该轴成功。"""
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", self._conn_hint())
+            return
+        self._transfer_busy = True
+        self.update_device_actions()
+        try:
+            self.send_bridge_command("echo /driver/gpio/stepper_x/enable 1", 2.0)
+            for ax in ("x", "y", "z"):
+                self.statusBar().showMessage(f"回零中：{ax.upper()} 轴，请勿断电或推动…")
+                QApplication.processEvents()
+                resp = self.send_bridge_command(f"home {ax}", 20.0)
+                if "ok" not in resp:
+                    raise OSError(resp.strip() or f"home {ax} 无响应")
+                self._refresh_axis_position(ax.upper())
+                QApplication.processEvents()
+        except OSError as exc:
+            QMessageBox.warning(self, "回零失败", str(exc))
+            return
+        finally:
+            self._transfer_busy = False
+            self.update_device_actions()
+            self.statusBar().clearMessage()
+        self.statusBar().showMessage("回零完成，XYZ 已置零点", 3000)
+
+    def _refresh_axis_position(self, axis: str) -> None:
+        """cat 读回指定轴的软件脉冲位置（get_position 返回带符号整数），换算 mm 刷新显示。"""
+        axis_l = axis.lower()
+        try:
+            resp = self.send_bridge_command(
+                f"cat /driver/gpio/stepper_{axis_l}/position", 2.0)
+        except OSError:
+            return
+        for line in resp.splitlines():
+            token = line.strip()
+            if re.fullmatch(r"[+-]?\d+", token):
+                self.axis_steps[axis] = int(token)
+                break
+        self._update_position_label()
+
+    def _update_position_label(self) -> None:
+        parts = []
+        for ax in ("X", "Y", "Z", "E"):
+            st = self.axis_steps.get(ax)
+            parts.append(f"{ax} —" if st is None
+                         else f"{ax} {st / STEPPER_STEPS_PER_MM[ax]:.3f}")
+        self.position_label.setText("   ".join(parts) + "  mm")
 
     def http_json(self, path: str, data: dict[str, str] | None = None) -> Any:
         device = self.connected_device or self.selected_wireless_device()

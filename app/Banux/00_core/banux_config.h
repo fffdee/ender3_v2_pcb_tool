@@ -66,8 +66,70 @@ extern "C" {
 #define BANUX_INTERNAL_FLASH_FS_EN  BANUX_FATFS_EN /* 独立挂载 20 KB Flash FAT12 */
 #endif
 
+#ifndef STEPPER_INVERT_X_DIR
+/* 各轴 DIR 极性翻转：1=在驱动层把该轴 DIR 引脚电平相对逻辑方向取反，
+ * 使「命令正方向 = 机械正方向」。本机实测 Z 轴「正脉冲=下降、负脉冲=上升」，
+ * 与标准(正=上升)相反，故 Z 置 1；X/Y/E 方向正常置 0。翻转只改物理引脚，
+ * position 仍按逻辑方向增减(正命令=position 增大=上升)。 */
+#define STEPPER_INVERT_X_DIR        0
+#endif
+#ifndef STEPPER_INVERT_Y_DIR
+#define STEPPER_INVERT_Y_DIR        0
+#endif
+#ifndef STEPPER_INVERT_Z_DIR
+#define STEPPER_INVERT_Z_DIR        1
+#endif
+#ifndef STEPPER_INVERT_E_DIR
+#define STEPPER_INVERT_E_DIR        0
+#endif
+
 #ifndef STEPPER_LIMIT_ACTIVE_HIGH
-#define STEPPER_LIMIT_ACTIVE_HIGH   1   /* Creality NC endstop: open/high means hit */
+/* 限位触发极性：
+ *   1 = 高电平触发（原始 Creality 常闭限位：开关断开/上拉为高 = 撞到）
+ *   0 = 低电平触发（限位按下/接地为低 = 撞到）
+ * 当前板子限位为「按下接地」，故设为 0。 */
+#define STEPPER_LIMIT_ACTIVE_HIGH   0
+#endif
+
+/*===========================================================================
+ * 回零 (homing) 配置 —— shell `home` 命令 / 操作台“回0”按钮用
+ *   方向 HOME_DIR_*：0 = 朝负向(dir=0)找 min 限位；1 = 朝正向。Ender-3 三轴
+ *     min 限位默认在负端，故默认 0；若某轴实测朝限位反方向走，把该值改成 1。
+ *   行程 HOME_MAX_MM_*：回零最大搜索距离(mm)，应略大于该轴实际行程；走满仍
+ *     未触发限位即报 -4（方向配反或限位故障），不会无限移动。
+ *=========================================================================*/
+#ifndef HOME_DIR_X
+#define HOME_DIR_X                  0
+#endif
+#ifndef HOME_DIR_Y
+#define HOME_DIR_Y                  0
+#endif
+#ifndef HOME_DIR_Z
+#define HOME_DIR_Z                  0
+#endif
+#ifndef HOME_MAX_MM_X
+#define HOME_MAX_MM_X               235.0
+#endif
+#ifndef HOME_MAX_MM_Y
+#define HOME_MAX_MM_Y               235.0
+#endif
+#ifndef HOME_MAX_MM_Z
+#define HOME_MAX_MM_Z               255.0
+#endif
+#ifndef HOME_FAST_MM_S
+#define HOME_FAST_MM_S              35.0    /* 快速逼近速度 mm/s */
+#endif
+#ifndef HOME_SLOW_MM_S
+#define HOME_SLOW_MM_S              6.0     /* 二次逼近速度 mm/s */
+#endif
+#ifndef HOME_BACKOFF_MM
+#define HOME_BACKOFF_MM             3.0     /* 触发限位后回退距离 mm */
+#endif
+#ifndef HOME_FAST_CHUNK_MM
+#define HOME_FAST_CHUNK_MM          2.0     /* 快速段每查一次限位走的 mm */
+#endif
+#ifndef HOME_SLOW_CHUNK_MM
+#define HOME_SLOW_CHUNK_MM          0.2     /* 慢速段每查一次限位走的 mm */
 #endif
 
 #ifndef SYS_LED_EN

@@ -13,6 +13,8 @@ BANUX_COMPONENT_DECLARE(g_banux_component_event_bus);
 BANUX_COMPONENT_DECLARE(g_banux_component_firmware_upgrade);
 BANUX_COMPONENT_DECLARE(g_banux_component_gcode);
 BANUX_COMPONENT_DECLARE(g_banux_component_wireless_control);
+BANUX_COMPONENT_DECLARE(g_banux_component_stepper_limit_mon);
+BANUX_COMPONENT_DECLARE(g_banux_component_motion_control);
 
 static const BanuxComponentDescriptor_t *const g_static_components[] = {
     &g_banux_component_vfs,
@@ -25,7 +27,9 @@ static const BanuxComponentDescriptor_t *const g_static_components[] = {
     &g_banux_component_event_bus,
     &g_banux_component_firmware_upgrade,
     &g_banux_component_gcode,
-    &g_banux_component_wireless_control
+    &g_banux_component_wireless_control,
+    &g_banux_component_stepper_limit_mon,
+    &g_banux_component_motion_control
 };
 
 static BanuxComponentInfo_t g_components[BANUX_COMPONENT_MAX];

@@ -334,12 +334,8 @@ static int set_value(const char *text, void *userData)
     return (DrvEeprom_Write(state->address, &byte, 1u) == 1) ? 0 : -1;
 }
 
-static int get_erase(char *buf, uint16_t maxLen, void *userData)
-{
-    (void)userData;
-    return snprintf(buf, maxLen, "0");
-}
-
+/* erase 是只写触发器：写 "1" 即整片擦为 FF；注册 get=NULL（见 eeprom_params）→
+ * cat erase 由框架提示 "Write-only parameter (use echo to set)"，不再返回误导性的 "0"。 */
 static int set_erase(const char *value, void *userData)
 {
     (void)userData;
@@ -353,7 +349,7 @@ static const FsParamDef_t eeprom_params[] = {
     FS_PARAM_DEF("address",   "read/write start address",       get_address,   set_address),
     FS_PARAM_DEF("value",     "byte at current address",        get_value,     set_value),
     FS_PARAM_DEF("detected",  "device acknowledged (0/1)",      get_detected,  NULL),
-    FS_PARAM_DEF("erase",     "write 1 to fill EEPROM with FF", get_erase,     set_erase),
+    FS_PARAM_DEF("erase",     "write 1 to fill EEPROM with FF", NULL,          set_erase),
     FS_PARAM_END
 };
 

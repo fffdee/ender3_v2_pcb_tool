@@ -101,7 +101,8 @@ typedef enum {
     EVT_GCODE_STOP          = 0x0123,
 
     /* ---- 用户自定义事件 (0x0200 ~ 0x02FF) ---- */
-    EVT_USER_BASE           = 0x0200,   /* 应用层自定义事件起始 */
+    EVT_GPIO_CHANGED        = 0x0200,   /* GPIO 电平变化 (限位/IO 监控) */
+    EVT_USER_BASE           = 0x0210,   /* 应用层自定义事件起始 (0x0200~0x020F 已用) */
 
     /* ---- 最大值 ---- */
     EVT_TOPIC_MAX           = 0x02FF
@@ -201,6 +202,20 @@ typedef struct {
     const char *cmd;        /* 命令字符串 (仅在回调期间有效!) */
     uint8_t     io_source;  /* 命令来源 (0=UART, 1=BLE, 2=USB_CDC) */
 } BG_EventShellCmdData_t;
+
+/**
+ * @brief GPIO 电平变化事件 (伴随 EVT_GPIO_CHANGED 发布)
+ *
+ * 由限位/IO 监控轮询或 EXTI 边沿检测发布；订阅者据此打印/记录。
+ * 数据仅在回调期间有效 (同步分发)。
+ */
+typedef struct {
+    char     name[8];      /* 符号名, 如 "PA4" / "PA5" / "PA6" */
+    uint8_t  port_letter;  /* 'A'..'G' 方便人读 */
+    uint16_t pin;          /* GPIO 引脚号 0..15 */
+    uint8_t  raw_level;    /* 变化后的原始电平: 0=低, 1=高 */
+    uint8_t  idx;          /* 轴序号 (DRV_STEPPER_X=0..Z=2), 0xFF = 非轴信号 */
+} BG_EventGpioData_t;
 
 #ifdef __cplusplus
 }

@@ -621,6 +621,8 @@ class MainWindow(QMainWindow):
         self.combo_port.currentIndexChanged.connect(self._on_port_changed)
         self.combo_conn_mode.currentIndexChanged.connect(self._on_conn_mode_changed)
         self.btn_wireless_scan.clicked.connect(self._on_wireless_scan)
+        # 无线设备选择变化 → 同步"进入 Boot 模式"按钮显隐（无线同样支持 boot 命令）
+        self.combo_device.currentIndexChanged.connect(self._update_enter_boot_visibility)
 
         self.btn_ping.clicked.connect(lambda: self._start_op(UpgradeWorker.OP_PING))
         self.btn_query.clicked.connect(lambda: self._start_op(UpgradeWorker.OP_QUERY))
@@ -725,6 +727,9 @@ class MainWindow(QMainWindow):
         wireless = (self._conn_mode == "wireless")
         self.wireless_panel.setVisible(wireless)
         self.serial_panel.setVisible(not wireless)
+        # 切换模式后立即刷新"进入 Boot 模式"按钮显隐
+        # （原先只在串口端口变化时刷新，导致无线模式下按钮始终不出现）
+        self._update_enter_boot_visibility()
 
     def _auto_scan_current_mode(self):
         if self._conn_mode == "wireless":
@@ -789,8 +794,17 @@ class MainWindow(QMainWindow):
                     break
         self._on_port_changed()
 
-    def _on_port_changed(self):
-        """端口选择变化时，根据 USB 身份协议决定是否显示'进入 Boot 模式'按钮。"""
+    def _update_enter_boot_visibility(self, _index: int = 0):
+        """统一决定「进入 Boot 模式」按钮的显隐。
+
+        无线模式：只要选中了无线设备就显示——无线链路同样支持发送 boot 命令
+                 （见 _enter_boot_wireless）。
+        串口模式：仅当选中的是「非 Bootloader」设备时显示（已是 Bootloader 就不必再进）。
+        """
+        if self._conn_mode == "wireless":
+            self.btn_enter_boot.setVisible(self._selected_wireless_device() is not None)
+            return
+
         import serial.tools.list_ports as sp
         port_data = self.combo_port.currentData()
         if not port_data:
@@ -808,6 +822,10 @@ class MainWindow(QMainWindow):
 
         # 非 Bootloader 设备 → 显示"进入 Boot 模式"按钮
         self.btn_enter_boot.setVisible(not is_bootloader)
+
+    def _on_port_changed(self):
+        """端口选择变化时，根据 USB 身份协议决定是否显示'进入 Boot 模式'按钮。"""
+        self._update_enter_boot_visibility()
 
     def _on_enter_boot(self):
         """发送 'boot' 命令让 APP 进入 Bootloader 烧录模式（串口 / 无线均可）。"""

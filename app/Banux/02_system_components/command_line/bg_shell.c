@@ -368,6 +368,10 @@ static void Shell_ProcessChar(char c)
             if (!g_InputHandler && !CommandParser_IsRunning()) {
                 Shell_Prompt();
             }
+            /* \r\n 视作一次换行：处理完 '\r' 后置位，紧随的 '\n' 在
+             * Shell_Process / Shell_InputChar 入口被丢弃，避免多打一个提示符。
+             * 纯 '\n'（Unix 换行）不置位，后续字符照常处理。 */
+            g_IgnoreNextLf = (c == '\r');
             break;
             
         case '\b':

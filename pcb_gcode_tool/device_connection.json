@@ -4,5 +4,26 @@
   "bridge_port": 8266,
   "http_port": 80,
   "wifi": "1",
-  "ap": false
+  "ap": false,
+  "term_history": [
+    "ls",
+    "echo enable 0",
+    "ls",
+    "cd ..",
+    "cd stepper_z/",
+    "cat limit",
+    "cd ..",
+    "cd stepper_z/",
+    "ls",
+    "pwd",
+    "cat limit",
+    "cd ..",
+    "cd stepper_x/",
+    "cat limit",
+    "cd  ..",
+    "cd stepper_y/q",
+    "cd stepper_y",
+    "cat limit"
+  ],
+  "last_gerber": "E:\\project_and_dataset\\project\\ender3_v2_pcb_tool\\Gerber_PCB_PCB_1048-looper_2_2025-10-07_2_2026-08-28.zip"
 }

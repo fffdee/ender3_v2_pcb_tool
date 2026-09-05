@@ -5,6 +5,8 @@
 #include "debug.h"
 #include "banux_config.h"
 #include "stm32f1xx_hal.h"
+#include "bg_event.h"
+#include "banux_component.h"
 
 #define STEPPER_EN_PORT       GPIOC
 #define STEPPER_EN_PIN        GPIO_PIN_3
@@ -29,17 +31,18 @@ typedef struct {
     uint32_t pulseUs;
     int32_t position;
     uint8_t direction;
+    uint8_t dirInvert;   /* 1=物理 DIR 引脚电平相对逻辑方向取反（见 STEPPER_INVERT_*_DIR） */
 } StepperPriv_t;
 
 static StepperPriv_t s_steppers[DRV_STEPPER_COUNT] = {
-    { DRV_STEPPER_X, "X", GPIOB, GPIO_PIN_9, GPIOC, GPIO_PIN_2,
-      GPIOC, GPIO_PIN_0, "PB9", "PC2", "PC0", STEPPER_DEFAULT_US, 0, 0 },
-    { DRV_STEPPER_Y, "Y", GPIOB, GPIO_PIN_7, GPIOB, GPIO_PIN_8,
-      GPIOC, GPIO_PIN_1, "PB7", "PB8", "PC1", STEPPER_DEFAULT_US, 0, 0 },
-    { DRV_STEPPER_Z, "Z", GPIOB, GPIO_PIN_5, GPIOB, GPIO_PIN_6,
-      GPIOA, GPIO_PIN_15, "PB5", "PB6", "PA15", STEPPER_DEFAULT_US, 0, 0 },
-    { DRV_STEPPER_E, "E", GPIOB, GPIO_PIN_3, GPIOB, GPIO_PIN_4,
-      NULL, 0, "PB3", "PB4", NULL, STEPPER_DEFAULT_US, 0, 0 },
+    { DRV_STEPPER_X, "X", GPIOC, GPIO_PIN_2, GPIOB, GPIO_PIN_9,
+      GPIOA, GPIO_PIN_5, "PC2", "PB9", "PA5", STEPPER_DEFAULT_US, 0, 0, STEPPER_INVERT_X_DIR },
+    { DRV_STEPPER_Y, "Y", GPIOB, GPIO_PIN_8, GPIOB, GPIO_PIN_7,
+      GPIOA, GPIO_PIN_6, "PB8", "PB7", "PA6", STEPPER_DEFAULT_US, 0, 0, STEPPER_INVERT_Y_DIR },
+    { DRV_STEPPER_Z, "Z", GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_5,
+      GPIOA, GPIO_PIN_7, "PB6", "PB5", "PA7", STEPPER_DEFAULT_US, 0, 0, STEPPER_INVERT_Z_DIR },
+    { DRV_STEPPER_E, "E", GPIOB, GPIO_PIN_4, GPIOB, GPIO_PIN_3,
+      NULL, 0, "PB4", "PB3", NULL, STEPPER_DEFAULT_US, 0, 0, STEPPER_INVERT_E_DIR },
 };
 
 static uint8_t s_gpioInitialized;
@@ -88,13 +91,12 @@ static void stepper_gpio_init(void)
     init.Pin = GPIO_PIN_2 | GPIO_PIN_3;
     HAL_GPIO_Init(GPIOC, &init);
 
-    /* The board supplies 10K pull-ups and 100 nF filters on all endstops. */
+    /* 限位输入：X=PA5 / Y=PA6 / Z=PA7
+     * 板上限位自带 10K 上拉与 100nF 滤波，故配置为浮空输入。 */
     init.Mode = GPIO_MODE_INPUT;
     init.Pull = GPIO_NOPULL;
     init.Speed = GPIO_SPEED_FREQ_LOW;
-    init.Pin = GPIO_PIN_0 | GPIO_PIN_1;
-    HAL_GPIO_Init(GPIOC, &init);
-    init.Pin = GPIO_PIN_15;
+    init.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
     HAL_GPIO_Init(GPIOA, &init);
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -116,14 +118,27 @@ int DrvStepper_EnableAll(int enabled)
 int DrvStepper_SetDirection(DrvStepperAxis_t axis, int direction)
 {
     StepperPriv_t *stepper;
+    uint8_t pinDir;
 
     if (!stepper_axis_valid(axis)) return -1;
     stepper_gpio_init();
     stepper = &s_steppers[axis];
-    stepper->direction = direction ? 1u : 0u;
+    stepper->direction = direction ? 1u : 0u;   /* 逻辑方向：决定 position 增减 */
+    /* 物理 DIR 电平 = 逻辑方向 XOR 该轴翻转位（Z 翻转后：正命令=上升） */
+    pinDir = (uint8_t)(stepper->direction ^ stepper->dirInvert);
     HAL_GPIO_WritePin(stepper->dirPort, stepper->dirPin,
-                      stepper->direction ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                      pinDir ? GPIO_PIN_SET : GPIO_PIN_RESET);
     return 0;
+}
+
+/* 返回 1=该轴 min 限位已触发；0=未触发或该轴无限位(如 E)。
+ * 与 DrvStepper_GetLimit 同极性逻辑，供脉冲循环内联急停判定用。 */
+static uint8_t stepper_limit_hit(const StepperPriv_t *st)
+{
+    int raw;
+    if (!st->limitPort || st->limitPin == 0u) return 0u;
+    raw = (HAL_GPIO_ReadPin(st->limitPort, st->limitPin) == GPIO_PIN_SET);
+    return (uint8_t)(STEPPER_LIMIT_ACTIVE_HIGH ? raw : !raw);
 }
 
 int DrvStepper_Step(DrvStepperAxis_t axis, uint32_t count, uint32_t pulseUs)
@@ -141,15 +156,23 @@ int DrvStepper_Step(DrvStepperAxis_t axis, uint32_t count, uint32_t pulseUs)
     stepper = &s_steppers[axis];
     s_busy = 1u;
     for (i = 0; i < count; i++) {
+        /* 死规则：朝 min 限位方向(direction==0)且限位已触发 → 立即停脉冲并把
+         * 该轴位置清零，防止继续撞机床/床面。朝反方向(离开限位)放行，保证回零
+         * 回退、以及回零后抬起不被卡死。position 改为逐脉冲累加，提前中断时
+         * 也能反映真实已走步数。 */
+        if (stepper->direction == 0u && stepper_limit_hit(stepper)) {
+            stepper->position = 0;
+            break;
+        }
         HAL_GPIO_WritePin(stepper->stepPort, stepper->stepPin, GPIO_PIN_SET);
         stepper_delay_us(pulseUs);
         HAL_GPIO_WritePin(stepper->stepPort, stepper->stepPin, GPIO_PIN_RESET);
         stepper_delay_us(pulseUs);
-    }
-    if (stepper->direction) {
-        stepper->position += (int32_t)count;
-    } else {
-        stepper->position -= (int32_t)count;
+        if (stepper->direction) {
+            stepper->position++;
+        } else {
+            stepper->position--;
+        }
     }
     s_busy = 0u;
     return 0;
@@ -179,14 +202,24 @@ static int stepper_move_group(const DrvStepperMoveCommand_t *command)
 
     for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
         if (counts[axis] > 0u) {
+            uint8_t pinDir;
             s_steppers[axis].direction = command->steps[axis] > 0 ? 1u : 0u;
+            pinDir = (uint8_t)(s_steppers[axis].direction ^ s_steppers[axis].dirInvert);
             HAL_GPIO_WritePin(s_steppers[axis].dirPort, s_steppers[axis].dirPin,
-                              s_steppers[axis].direction ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                              pinDir ? GPIO_PIN_SET : GPIO_PIN_RESET);
         }
     }
 
     s_busy = 1u;
     for (tick = 0u; tick < maximum; tick++) {
+        /* 死规则：任一轴朝 min 限位方向(direction==0)且已触发 → 停该轴脉冲 + 位置清零 */
+        for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
+            if (counts[axis] > 0u && s_steppers[axis].direction == 0u &&
+                stepper_limit_hit(&s_steppers[axis])) {
+                counts[axis] = 0u;
+                s_steppers[axis].position = 0;
+            }
+        }
         memset(stepped, 0, sizeof(stepped));
         for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
             accumulators[axis] += counts[axis];
@@ -245,8 +278,9 @@ static int stepper_drv_init(void *priv)
     HAL_GPIO_WritePin(stepper->dirPort, stepper->dirPin, GPIO_PIN_RESET);
     stepper->direction = 0u;
     stepper->position = 0;
-    DBG("[Stepper] %s ready: STEP=%s DIR=%s EN=PC3(active-low)\n",
-        stepper->axisName, stepper->stepPinName, stepper->dirPinName);
+    DBG("[Stepper] %s ready: STEP=%s DIR=%s LIMIT=%s EN=PC3(active-low)\n",
+        stepper->axisName, stepper->stepPinName, stepper->dirPinName,
+        stepper->limitPinName ? stepper->limitPinName : "-");
     return 0;
 }
 
@@ -379,12 +413,9 @@ static int set_pulse_us(const char *value, void *userData)
     return 0;
 }
 
-static int get_steps(char *buf, uint16_t maxLen, void *userData)
-{
-    (void)userData;
-    return snprintf(buf, maxLen, "0");
-}
-
+/* steps 是只写触发器：写入带符号脉冲数即打脉冲，成功后 position 累加 |steps|。
+ * 注册为 get=NULL（见 stepper_params / stepper_limit_params）→ cat steps 由框架
+ * 提示 "Write-only parameter (use echo to set)"，累计位移看 position。 */
 static int set_steps(const char *value, void *userData)
 {
     StepperPriv_t *stepper = (StepperPriv_t *)userData;
@@ -465,7 +496,7 @@ static const FsParamDef_t stepper_params[] = {
     FS_PARAM_DEF("enable",   "shared motor enable (active-low pin)", get_enable,    set_enable),
     FS_PARAM_DEF("dir",      "raw direction level (0/1)",           get_direction, set_direction),
     FS_PARAM_DEF("pulse_us", "STEP high and low time in us",        get_pulse_us,  set_pulse_us),
-    FS_PARAM_DEF("steps",    "write signed pulse count",            get_steps,     set_steps),
+    FS_PARAM_DEF("steps",    "write signed pulse count",            NULL,          set_steps),
     FS_PARAM_DEF("position", "software pulse position",             get_position,  set_position),
     FS_PARAM_DEF("step_pin", "STEP GPIO",                           get_step_pin,  NULL),
     FS_PARAM_DEF("dir_pin",  "DIR GPIO",                            get_dir_pin,   NULL),
@@ -477,7 +508,7 @@ static const FsParamDef_t stepper_limit_params[] = {
     FS_PARAM_DEF("enable",    "shared motor enable (active-low pin)", get_enable,    set_enable),
     FS_PARAM_DEF("dir",       "raw direction level (0/1)",           get_direction, set_direction),
     FS_PARAM_DEF("pulse_us",  "STEP high and low time in us",        get_pulse_us,  set_pulse_us),
-    FS_PARAM_DEF("steps",     "write signed pulse count",            get_steps,     set_steps),
+    FS_PARAM_DEF("steps",     "write signed pulse count",            NULL,          set_steps),
     FS_PARAM_DEF("position",  "software pulse position",             get_position,  set_position),
     FS_PARAM_DEF("limit",     "minimum endstop triggered (0/1)",      get_limit,     NULL),
     FS_PARAM_DEF("limit_raw", "raw endstop GPIO level (0/1)",        get_limit_raw, NULL),
@@ -517,6 +548,113 @@ static DrvDevice_t s_stepperGroupDevice = {
     .params = NULL,
     .privData = NULL
 };
+
+/* ============================================================
+ * 限位 GPIO 变化监控 (调试用)
+ * ------------------------------------------------------------
+ * 通过事件总线发布 GPIO 变化, 并在订阅者里打印到串口,
+ * 用于排查“短接限位但 cat limit 不变”等接线/极性问题。
+ * 轮询运行在 Banux 组件 process 钩子 (主循环线程上下文, 可安全 DBG 打印)。
+ * ============================================================ */
+static uint8_t s_lastLimitRaw[3];   /* 索引 0=X,1=Y,2=Z；0xFF=无效轴 */
+
+static int DrvStepper_LimitMonitorInit(void)
+{
+    uint8_t i;
+
+    stepper_gpio_init();   /* 确保限位引脚已配置为输入 */
+    for (i = 0u; i < 3u; i++) {
+        StepperPriv_t *st = &s_steppers[i];
+        if (st->limitPort && st->limitPin) {
+            s_lastLimitRaw[i] = (HAL_GPIO_ReadPin(st->limitPort, st->limitPin)
+                                 == GPIO_PIN_SET) ? 1u : 0u;
+        } else {
+            s_lastLimitRaw[i] = 0xFFu;
+        }
+    }
+    DBG("[Stepper] limit monitor started (X=PA5 Y=PA6 Z=PA7)\n");
+    return 0;
+}
+
+static void DrvStepper_PollLimit(void)
+{
+    uint8_t i;
+
+    /* 使能保持（需求：电机使能且无操作时不得被外力移动）：
+     * 只要处于使能态就每拍把 EN(PC3, active-low) 重新拉低，保证驱动器绕组持续
+     * 通电、维持保持扭矩锁住转子；即便其它代码路径意外改写 EN，也会在下一拍被
+     * 纠正。未使能(s_enabled==0)时不触碰 EN，保持高电平→驱动器释放→可自由推动。 */
+    if (s_enabled && s_gpioInitialized) {
+        HAL_GPIO_WritePin(STEPPER_EN_PORT, STEPPER_EN_PIN, GPIO_PIN_RESET);
+    }
+
+    for (i = 0u; i < 3u; i++) {
+        StepperPriv_t *st = &s_steppers[i];
+        uint8_t raw;
+        BG_EventGpioData_t d;
+        uint16_t mask;
+        uint8_t pin_no;
+
+        if (!st->limitPort || st->limitPin == 0u) continue;
+
+        raw = (HAL_GPIO_ReadPin(st->limitPort, st->limitPin) == GPIO_PIN_SET) ? 1u : 0u;
+        if (raw == s_lastLimitRaw[i]) continue;   /* 无变化, 跳过 */
+        s_lastLimitRaw[i] = raw;
+
+        /* 死规则(空闲侧)：限位状态跳变为“触发”时把该轴位置清零——即便电机空闲
+         * 被外力推到限位也归零。仅在跳变沿执行, 避免停在限位上时对离开方向的
+         * 小位移反复清零(运动中的急停清零由 DrvStepper_Step 负责)。 */
+        if (STEPPER_LIMIT_ACTIVE_HIGH ? raw : !raw) {
+            st->position = 0;
+        }
+
+        /* GPIO_PIN_x 位掩码 -> 引脚号 0..15 */
+        mask = st->limitPin;
+        pin_no = 0u;
+        while (mask > 1u) { mask >>= 1; pin_no++; }
+
+        d.port_letter = (st->limitPort == GPIOA) ? 'A'
+                      : (st->limitPort == GPIOB) ? 'B'
+                      : (st->limitPort == GPIOC) ? 'C' : '?';
+        d.pin       = pin_no;
+        d.raw_level = raw;
+        d.idx       = (uint8_t)st->axis;
+        {
+            const char *n = st->limitPinName ? st->limitPinName : "?";
+            uint8_t k = 0u;
+            while (k < (uint8_t)(sizeof(d.name) - 1u) && n[k] != '\0') {
+                d.name[k] = n[k]; k++;
+            }
+            d.name[k] = '\0';
+        }
+        BG_EVT_PUB_DATA(EVT_GPIO_CHANGED, &d, sizeof(d));
+    }
+}
+
+/* 订阅者: 收到 GPIO 变化即打印到串口 */
+static void on_gpio_changed(BG_EventTopic_t topic, const void *data, uint8_t size)
+{
+    const BG_EventGpioData_t *d = (const BG_EventGpioData_t *)data;
+    char axis_ch;
+    (void)topic;
+    (void)size;
+    if (!d) return;
+    axis_ch = (d->idx < 3u) ? "XYZ"[d->idx] : '?';
+    DBG("[GPIO] %s raw=%d limit=%d axis=%c\n",
+        d->name,
+        (int)d->raw_level,
+        STEPPER_LIMIT_ACTIVE_HIGH ? (int)d->raw_level : (int)(!d->raw_level),
+        axis_ch);
+}
+BG_EVT_SUB(EVT_GPIO_CHANGED, on_gpio_changed);
+
+/* 注册为 Banux 组件: 主循环 process 钩子调用 DrvStepper_PollLimit (线程上下文) */
+BANUX_COMPONENT_DEFINE_EX(
+    g_banux_component_stepper_limit_mon,
+    "stepper_limit_mon", "1.0.0",
+    BANUX_COMPONENT_APPLICATION, 1,
+    "X/Y/Z 限位 GPIO 变化监控 (发布 EVT_GPIO_CHANGED)",
+    DrvStepper_LimitMonitorInit, DrvStepper_PollLimit);
 
 int DrvStepper_Register(void)
 {

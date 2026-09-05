@@ -262,6 +262,7 @@ const char *BG_Event_GetTopicName(BG_EventTopic_t topic)
         case EVT_GCODE_COMPLETE: return "EVT_GCODE_COMPLETE";
         case EVT_GCODE_ERROR: return "EVT_GCODE_ERROR";
         case EVT_GCODE_STOP: return "EVT_GCODE_STOP";
+        case EVT_GPIO_CHANGED: return "EVT_GPIO_CHANGED";
         case BG_EVT_TOPIC_ANY: return "ANY";
         default: return "UNKNOWN";
     }

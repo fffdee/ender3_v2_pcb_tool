@@ -1,12 +1,12 @@
       Code (inc. data)   RO Data    RW Data    ZI Data      Debug   Object Name
       1986          0         21         24        584          0   app_bl.o
        300          0          0         16          0          0   banux.o
-       432          0         44          1        128          0   banux_component.o
+       432          0         52          1        128          0   banux_component.o
         60          0          0          4          0          0   banux_debug.o
        378          0         80          0          0          0   banux_io.o
         14          0          0          0          0          0   banux_scheduler.o
-      2176          0          0          3        384          0   bg_event.o
-      3768          0        522         44       2976          0   bg_shell.o
+      2228          0          0          3        384          0   bg_event.o
+      3792          0        522         44       2976          0   bg_shell.o
       6780          0       2288          0       2636          0   bg_shell_commands.o
        410          0          0          0        512          0   bsp_driver_sd.o
         92          0       1216          0          0          0   ccsbcs.o
@@ -14,11 +14,11 @@
        160          0          0          0          0          0   diskio.o
        328          0         77          0          0          0   driver_init.o
       1818          0         53         40         64          0   drv_device.o
-      1478          0        427         60          0          0   drv_eeprom.o
+      1466          0        427         60          0          0   drv_eeprom.o
        476          0          0         44          0          0   drv_fs.o
        208          0         96          0          0          0   drv_init.o
       1012          0        523         56        560          0   drv_sdio.o
-      2234          0       1105        508          0          0   drv_stepper.o
+      2694          0       1203        512          0          0   drv_stepper.o
         90          0        116         56          0          0   drv_timer1ms.o
        170          0        195        144          0          0   drv_uart.o
          0          0         78          0          0          0   event_component_manifest.o
@@ -31,6 +31,7 @@
        852          0         20          1       2048          0   internal_flash_diskio.o
        272          0         78          0          0          0   internal_flash_fs.o
        334          0         96          0          0          0   main.o
+      2186          0        520          0          0          0   motion_control.o
        564          0        216         12        512          0   sd_diskio.o
        192          0          0          0        132          0   sdio.o
        168          0         74          0          0          0   shell_io_uart.o
@@ -59,8 +60,8 @@ Memory Map of the image
 
 	Load Region LR_IROM1 
 
-		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x000136B4, Max: 0x00070000, END)
+		Execution Region ER_IROM1 (Exec base: 0x08008000, Size: 0x00015C90, Max: 0x00070000, END)
 
-		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000DF08, Max: 0x00010000, END)
+		Execution Region RW_IRAM1 (Exec base: 0x20000000, Size: 0x0000DF10, Max: 0x00010000, END)
 
 Image component sizes

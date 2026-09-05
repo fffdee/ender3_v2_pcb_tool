@@ -339,7 +339,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xE</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;../Banux;../Banux/00_core;../Banux/01_driver;../Banux/01_driver/eeprom;../Banux/01_driver/internal_flash;../Banux/01_driver/sd;../Banux/01_driver/stepper;../Banux/01_driver/timer;../Banux/01_driver/uart;../Banux/inc;../Banux/02_system_components/file_io;../Banux/02_system_components/command_line;../Banux/02_system_components/command_parser;../Banux/02_system_components/event;../Banux/02_system_components/internal_flash_fs;../Banux/02_system_components/fatfs/app;../Banux/02_system_components/fatfs/target;../Banux/02_system_components/fatfs/src;../Banux/02_system_components/fatfs/src/drivers;../Banux/02_system_components/driver_framework;../Banux/02_system_components/driver_framework/core;../Banux/02_system_components/driver_framework/vfs;../Banux/03_application_components/gcode;../Banux/03_application_components/wireless_control</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;../Banux;../Banux/00_core;../Banux/01_driver;../Banux/01_driver/eeprom;../Banux/01_driver/internal_flash;../Banux/01_driver/sd;../Banux/01_driver/stepper;../Banux/01_driver/timer;../Banux/01_driver/uart;../Banux/inc;../Banux/02_system_components/file_io;../Banux/02_system_components/command_line;../Banux/02_system_components/command_parser;../Banux/02_system_components/event;../Banux/02_system_components/internal_flash_fs;../Banux/02_system_components/fatfs/app;../Banux/02_system_components/fatfs/target;../Banux/02_system_components/fatfs/src;../Banux/02_system_components/fatfs/src/drivers;../Banux/02_system_components/driver_framework;../Banux/02_system_components/driver_framework/core;../Banux/02_system_components/driver_framework/vfs;../Banux/03_application_components/motion_control;../Banux/03_application_components/gcode;../Banux/03_application_components/wireless_control</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -567,6 +567,11 @@
               <FileName>wireless_control.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Banux/03_application_components/wireless_control/wireless_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/03_application_components/motion_control/motion_control.c</FilePath>
             </File>
           </Files>
         </Group>
