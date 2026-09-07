@@ -589,7 +589,7 @@ uint32_t app_bl_shell_drops(uint8_t port)
 
 /* 镜像缓冲是否还能再收 1 字节（环形缓冲留 1 字节区分满/空，故有效上限 SIZE-1）。
  * 供 app_bl_poll 背压使用：镜像满时暂停从 UART 环形缓冲取字节，把数据留在
- * rb(UART_RB_SIZE=4096) 里等下一轮，而不是走 shell1_push/shell3_push 的丢弃分支。 */
+ * rb(usart 的 UART1 软件环现仅 512 字节)里等下一轮，而不是走 shell1_push/shell3_push 的丢弃分支。 */
 static uint8_t shell1_has_room(void)
 {
     return (uint8_t)(app_bl_shell1_available() < (uint16_t)(APP_BL_SHELL_RB_SIZE - 1u));

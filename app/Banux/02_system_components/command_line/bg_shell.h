@@ -41,7 +41,7 @@ extern "C" {
  * 注意：历史条目长度用独立的 SHELL_HISTORY_LEN，避免 g_History[10][512] 吃掉 5KB RAM
  * ——长命令本来就是上位机生成的 recv -b，没必要进历史。 */
 #define SHELL_CMD_MAX_LEN       512     // Max command line length
-#define SHELL_HISTORY_LEN       128     // 命令历史条目长度(与命令行长度解耦)
+#define SHELL_HISTORY_LEN       64      // 命令历史条目长度(与命令行长度解耦)
 #define SHELL_CMD_MAX_ARGS      15      // Max argument count
 #define SHELL_MODULE_MAX        40     // Max module count (increased for remind + future modules)
 #define SHELL_OUT_BUF_SIZE      256     // Output buffer size

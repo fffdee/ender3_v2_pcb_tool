@@ -167,7 +167,7 @@ extern "C" {
 #endif
 
 #ifndef VFS_MAX_CHILDREN
-#define VFS_MAX_CHILDREN            24
+#define VFS_MAX_CHILDREN            16
 #endif
 
 #ifndef VFS_MAX_PARAM_LEN

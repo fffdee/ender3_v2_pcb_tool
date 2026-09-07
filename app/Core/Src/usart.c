@@ -28,19 +28,28 @@
  * 中断，仅在 DMA 半满/全满(每 UART_DMA_BUF/2 字节)时进一次轻量中断兜底。
  * 注：TX 仍为阻塞发送(HAL_UART_Transmit)，下载场景 TX 量很小，无丢字节风险。
  ******************************************************************************/
-#define UART_RB_SIZE    4096u   /* 软件环形缓冲(应用层消费) */
 #define UART_DMA_BUF    512u    /* DMA 循环缓冲(硬件搬运)   */
 
+/* 软件环形缓冲(应用层消费)：
+ * UART1 仅用于交互调试(低速链路)，512 字节(≈4.4ms@115200)绰绰有余；
+ * UART3 走 ESP 桥接 / 2M gcode 下载，保留大缓冲避免主循环偶发阻塞时溢出。
+ * 两者必须是 2 的幂。改为"指针 + 独立缓冲"，使两个实例可用不同大小。 */
+#define UART1_RB_SIZE   512u
+#define UART3_RB_SIZE   4096u
+
 typedef struct {
-    uint8_t  rb[UART_RB_SIZE];           /* 软件环形缓冲 */
+    uint8_t *rb;                         /* 指向下方独立缓冲 s_uartN_rb */
+    uint16_t rb_size;                    /* 环形缓冲容量(= 2^n) */
     volatile uint16_t rb_head;
     volatile uint16_t rb_tail;
     uint8_t  dma[UART_DMA_BUF];          /* DMA 循环目标缓冲 */
     volatile uint16_t dma_last;          /* 上次已搬入 rb 的 DMA 写入位置 */
 } uart_drv_t;
 
-static uart_drv_t s_uart1;
-static uart_drv_t s_uart3;
+static uint8_t s_uart1_rb[UART1_RB_SIZE];
+static uint8_t s_uart3_rb[UART3_RB_SIZE];
+static uart_drv_t s_uart1 = { s_uart1_rb, UART1_RB_SIZE, 0, 0, { 0 }, 0 };
+static uart_drv_t s_uart3 = { s_uart3_rb, UART3_RB_SIZE, 0, 0, { 0 }, 0 };
 
 /* DMA 句柄(供 stm32f1xx_it.c 的 DMA 通道 ISR 引用) */
 DMA_HandleTypeDef hdma_usart1_rx;
@@ -49,7 +58,7 @@ DMA_HandleTypeDef hdma_usart3_rx;
 /* ── 软件环形缓冲(生产者:DMA 兜底/主循环 drain; 消费者:app_bl_poll) ── */
 static void rb_push(uart_drv_t *u, uint8_t b)
 {
-    uint16_t next = (uint16_t)((u->rb_head + 1u) % UART_RB_SIZE);
+    uint16_t next = (uint16_t)((u->rb_head + 1u) % u->rb_size);
     if (next != u->rb_tail) {            /* 满则丢弃最旧，避免覆盖未读数据 */
         u->rb[u->rb_head] = b;
         u->rb_head = next;
@@ -90,11 +99,20 @@ static DMA_HandleTypeDef *uart_hdma_of(UART_HandleTypeDef *huart)
     return (DMA_HandleTypeDef *)0;
 }
 
+/* 仅复位环形缓冲 / DMA 状态字，保留 rb 指针与 rb_size(否则 memset 清零会把
+ * rb 指针弄丢)。DMA 尚未启动，此时清零安全。 */
+static void uart_drv_reset(uart_drv_t *u)
+{
+    u->rb_head = 0;
+    u->rb_tail = 0;
+    u->dma_last = 0;
+    memset(u->dma, 0, UART_DMA_BUF);
+}
+
 void uart_rx_start(void)
 {
-    /* 清空全部状态(含 dma_last / rb 指针)。DMA 尚未启动，此时清零安全。 */
-    memset(&s_uart1, 0, sizeof(s_uart1));
-    memset(&s_uart3, 0, sizeof(s_uart3));
+    uart_drv_reset(&s_uart1);
+    uart_drv_reset(&s_uart3);
     /* 启动 DMA 循环接收；依赖 MSP 中已 LINK 的 hdmarx */
     (void)HAL_UART_Receive_DMA(&huart1, s_uart1.dma, UART_DMA_BUF);
     (void)HAL_UART_Receive_DMA(&huart3, s_uart3.dma, UART_DMA_BUF);
@@ -111,7 +129,7 @@ int uart_rb_pop(UART_HandleTypeDef *huart, uint8_t *b)
         return 0;
     }
     *b = u->rb[u->rb_tail];
-    u->rb_tail = (uint16_t)((u->rb_tail + 1u) % UART_RB_SIZE);
+    u->rb_tail = (uint16_t)((u->rb_tail + 1u) % u->rb_size);
     return 1;
 }
 
@@ -125,7 +143,7 @@ uint16_t uart_rb_available(UART_HandleTypeDef *huart)
     uart_rb_drain(u, uart_hdma_of(huart));
     head = u->rb_head;
     tail = u->rb_tail;
-    return (uint16_t)((head + UART_RB_SIZE - tail) % UART_RB_SIZE);
+    return (uint16_t)((head + u->rb_size - tail) % u->rb_size);
 }
 
 void uart_tx(UART_HandleTypeDef *huart, const uint8_t *data, uint16_t len)

@@ -2,12 +2,12 @@
 =================================================== keil-build-viewer v1.6 ==================================================
  
 [Search keil project] 1 item(s)
-	E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
+	D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
 
 [User input] 
-[Current folder] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM
+[Current folder] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM
 [Encoding] 936
-[Keil project path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
+[Keil project path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.uvprojx
 [Keil project name] ender3 v2.uvprojx
 [Is keil v4] 0
 [target name] ender3 v2
@@ -34,14 +34,14 @@ Note: source file '../Banux/02_system_components/event/component_manifest.c' - o
 Note: source file '../Banux/03_application_components/firmware_upgrade/component_manifest.c' - object file renamed from 'ender3 v2\upgrade_component_manifest.o' to 'ender3 v2\upgrade_component_manifest.o'.
 'upgrade_component_manifest.c' rename to 'upgrade_component_manifest.o'
 
-[map file path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.map
+[map file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2.map
 
 [region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00016928 [memory type] 2 [memory ID] 3
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00017598 [memory type] 2 [memory ID] 3
 
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E560 [memory type] 1 [memory ID] 2
-		[ZI block] addr: 0x20000498, size: 0x0000E0C8 (57544)
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E580 [memory type] 1 [memory ID] 2
+		[ZI block] addr: 0x200004B4, size: 0x0000E0CC (57548)
 
 
 [object name max length] 28
@@ -170,8 +170,8 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 
 [record region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00016928 [type] 2 [ID] 3
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E560 [type] 1 [ID] 2
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00017598 [type] 2 [ID] 3
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E580 [type] 1 [ID] 2
 ------------------------------------------------------------------------------------------------------------------------------------
                                    FILE(s)                                   |         RAM (byte)       |       FLASH (byte)       |
 ------------------------------------------------------------------------------------------------------------------------------------
@@ -203,7 +203,7 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 ../Banux/02_system_components/fatfs/src/ff.c():                              |         166              |        8628              |
 ../Banux/02_system_components/fatfs/src/ff_gen_drv.c():                      |          16              |          70              |
 ../Banux/01_driver/sd/fs_sd.c():                                             |        1820              |        3242              |
-../Banux/03_application_components/gcode/gcode.c():                          |          28              |        3061              |
+../Banux/03_application_components/gcode/gcode.c():                          |          60              |        6273              |
 ../Core/Src/gpio.c():                                                        |           0              |         128              |
 ../Banux/01_driver/internal_flash/internal_flash_diskio.c():                 |        2049              |         873              |
 ../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c():       |           0              |         350              |
@@ -239,11 +239,11 @@ LR_IROM1
                 RW_IRAM1  [0x20000000]|■□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□______| (  57.3 KB /  64.0 KB )  89.6%  
  
         FLASH 1           [0x08008000 | 0x00070000 (458752)]
-                ER_IROM1  [0x08008000]|■■■■■■■■■■________________________________________| (  90.2 KB / 448.0 KB )  20.2%  
+                ER_IROM1  [0x08008000]|■■■■■■■■■■________________________________________| (  93.3 KB / 448.0 KB )  20.8%  
  
-[htm file path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
+[htm file path] D:\资料\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
 Maximum Stack Usage =       1440 bytes + Unknown(Functions without stacksize, Cycles, Untraceable Function Pointers)
  
 =============================================================================================================================
 
-run time: 0.311 s
+run time: 0.212 s
