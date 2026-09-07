@@ -1,6 +1,7 @@
 /** @file driver_init.c @brief Ender-3 V2 platform driver registration. */
 #include "driver_init.h"
 #include "drv_eeprom.h"
+#include "hc245/drv_hc245.h"
 #include "drv_sdio.h"
 #include "drv_stepper.h"
 #include "drv_timer1ms.h"
@@ -21,6 +22,11 @@ int BanuxDriver_RegisterAll(void)
     if (ret != 0) {
         DBG("[DriverInit] stepper register failed (%d)\n", ret);
         return -2;
+    }
+
+    ret = DrvHc245_Register();
+    if (ret != 0) {
+        DBG("[DriverInit] WARNING: hc245 register failed (%d)\n", ret);
     }
 
     ret = DrvEeprom_Register();

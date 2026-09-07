@@ -491,11 +491,23 @@ void app_bl_init(void)
 /* ─── Shell 输入镜像缓冲 ───
  * app_bl_poll() 是 UART 环形缓冲的唯一消费者（嗅探 ENTER_BOOT 帧 / "boot" 命令）。
  * 为让 Shell 与嗅探共存：嗅探后将 UART1 字节镜像转发到 Shell 输入缓冲，
- * shell_io_uart.c 的 UART1 recv/available 改为从该缓冲读取，避免两个消费者抢数据。 */
-#define APP_BL_SHELL_RB_SIZE 256u
+ * shell_io_uart.c 的 UART1 recv/available 改为从该缓冲读取，避免两个消费者抢数据。
+ *
+ * 容量必须 >= 一整条命令行（SHELL_CMD_MAX_LEN = 512）+ 余量，原因：
+ *   app_bl_poll() 一轮主循环会把 usart.c 环形缓冲里"全部"待收字节一次性搬进本
+ *   缓冲；而 Shell 每轮主循环只取 SHELL_IO_CHUNK 字节，并且每取一个字节就要
+ *   阻塞 TX 回显（UART1+UART3 双发），实测消费速率只有 ~60 KB/s，远低于 2M 波特
+ *   下 200 KB/s 的到达速率。于是上位机一口气发来的整条 `recv -b` 命令（288 字节
+ *   载荷 -> 384 个 base64 字符，命令行共 421 字节）会把本缓冲塞满，尾部字节
+ *   （含行尾 '\n'）被静默丢弃：Shell 永远等不到换行、命令不执行，只剩逐字回显，
+ *   上位机表现为"块 N 未确认写入（响应：'recv -b ...'）"。
+ *   256 字节时 421 字节的行必然溢出，且与主循环快慢只差几十字节，因此会出现
+ *   "之前能传、现在失败"的临界抖动。扩到 1024 = 最长命令行 512 + 一倍余量。 */
+#define APP_BL_SHELL_RB_SIZE 1024u
 static uint8_t            s_shell1_rb[APP_BL_SHELL_RB_SIZE];
 static volatile uint16_t  s_shell1_head = 0;
 static volatile uint16_t  s_shell1_tail = 0;
+static uint32_t           s_shell1_drops = 0U;
 
 static void shell1_push(uint8_t b)
 {
@@ -503,6 +515,14 @@ static void shell1_push(uint8_t b)
     if (next != s_shell1_tail) {
         s_shell1_rb[s_shell1_head] = b;
         s_shell1_head = next;
+    } else {
+        /* 缓冲满 → 丢弃本字节。计数并节流打印，避免"只有回显没有响应"再次
+         * 变成无从下手的哑谜（正常传输时该计数应始终为 0）。 */
+        s_shell1_drops++;
+        if ((s_shell1_drops == 1U) || ((s_shell1_drops % 512U) == 0U)) {
+            app_log_u32("[RX] UART1 shell input overflow, dropped=0x",
+                        s_shell1_drops);
+        }
     }
 }
 
@@ -521,10 +541,13 @@ uint16_t app_bl_shell1_pop(uint8_t *data, uint16_t maxLen)
     return n;
 }
 
-/* UART3 镜像缓冲：供 /driver/uart/uart3 设备 read 使用（drv_uart.c） */
+/* UART3 镜像缓冲：供 /driver/uart/uart3 设备 read 使用（drv_uart.c）与
+ * UART1+UART3 组合 Shell IO 的输入（无线桥接数据走这一路）。容量与丢弃处理
+ * 同 shell1，见 APP_BL_SHELL_RB_SIZE 处说明。 */
 static uint8_t            s_shell3_rb[APP_BL_SHELL_RB_SIZE];
 static volatile uint16_t  s_shell3_head = 0;
 static volatile uint16_t  s_shell3_tail = 0;
+static uint32_t           s_shell3_drops = 0U;
 
 static void shell3_push(uint8_t b)
 {
@@ -532,6 +555,12 @@ static void shell3_push(uint8_t b)
     if (next != s_shell3_tail) {
         s_shell3_rb[s_shell3_head] = b;
         s_shell3_head = next;
+    } else {
+        s_shell3_drops++;
+        if ((s_shell3_drops == 1U) || ((s_shell3_drops % 512U) == 0U)) {
+            app_log_u32("[RX] UART3 shell input overflow, dropped=0x",
+                        s_shell3_drops);
+        }
     }
 }
 
@@ -550,17 +579,47 @@ uint16_t app_bl_shell3_pop(uint8_t *data, uint16_t maxLen)
     return n;
 }
 
+/* 诊断用：Shell 输入镜像缓冲因满而丢弃的字节数（port=1 或 3）。
+ * 正常传输应恒为 0；非 0 说明上位机发得比下位机消费快（命令过长 / 波特率过高 /
+ * 主循环被长时间占用），被丢的往往是行尾 '\n'，表现为"命令只回显不执行"。 */
+uint32_t app_bl_shell_drops(uint8_t port)
+{
+    return (port == 3U) ? s_shell3_drops : s_shell1_drops;
+}
+
+/* 镜像缓冲是否还能再收 1 字节（环形缓冲留 1 字节区分满/空，故有效上限 SIZE-1）。
+ * 供 app_bl_poll 背压使用：镜像满时暂停从 UART 环形缓冲取字节，把数据留在
+ * rb(UART_RB_SIZE=4096) 里等下一轮，而不是走 shell1_push/shell3_push 的丢弃分支。 */
+static uint8_t shell1_has_room(void)
+{
+    return (uint8_t)(app_bl_shell1_available() < (uint16_t)(APP_BL_SHELL_RB_SIZE - 1u));
+}
+
+static uint8_t shell3_has_room(void)
+{
+    return (uint8_t)(app_bl_shell3_available() < (uint16_t)(APP_BL_SHELL_RB_SIZE - 1u));
+}
+
 void app_bl_poll(void)
 {
     uint8_t b;
 
-    while (uart_rb_pop(&huart1, &b)) {
+    /* 背压式搬运（根治"整条 recv -b 命令灌满镜像缓冲 -> 行尾 '\n' 被丢 -> 命令
+     * 永不执行、只剩逐字回显"的传输卡死）：
+     *   仅当镜像缓冲还有空位时才从 usart.c 的环形缓冲 pop 字节；镜像满就把字节
+     *   留在 rb 里，下一轮 Shell 消费掉一些后再继续搬。有效输入深度因此从
+     *   "镜像 1024（满即丢）"提升到"rb 4096 + 镜像 1024 = 5120，且只有 Shell 被
+     *   长时间阻塞、连 rb 也满时才丢"，足以吸收上位机整条命令（recv -b 行最长
+     *   512）叠加重试残留的突发，任何情况下都不会丢掉行尾 '\n'。
+     *   副作用：镜像满期间 ENTER_BOOT 帧 / 'boot' 文本嗅探顺延到后续轮次——字节
+     *   仍完整保留在 rb 中、按序处理，只晚一两轮，不影响升级触发。 */
+    while (shell1_has_room() && uart_rb_pop(&huart1, &b)) {
         echo_byte(b, &huart1);
         feed_text(b, &huart1);
         feed_byte(b, &huart1);
         shell1_push(b);   /* 转发给 Shell 输入缓冲 */
     }
-    while (uart_rb_pop(&huart3, &b)) {
+    while (shell3_has_room() && uart_rb_pop(&huart3, &b)) {
         echo_byte(b, &huart3);
         feed_text(b, &huart3);
         feed_byte(b, &huart3);

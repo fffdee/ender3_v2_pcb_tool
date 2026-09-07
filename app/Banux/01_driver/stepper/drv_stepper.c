@@ -15,6 +15,8 @@
 #define STEPPER_MAX_PULSE_US  100000u
 #define STEPPER_MAX_CMD_STEPS 100000u
 #define STEPPER_MAX_MOVE_US   5000000u
+#define STEPPER_GROUP_DEF_VMAX 2000.0   /* group 联动缺省主轴速度 steps/s（与 shell motion 一致） */
+#define STEPPER_GROUP_DEF_AMAX 40000.0  /* group 联动缺省加速度 steps/s^2 */
 
 typedef struct {
     DrvStepperAxis_t axis;
@@ -178,6 +180,34 @@ int DrvStepper_Step(DrvStepperAxis_t axis, uint32_t count, uint32_t pulseUs)
     return 0;
 }
 
+/* 自实现 double 平方根，避免链接 libm（Keil 默认不带数学库）。与 motion_control
+ * 的 dsqrt 等价，driver 层自持一份，不反向依赖 application 组件。 */
+static double stepper_dsqrt(double x)
+{
+    double g = 1.0;
+    int i;
+    if (x <= 0.0) return 0.0;
+    for (i = 0; i < 12; i++) {
+        double q = x / g;
+        g = 0.5 * (g + q);
+    }
+    return g;
+}
+
+/* 由瞬时速度(steps/s)换算单拍半周期(us)：整周期 = 1e6 / speed，半周期再 /2。 */
+static uint32_t stepper_pulse_us_for_speed(double speed)
+{
+    double half;
+    if (speed < 1.0) speed = 1.0;
+    half = (1000000.0 / speed) / 2.0;
+    if (half < (double)STEPPER_MIN_PULSE_US) half = (double)STEPPER_MIN_PULSE_US;
+    if (half > (double)STEPPER_MAX_PULSE_US) half = (double)STEPPER_MAX_PULSE_US;
+    return (uint32_t)half;
+}
+
+/* 多轴联动 + 梯形加减速：主轴(maximum 步)按“加速-匀速-减速”逐拍变速，各从轴用
+ * Bresenham accumulator 按比例在同拍联动。取代原“固定 pulseUs 匀速 + 5 秒时长上限”，
+ * 上限改为步数(STEPPER_MAX_CMD_STEPS)，长距离移动(如回零后走到平面中间的板子)不再被拒。 */
 static int stepper_move_group(const DrvStepperMoveCommand_t *command)
 {
     uint32_t counts[DRV_STEPPER_COUNT];
@@ -186,11 +216,10 @@ static int stepper_move_group(const DrvStepperMoveCommand_t *command)
     uint32_t maximum = 0u;
     uint32_t tick;
     uint32_t axis;
-    uint32_t pulseUs;
+    double vMax, aMax, dA, vPeak, v;
+    int32_t nAccel, nCruise;
 
     if (!command || !s_enabled || s_busy) return -1;
-    pulseUs = command->pulseUs ? command->pulseUs : STEPPER_DEFAULT_US;
-    if (pulseUs < STEPPER_MIN_PULSE_US || pulseUs > STEPPER_MAX_PULSE_US) return -1;
 
     for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
         int32_t steps = command->steps[axis];
@@ -198,7 +227,7 @@ static int stepper_move_group(const DrvStepperMoveCommand_t *command)
         counts[axis] = (uint32_t)(steps < 0 ? -steps : steps);
         if (counts[axis] > maximum) maximum = counts[axis];
     }
-    if (maximum == 0u || maximum > (STEPPER_MAX_MOVE_US / (2u * pulseUs))) return -1;
+    if (maximum == 0u || maximum > STEPPER_MAX_CMD_STEPS) return -1;
 
     for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
         if (counts[axis] > 0u) {
@@ -210,8 +239,35 @@ static int stepper_move_group(const DrvStepperMoveCommand_t *command)
         }
     }
 
+    /* 梯形速度规划：dA = vMax^2/(2*aMax) 为加速段步数。达不到 vMax 时走三角曲线。 */
+    vMax = command->vMaxStepsPerSec > 0u ? (double)command->vMaxStepsPerSec
+                                         : STEPPER_GROUP_DEF_VMAX;
+    aMax = command->aMaxStepsPerSec2 > 0u ? (double)command->aMaxStepsPerSec2
+                                          : STEPPER_GROUP_DEF_AMAX;
+    dA = (vMax * vMax) / (2.0 * aMax);
+    if (2.0 * dA >= (double)maximum) {
+        nAccel = (int32_t)(maximum / 2u);
+        nCruise = 0;
+        vPeak = stepper_dsqrt(aMax * (double)maximum);
+        if (vPeak > vMax) vPeak = vMax;
+    } else {
+        nAccel = (int32_t)dA;
+        nCruise = (int32_t)maximum - 2 * nAccel;
+        vPeak = vMax;
+    }
+
     s_busy = 1u;
     for (tick = 0u; tick < maximum; tick++) {
+        uint32_t pulseUs;
+        int32_t k = (int32_t)tick;
+        /* 当前拍瞬时速度：加速段 v=√(2·a·(k+1))、匀速段 vPeak、减速段 v=√(2·a·(max-k)) */
+        if (k < nAccel) v = stepper_dsqrt(2.0 * aMax * (double)(k + 1));
+        else if (k < nAccel + nCruise) v = vPeak;
+        else v = stepper_dsqrt(2.0 * aMax * (double)(maximum - (uint32_t)k));
+        if (v > vPeak) v = vPeak;
+        pulseUs = stepper_pulse_us_for_speed(v);
+        if (command->pulseUs && pulseUs < command->pulseUs) pulseUs = command->pulseUs;
+
         /* 死规则：任一轴朝 min 限位方向(direction==0)且已触发 → 停该轴脉冲 + 位置清零 */
         for (axis = 0u; axis < DRV_STEPPER_COUNT; axis++) {
             if (counts[axis] > 0u && s_steppers[axis].direction == 0u &&

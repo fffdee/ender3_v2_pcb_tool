@@ -10,7 +10,8 @@ typedef enum {
     GCODE_ERR_UNKNOWN_WORD = -3,
     GCODE_ERR_UNSUPPORTED = -4,
     GCODE_ERR_DRIVER = -5,
-    GCODE_ERR_LINE_TOO_LONG = -6
+    GCODE_ERR_LINE_TOO_LONG = -6,
+    GCODE_ERR_ABORTED = -7
 } GcodeResult_t;
 
 typedef struct {
@@ -22,7 +23,7 @@ typedef struct {
 
 int Gcode_Init(void);
 int Gcode_ExecuteLine(const char *line);
-int Gcode_ExecuteFile(const char *path);
+int Gcode_ExecuteFile(const char *path, int reportProgress);
 void Gcode_GetState(GcodeState_t *state);
 
 #endif /* BANUX_GCODE_H */

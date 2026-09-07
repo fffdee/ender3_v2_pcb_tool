@@ -31,7 +31,9 @@ typedef struct {
 
 typedef struct {
     int32_t steps[DRV_STEPPER_COUNT];
-    uint32_t pulseUs;
+    uint32_t pulseUs;           /* 兼容：单拍半周期下限（0=不限，由梯形曲线决定） */
+    uint32_t vMaxStepsPerSec;   /* 主轴最大速度 steps/s（0=用驱动默认） */
+    uint32_t aMaxStepsPerSec2;  /* 加速度 steps/s^2（0=用驱动默认） */
 } DrvStepperMoveCommand_t;
 
 #define DRV_STEPPER_IOCTL_ENABLE       1u

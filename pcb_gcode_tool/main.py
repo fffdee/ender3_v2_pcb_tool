@@ -26,10 +26,10 @@ from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (QAction, QColor, QFont, QPainter, QPainterPath, QPen,
                          QPolygonF, QTextCharFormat, QTextCursor)
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QStyle, QTableWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStatusBar, QStyle, QTabWidget, QTableWidget,
     QTableWidgetItem, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -65,6 +65,30 @@ BRIDGE_PORT = 8266
 #   SHELL_CMD_MAX_LEN >= 命令行总长(512)  且  RECV_DECODE_MAX >= 288
 # 三者任一不匹配，模块会回 "recv: invalid base64"。
 UPLOAD_CHUNK_SIZE = 288
+# 串口直连模式下的发送限速：分片大小与片间隔（秒）。
+# 下位机 app_bl_poll() 一轮主循环会把收到的全部字节一次性搬进 Shell 输入镜像缓冲
+# （app_bl.c: APP_BL_SHELL_RB_SIZE），而 Shell 每轮只取一小段、且每取一个字节都要
+# 阻塞回显（UART1+UART3 双发），消费速率(~60-80 KB/s)远低于 2M 波特的到达速率
+# (~200 KB/s)。一条 recv -b 命令行 421 字节一口气灌进去会撑爆该缓冲，尾部（含行尾
+# '\n'）被静默丢弃 → Shell 永远等不到换行、命令不执行，只剩逐字回显，表现为
+# "块 N 未确认写入（响应：'recv -b ...'）"。
+# 96 字节/片 + 2ms 间隔 ≈ 48 KB/s，低于下位机消费速率，从源头避免溢出。固件侧已把
+# app_bl_poll 改为“镜像缓冲满则把字节暂存于 4096 字节底层 rb、绝不丢弃”（有效输入
+# 深度 1024+4096=5120）后，本限制只作保险，不影响正确性（分片不改变命令语义）。
+SERIAL_WRITE_SLICE = 96
+SERIAL_WRITE_GAP_S = 0.002
+# 无线模式的发送分片：模块一轮 loop() 会把 TCP 里"所有"待收字节一次性转发给 STM32
+# （wireless.ino 的 while (bridgeClient.available())），421 字节的整行于是变成 2M
+# 波特下的连续突发，正好撑爆下位机 256 字节的 Shell 输入缓冲（老固件）。
+# 现在固件已在 app_bl_poll 加背压（镜像满则把字节暂存于 4096 底层 rb、绝不丢弃，
+# 有效输入深度 1024+4096=5120），一条 411 字节命令即使被模块一轮 loop 整段猛灌也
+# 稳稳装下、绝不丢行尾换行符，无需再刻意“喂慢”下位机。于是把切片放大到 512（>=
+# 最长命令 500，等于整条一次发出、不再分片），间隔降到 3ms 仅作未来超长数据的保险。
+# 此前 128/片 + 30ms 间隔跑在 UI 主线程 time.sleep 上，每块冻结 ~90ms、327 块累积
+# 近 30 秒，正是下载“一卡一卡”的元凶；可靠性既已由固件兜底，速度就该放回来。
+# 客户端已 setNoDelay(true)，每次 write 会立刻发出去。
+BRIDGE_WRITE_SLICE = 512
+BRIDGE_WRITE_GAP_S = 0.003
 DEFAULT_DEVICE_IP = "192.168.4.1"  # AP 模式固定 IP
 DEFAULT_DEVICE_NAME = "BanPCBTool"  # 模块热点名称前缀
 DEFAULT_AP_PASSWORD = "12345678"    # Ban-IOT 协议统一 AP 密码
@@ -615,12 +639,38 @@ def gcode_label(value: Any, limit: int = 40) -> str:
     return label or "item"
 
 
+PLANE_MM = 220.0  # 点胶平面边长（mm）：原点 (0,0) 在左下角，X 向右、Y 向上
+
+
 class PathPreview(QWidget):
+    """220×220mm 平面预览。
+
+    - 固定平面坐标系：几何按平面坐标 (0..PLANE_MM) 绘制，板子放置位置即
+      transformed 坐标（已含 offset），原点 (0,0) 在左下角。
+    - 鼠标拖拽板子可改变放置位置，释放时通过 on_board_dropped(dx_mm, dy_mm)
+      回调把 offset 增量提交给主窗口（拖拽中仅本地预览，不重算 gcode）。
+    - 执行态（set_execution_state）叠加当前喷头位置、已走轨迹与进度文字。
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.points: list[PointData] = []
         self.pads: list[GerberPad] = []
         self.segments: list[DispenseSegment] = []
+        self._pad_seg_end: list[int] = []  # 每个焊盘对应的“累计笔画(段)结束序号”
+        self.exec_active = False
+        self.exec_pos: tuple[float, float] | None = None
+        self.exec_trail: list[tuple[float, float]] = []
+        self.exec_seg = 0
+        self.exec_total = 0
+        self.on_board_dropped = None  # callable(dx_mm: float, dy_mm: float)
+        self.allow_drag = True        # 执行态置 False：仅允许缩放，禁止拖拽板子
+        self.show_trajectory = False  # 轨迹线（规划路径/段线）开关，默认关闭
+        self.highlight_color = QColor("#f08c00")  # 已完成焊盘高亮色
+        self._zoom = 1.0
+        self._dragging = False
+        self._drag_start_px: tuple[float, float] | None = None
+        self._drag_delta_mm: tuple[float, float] = (0.0, 0.0)
         self.setMinimumSize(420, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -633,22 +683,60 @@ class PathPreview(QWidget):
         self.points = points
         self.pads = pads
         self.segments = segments
+        # 固件 @PG 的 segIdx 按“笔画(段)”计数（generate_pad_gcode 每笔画一条 ;@SEG），
+        # 一个焊盘往往含多条笔画。预算每个焊盘的累计笔画结束序号，供高亮判定把
+        # “已完成笔画数”映射到“已完成焊盘”（修正之前 index<exec_seg 的整片误亮）。
+        seg_counts: dict[int, int] = {}
+        for seg in segments:
+            seg_counts[seg.pad_id] = seg_counts.get(seg.pad_id, 0) + 1
+        cumulative = 0
+        self._pad_seg_end = []
+        for pad in pads:
+            cumulative += seg_counts.get(pad.pad_id, 0)
+            self._pad_seg_end.append(cumulative)
+        self._drag_delta_mm = (0.0, 0.0)
         self.update()
 
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#ffffff"))
-        painter.setPen(QPen(QColor("#e6eaeb"), 1))
-        for x in range(0, self.width(), 24):
-            painter.drawLine(x, 0, x, self.height())
-        for y in range(0, self.height(), 24):
-            painter.drawLine(0, y, self.width(), y)
-        if not self.points and not self.pads:
-            painter.setPen(QColor("#68777d"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "没有选中的点胶对象")
-            return
+    def set_execution_state(self, x_mm: float, y_mm: float,
+                            seg_idx: int, total: int) -> None:
+        """执行态：更新当前喷头平面坐标与段进度，并把该点追加到已走轨迹。"""
+        self.exec_active = True
+        self.exec_pos = (x_mm, y_mm)
+        self.exec_seg = seg_idx
+        self.exec_total = total
+        if not self.exec_trail or self.exec_trail[-1] != (x_mm, y_mm):
+            self.exec_trail.append((x_mm, y_mm))
+        self.update()
 
+    def clear_execution(self) -> None:
+        self.exec_active = False
+        self.exec_pos = None
+        self.exec_trail = []
+        self.exec_seg = 0
+        self.exec_total = 0
+        self.update()
+
+    def _plane_rect(self) -> tuple[float, float, float]:
+        """平面在画布中的左上角像素 (left, top) 与 mm→px 比例 scale。"""
+        drawing = self.rect().adjusted(28, 22, -28, -22)
+        scale = min(drawing.width(), drawing.height()) / PLANE_MM * self._zoom
+        plane_px = PLANE_MM * scale
+        left = drawing.center().x() - plane_px / 2
+        top = drawing.center().y() - plane_px / 2
+        return left, top, scale
+
+    def _map_xy(self, x: float, y: float) -> QPointF:
+        """平面坐标(mm) → 画布像素，Y 轴向上翻转。"""
+        left, top, scale = self._plane_rect()
+        return QPointF(left + x * scale, top + (PLANE_MM - y) * scale)
+
+    def _unmap_px(self, px: float, py: float) -> tuple[float, float]:
+        """画布像素 → 平面坐标(mm)。"""
+        left, top, scale = self._plane_rect()
+        return (px - left) / scale, PLANE_MM - (py - top) / scale
+
+    def _collect_xy(self) -> tuple[list[float], list[float]]:
+        """当前几何（transformed 平面坐标，不含拖拽 delta）的 x/y 列表。"""
         xs = [p.x for p in self.points]
         ys = [p.y for p in self.points]
         for pad in self.pads:
@@ -657,41 +745,167 @@ class PathPreview(QWidget):
         for segment in self.segments:
             xs.extend([segment.start[0], segment.end[0]])
             ys.extend([segment.start[1], segment.end[1]])
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        range_x, range_y = max(1.0, max_x - min_x), max(1.0, max_y - min_y)
-        drawing = self.rect().adjusted(28, 22, -28, -22)
-        scale = min(drawing.width() / range_x, drawing.height() / range_y)
-        board_w, board_h = range_x * scale, range_y * scale
-        left = drawing.center().x() - board_w / 2
-        top = drawing.center().y() - board_h / 2
+        return xs, ys
 
-        def map_xy(x: float, y: float) -> QPointF:
-            return QPointF(left + (x - min_x) * scale, top + (max_y - y) * scale)
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        left, top, scale = self._plane_rect()
+        plane_px = PLANE_MM * scale
+        plane_rect = QRectF(left, top, plane_px, plane_px)
+        # 平面底色 + 边框
+        painter.setPen(QPen(QColor("#c8d0d2"), 1.4))
+        painter.setBrush(QColor("#f7f9f9"))
+        painter.drawRect(plane_rect)
+        # 每 10mm 网格
+        painter.setPen(QPen(QColor("#e8ecec"), 1))
+        step = 10.0 * scale
+        i = 1
+        while i * step < plane_px:
+            painter.drawLine(QPointF(left + i * step, top),
+                             QPointF(left + i * step, top + plane_px))
+            painter.drawLine(QPointF(left, top + i * step),
+                             QPointF(left + plane_px, top + i * step))
+            i += 1
+        # 原点 (0,0) 标记（左下角）
+        origin = self._map_xy(0.0, 0.0)
+        painter.setPen(QPen(QColor("#8a979a"), 1.3))
+        painter.drawLine(QPointF(origin.x() - 7, origin.y()), QPointF(origin.x() + 7, origin.y()))
+        painter.drawLine(QPointF(origin.x(), origin.y() - 7), QPointF(origin.x(), origin.y() + 7))
+        painter.drawText(QPointF(origin.x() + 9, origin.y() - 5), "(0,0)")
 
-        painter.setPen(QPen(QColor("#dbe2e3"), 1, Qt.PenStyle.DashLine))
-        painter.setBrush(QColor(246, 249, 248, 190))
-        painter.drawRect(QRectF(left, top, board_w, board_h))
+        xs, ys = self._collect_xy()
+        dx, dy = self._drag_delta_mm
+        if not xs:
+            painter.setPen(QColor("#68777d"))
+            painter.drawText(plane_rect, Qt.AlignmentFlag.AlignCenter, "没有选中的点胶对象")
+            self._paint_execution(painter)
+            return
+
+        min_x, max_x = min(xs) + dx, max(xs) + dx
+        min_y, max_y = min(ys) + dy, max(ys) + dy
+        out = (min_x < -0.01 or min_y < -0.01
+               or max_x > PLANE_MM + 0.01 or max_y > PLANE_MM + 0.01)
+        # 板子边框（超出平面则标红）
+        painter.setPen(QPen(QColor("#d94841") if out else QColor("#b9c4c6"),
+                            1, Qt.PenStyle.DashLine))
+        painter.setBrush(QColor(246, 249, 248, 150))
+        painter.drawRect(QRectF(self._map_xy(min_x, max_y), self._map_xy(max_x, min_y)))
         if self.pads:
             painter.setPen(QPen(QColor("#087f5b"), 1))
             painter.setBrush(QColor(8, 127, 91, 46))
             for pad in self.pads:
-                painter.drawPolygon(QPolygonF([map_xy(x, y) for x, y in pad.vertices]))
+                painter.drawPolygon(QPolygonF(
+                    [self._map_xy(x + dx, y + dy) for x, y in pad.vertices]))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor("#d94841"), 1.35))
-            for segment in self.segments:
-                painter.drawLine(map_xy(*segment.start), map_xy(*segment.end))
-        if self.points:
-            path = QPainterPath(map_xy(self.points[0].x, self.points[0].y))
-            for point in self.points[1:]:
-                path.lineTo(map_xy(point.x, point.y))
+        if self.show_trajectory:
+            if self.pads:
+                painter.setPen(QPen(QColor("#d94841"), 1.35))
+                for segment in self.segments:
+                    painter.drawLine(self._map_xy(segment.start[0] + dx, segment.start[1] + dy),
+                                     self._map_xy(segment.end[0] + dx, segment.end[1] + dy))
+            if self.points:
+                path = QPainterPath(self._map_xy(self.points[0].x + dx, self.points[0].y + dy))
+                for point in self.points[1:]:
+                    path.lineTo(self._map_xy(point.x + dx, point.y + dy))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(224, 122, 34, 145), 1.15))
+                painter.drawPath(path)
+                for index, point in enumerate(self.points):
+                    painter.setPen(QPen(QColor("#ffffff"), 1))
+                    painter.setBrush(QColor("#d94841" if index == 0 else "#087f5b"))
+                    painter.drawEllipse(self._map_xy(point.x + dx, point.y + dy), 3.6, 3.6)
+        self._paint_execution(painter)
+
+    def _paint_execution(self, painter: QPainter) -> None:
+        """叠加执行模拟层：已完成焊盘高亮、已走轨迹（绿，受轨迹开关控制）、
+        当前喷头（红十字+光晕）、进度文字。"""
+        if not self.exec_active:
+            return
+        # 已完成焊盘高亮：只有当已完成笔画数 exec_seg 覆盖到该焊盘的最后一条笔画
+        # （即 exec_seg >= 该焊盘累计结束序号）时，该焊盘才算完成并高亮。
+        if self.pads:
+            dx, dy = self._drag_delta_mm
+            painter.setPen(QPen(self.highlight_color, 1.2))
+            painter.setBrush(QColor(self.highlight_color))
+            for index, pad in enumerate(self.pads):
+                end = self._pad_seg_end[index] if index < len(self._pad_seg_end) else (index + 1)
+                if end > 0 and self.exec_seg >= end:
+                    painter.drawPolygon(QPolygonF(
+                        [self._map_xy(x + dx, y + dy) for x, y in pad.vertices]))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(224, 122, 34, 145), 1.15))
-            painter.drawPath(path)
-            for index, point in enumerate(self.points):
-                painter.setPen(QPen(QColor("#ffffff"), 1))
-                painter.setBrush(QColor("#d94841" if index == 0 else "#087f5b"))
-                painter.drawEllipse(map_xy(point.x, point.y), 3.8, 3.8)
+        # 已走轨迹绿线：与规划轨迹同属“轨迹线”，一并受设置里的轨迹开关控制（默认关）。
+        if self.show_trajectory and len(self.exec_trail) >= 2:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#087f5b"), 2.4))
+            trail = QPainterPath(self._map_xy(*self.exec_trail[0]))
+            for pt in self.exec_trail[1:]:
+                trail.lineTo(self._map_xy(*pt))
+            painter.drawPath(trail)
+        if self.exec_pos:
+            c = self._map_xy(*self.exec_pos)
+            painter.setPen(QPen(QColor(217, 72, 65, 70), 1))
+            painter.setBrush(QColor(217, 72, 65, 55))
+            painter.drawEllipse(c, 10.0, 10.0)
+            painter.setPen(QPen(QColor("#d94841"), 1.1))
+            painter.drawLine(QPointF(c.x() - 13, c.y()), QPointF(c.x() + 13, c.y()))
+            painter.drawLine(QPointF(c.x(), c.y() - 13), QPointF(c.x(), c.y() + 13))
+            painter.setPen(QPen(QColor("#ffffff"), 1.2))
+            painter.setBrush(QColor("#d94841"))
+            painter.drawEllipse(c, 4.2, 4.2)
+        if self.exec_total > 0:
+            pct = int(self.exec_seg * 100 / self.exec_total)
+            painter.setPen(QColor("#0b3b54"))
+            painter.drawText(QRectF(self.width() - 200, 4, 194, 20),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"执行 {self.exec_seg}/{self.exec_total}  {pct}%")
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        """滚轮缩放画面（执行态也允许，仅禁用拖拽）。"""
+        delta = event.angleDelta().y()
+        factor = 1.1 if delta > 0 else (1.0 / 1.1)
+        self._zoom = max(0.5, min(8.0, self._zoom * factor))
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if not self.allow_drag:
+            return
+        if event.button() != Qt.MouseButton.LeftButton or self.on_board_dropped is None:
+            return
+        xs, ys = self._collect_xy()
+        if not xs:
+            return
+        mx, my = self._unmap_px(event.position().x(), event.position().y())
+        if min(xs) <= mx <= max(xs) and min(ys) <= my <= max(ys):
+            self._dragging = True
+            self._drag_start_px = (event.position().x(), event.position().y())
+            self._drag_delta_mm = (0.0, 0.0)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not self._dragging or self._drag_start_px is None:
+            return
+        _, _, scale = self._plane_rect()
+        dx_mm = (event.position().x() - self._drag_start_px[0]) / scale
+        dy_mm = -(event.position().y() - self._drag_start_px[1]) / scale
+        xs, ys = self._collect_xy()
+        if xs:
+            dx_mm = max(-min(xs), min(dx_mm, PLANE_MM - max(xs)))
+            dy_mm = max(-min(ys), min(dy_mm, PLANE_MM - max(ys)))
+        self._drag_delta_mm = (dx_mm, dy_mm)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if not self._dragging:
+            return
+        self._dragging = False
+        self.unsetCursor()
+        dx, dy = self._drag_delta_mm
+        self._drag_delta_mm = (0.0, 0.0)
+        self.update()
+        if (abs(dx) > 0.001 or abs(dy) > 0.001) and self.on_board_dropped:
+            self.on_board_dropped(dx, dy)
 
 
 def list_serial_ports() -> list[tuple[str, str]]:
@@ -962,6 +1176,9 @@ class MainWindow(QMainWindow):
         self.conn_mode, self.serial_port_name, self.serial_baud = self._load_conn_prefs()
         self._connecting = False
         self._transfer_busy = False
+        self._transfer_dialog = None  # (dialog, label, bar) 传输进度弹窗
+        self._executing = False
+        self._paused = False  # 执行中是否已发暂停（挂起看门狗用）
         self._terminal_busy = False
         self._prev_ssid = ""
         self.setWindowTitle("Banux PCB 锡膏路径生成器")
@@ -1016,35 +1233,33 @@ class MainWindow(QMainWindow):
         title = QLabel("PCB 锡膏路径生成器")
         title.setObjectName("appTitle")
         toolbar.addWidget(title)
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
         self.import_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "导入 XLSX", self)
         self.import_gerber_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "导入 Gerber", self)
         self.export_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "导出 G-code", self)
         self.start_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "开始", self)
-        self.settings_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "无线设置", self)
+        self.settings_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView), "设置", self)
         self.terminal_action = QAction(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), "命令行", self)
+        # 左上：导入/导出/开始；spacer 撑开后右上仅留“设置”入口。
+        # 无线设置与命令行收进设置对话框，不再占工具栏。
+        toolbar.addAction(self.import_action)
         toolbar.addAction(self.import_gerber_action)
         toolbar.addAction(self.export_action)
         toolbar.addAction(self.start_action)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
         toolbar.addAction(self.settings_action)
-        toolbar.addAction(self.terminal_action)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_settings())
         splitter.addWidget(self._build_center())
-        splitter.addWidget(self._build_points())
-        splitter.setSizes([290, 760, 390])
+        splitter.addWidget(self._build_right_panel())
+        splitter.setSizes([290, 720, 400])
         splitter.setStretchFactor(1, 1)
-        self.prepare_page = splitter
-        self.pages = QStackedWidget()
-        self.pages.addWidget(self.prepare_page)
-        self.start_page = self._build_start_page()
-        self.pages.addWidget(self.start_page)
-        self.setCentralWidget(self.pages)
+        self.setCentralWidget(splitter)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("请选择 Gerber Paste 文件")
+        self._build_settings_dialog()
         self.update_start_enabled()
 
     def _spin(self, value: float, minimum: float = -100000.0,
@@ -1072,7 +1287,7 @@ class MainWindow(QMainWindow):
         self.source_combo.addItems(["Mid X / Mid Y", "Ref X / Ref Y", "Pad X / Pad Y"])
         self.origin_combo = QComboBox()
         self.origin_combo.addItems(["左下角归零", "保留原坐标", "指定工件原点"])
-        self.offset_x, self.offset_y = self._spin(0), self._spin(0)
+        self.offset_x, self.offset_y = self._spin(0, 0, PLANE_MM, 0.5), self._spin(0, 0, PLANE_MM, 0.5)
         self.origin_x, self.origin_y = self._spin(0), self._spin(0)
         self.flip_x, self.flip_y = QCheckBox("X 轴镜像"), QCheckBox("Y 轴镜像")
         mirror_row = QWidget()
@@ -1122,6 +1337,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(content)
         scroll.setMinimumWidth(270)
+        self._left_scroll = scroll
         return scroll
 
     def _build_center(self) -> QWidget:
@@ -1140,7 +1356,29 @@ class MainWindow(QMainWindow):
         layout.addLayout(title_row)
         self.preview = PathPreview()
         self.preview.setObjectName("preview")
+        self.preview.on_board_dropped = self._on_board_dropped
         layout.addWidget(self.preview, 3)
+        # 执行控制条（默认隐藏，进入执行态显示）：进度条 + 暂停/恢复二合一 + 停止。
+        # 由右栏移入中央预览下方，执行时视线集中在预览区即可看到进度并操作。
+        self.exec_bar = QWidget()
+        exec_row = QHBoxLayout(self.exec_bar)
+        exec_row.setContentsMargins(0, 0, 0, 0)
+        exec_row.setSpacing(8)
+        self.transfer_progress = QLabel("准备就绪")
+        self.transfer_progress.setObjectName("muted")
+        self.exec_progress_bar = QProgressBar()
+        self.exec_progress_bar.setRange(0, 100)
+        self.exec_progress_bar.setValue(0)
+        self.pause_resume_button = QPushButton("暂停")
+        self.pause_resume_button.setEnabled(False)
+        self.estop_button = QPushButton("停止")
+        self.estop_button.setEnabled(False)
+        exec_row.addWidget(self.transfer_progress)
+        exec_row.addWidget(self.exec_progress_bar, 1)
+        exec_row.addWidget(self.pause_resume_button)
+        exec_row.addWidget(self.estop_button)
+        self.exec_bar.setVisible(False)
+        layout.addWidget(self.exec_bar)
         stats = QFrame()
         stats.setObjectName("stats")
         stats_layout = QGridLayout(stats)
@@ -1157,34 +1395,34 @@ class MainWindow(QMainWindow):
             stats_layout.addWidget(caption, 0, column)
             stats_layout.addWidget(value, 1, column)
         layout.addWidget(stats)
-        code_header = QHBoxLayout()
-        code_title = QLabel("G-code 预览")
-        code_title.setObjectName("sectionTitle")
-        self.copy_button = QPushButton("复制")
-        self.go_start_button = QPushButton("开始")
-        code_header.addWidget(code_title)
-        code_header.addStretch()
-        code_header.addWidget(self.copy_button)
-        code_header.addWidget(self.go_start_button)
-        layout.addLayout(code_header)
+        # 底部 Tab：G-code 预览 / 点胶对象表。preview 画布常驻其上，执行进度始终可见。
         self.gcode_preview = QPlainTextEdit()
         self.gcode_preview.setReadOnly(True)
         self.gcode_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.gcode_preview.setFont(QFont("Consolas", 9))
-        layout.addWidget(self.gcode_preview, 2)
+        self.copy_button = QPushButton("复制")
+        gcode_tab = QWidget()
+        gcode_tab_layout = QVBoxLayout(gcode_tab)
+        gcode_tab_layout.setContentsMargins(6, 6, 6, 6)
+        gcode_header = QHBoxLayout()
+        gcode_header.addStretch()
+        gcode_header.addWidget(self.copy_button)
+        gcode_tab_layout.addLayout(gcode_header)
+        gcode_tab_layout.addWidget(self.gcode_preview)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.addTab(gcode_tab, "G-code 预览")
+        self.bottom_tabs.addTab(self._build_points(), "点胶对象")
+        layout.addWidget(self.bottom_tabs, 2)
         return panel
 
-    def _build_start_page(self) -> QWidget:
-        page = QWidget()
-        page_layout = QHBoxLayout(page)
-        page_layout.setContentsMargins(18, 16, 18, 16)
-        page_layout.setSpacing(12)
-        left_panel = QWidget()
-        layout = QVBoxLayout(left_panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def _build_right_panel(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(12)
 
         connection = QGroupBox("设备")
+        self._conn_group = connection
         grid = QGridLayout(connection)
         self.device_combo = QComboBox()
         self.device_combo.setVisible(False)
@@ -1224,30 +1462,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.serial_refresh_button, 2, 4)
         grid.addWidget(self.serial_connect_button, 3, 3, 1, 2)
 
-        transfer = QGroupBox("G-code 传输与执行")
-        transfer_grid = QGridLayout(transfer)
-        self.storage_combo = QComboBox()
-        self.storage_combo.addItems(["/flash", "/sd"])
-        # 默认改为 SD 卡：/flash 是片内 Flash，每写一个 512B 扇区都要把整个 2KB 页
-        # 读-擦-重编一遍（约 50~100ms，且全程关中断），无线实测仅 ~48 B/s；
-        # SD 卡写入无需擦除，快几个数量级。
-        # 注意：必须在下方 storage_combo 信号 connect 之前设置，否则会触发
-        # update_remote_path_root 把路径重新改回根目录下。
-        self.storage_combo.setCurrentText("/sd")
-        self.remote_path_edit = QLineEdit("/sd/pcb_solder_paste.gcode")
-        self.upload_button = QPushButton("传到设备")
-        self.execute_button = QPushButton("执行")
-        self.transfer_progress = QLabel("0%")
-        self.transfer_progress.setObjectName("statValue")
-        transfer_grid.addWidget(QLabel("存储"), 0, 0)
-        transfer_grid.addWidget(self.storage_combo, 0, 1)
-        transfer_grid.addWidget(QLabel("路径"), 0, 2)
-        transfer_grid.addWidget(self.remote_path_edit, 0, 3, 1, 3)
-        transfer_grid.addWidget(self.upload_button, 0, 6)
-        transfer_grid.addWidget(self.execute_button, 0, 7)
-        transfer_grid.addWidget(QLabel("进度"), 1, 0)
-        transfer_grid.addWidget(self.transfer_progress, 1, 1, 1, 7)
-
+        # 执行控制（进度条/暂停恢复/停止）已移到中央预览下方，右栏不再单列“执行”组。
         self.connection_log = QPlainTextEdit()
         self.connection_log.setReadOnly(True)
         self.connection_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -1255,12 +1470,18 @@ class MainWindow(QMainWindow):
         self.connection_log.setVisible(False)
 
         layout.addWidget(connection)
-        layout.addWidget(transfer)
         layout.addWidget(self.connection_log)
+        self._manual_console = self._build_manual_console()
+        layout.addWidget(self._manual_console)
         layout.addStretch(1)
-        page_layout.addWidget(left_panel, 1)
-        page_layout.addWidget(self._build_manual_console())
-        return page
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        scroll.setMinimumWidth(340)
+        self._right_scroll = scroll
+        return scroll
 
     def _build_manual_console(self) -> QWidget:
         panel = QGroupBox("手动操作台")
@@ -1375,8 +1596,8 @@ class MainWindow(QMainWindow):
         self.import_action.triggered.connect(self.choose_workbook)
         self.import_gerber_action.triggered.connect(self.choose_gerber)
         self.export_action.triggered.connect(self.export_gcode)
-        self.start_action.triggered.connect(self.show_start_page)
-        self.settings_action.triggered.connect(self.show_wireless_settings)
+        self.start_action.triggered.connect(self.start_job)
+        self.settings_action.triggered.connect(self.open_settings_dialog)
         self.terminal_action.triggered.connect(self.show_bridge_terminal)
         self.sheet_combo.currentIndexChanged.connect(self.sheet_changed)
         for widget in [self.mode_combo, self.source_combo, self.origin_combo, self.order_combo, self.layer_combo]:
@@ -1393,14 +1614,13 @@ class MainWindow(QMainWindow):
         self.select_button.clicked.connect(lambda: self.select_visible(True))
         self.clear_button.clicked.connect(lambda: self.select_visible(False))
         self.copy_button.clicked.connect(self.copy_gcode)
-        self.go_start_button.clicked.connect(self.show_start_page)
         self.first_setup_button.clicked.connect(self.start_first_setup)
         self.conn_mode_combo.currentIndexChanged.connect(self.on_conn_mode_changed)
         self.serial_refresh_button.clicked.connect(self.refresh_serial_ports)
         self.serial_connect_button.clicked.connect(self.toggle_serial_connection)
         self.storage_combo.currentTextChanged.connect(self.update_remote_path_root)
-        self.upload_button.clicked.connect(self.upload_gcode_to_device)
-        self.execute_button.clicked.connect(self.execute_remote_gcode)
+        self.estop_button.clicked.connect(self.emergency_stop)
+        self.pause_resume_button.clicked.connect(self.toggle_pause_resume)
         self.x_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("X", -1.0))
         self.x_plus_button.clicked.connect(lambda _checked=False: self.jog_axis("X", 1.0))
         self.y_minus_button.clicked.connect(lambda _checked=False: self.jog_axis("Y", -1.0))
@@ -1692,6 +1912,7 @@ class MainWindow(QMainWindow):
         segments = self.pad_dispense_segments(pads) if gerber_mode else []
         self.preview.set_geometry(points, pads, segments)
         self._update_board_size(points, pads)
+        self._check_plane_bounds(points, pads)
         gcode = self.generate_gcode()
         self.gcode_preview.setPlainText(gcode)
         distance, seconds = self.path_stats(points, segments)
@@ -1711,6 +1932,28 @@ class MainWindow(QMainWindow):
             self.board_size_label.setText(f"{max(xs) - min(xs):.2f} x {max(ys) - min(ys):.2f} mm")
         else:
             self.board_size_label.setText("--")
+
+    def _on_board_dropped(self, dx_mm: float, dy_mm: float) -> None:
+        """画布拖拽板子释放：把位移增量叠加到 X/Y 偏移后刷新（blockSignals 防重复触发）。"""
+        for spin, delta in ((self.offset_x, dx_mm), (self.offset_y, dy_mm)):
+            spin.blockSignals(True)
+            spin.setValue(round(min(max(0.0, spin.value() + delta), spin.maximum()), 3))
+            spin.blockSignals(False)
+        self.refresh()
+
+    def _check_plane_bounds(self, points: list[PointData], pads: list[GerberPad]) -> None:
+        """板子超出 220×220 平面边界时状态栏告警（画布已把超界边框标红）。"""
+        xs = [p.x for p in points]
+        ys = [p.y for p in points]
+        for pad in pads:
+            xs.extend(x for x, _ in pad.vertices)
+            ys.extend(y for _, y in pad.vertices)
+        if not xs:
+            return
+        if (min(xs) < -0.01 or min(ys) < -0.01
+                or max(xs) > PLANE_MM + 0.01 or max(ys) > PLANE_MM + 0.01):
+            self.statusBar().showMessage(
+                f"警告：板子超出 {PLANE_MM:.0f}×{PLANE_MM:.0f}mm 平面，请调整 X/Y 偏移", 5000)
 
     def refresh_table(self, *_args) -> None:
         gerber_mode = self.mode_combo.currentIndex() == 1
@@ -1792,7 +2035,8 @@ class MainWindow(QMainWindow):
                 lines.append(f"G1 E{gcode_number(self.extrude.value())} F{gcode_number(self.e_feed.value())}")
             if self.retract.value() > 0:
                 lines.append(f"G1 E-{gcode_number(self.retract.value())} F{gcode_number(self.e_feed.value())}")
-            lines.extend(["G90", f"G0 Z{gcode_number(self.safe_z.value())} F{gcode_number(self.z_feed.value())}"])
+            lines.extend(["G90", f"G0 Z{gcode_number(self.safe_z.value())} F{gcode_number(self.z_feed.value())}",
+                          f";@SEG {index}"])
         lines.extend(["M84", "; End"])
         return "\n".join(lines) + "\n"
 
@@ -1827,6 +2071,7 @@ class MainWindow(QMainWindow):
                                   f"G1 E-{gcode_number(self.retract.value())} F{gcode_number(self.e_feed.value())}",
                                   "G90"])
             lines.append(f"G0 Z{gcode_number(self.safe_z.value())} F{gcode_number(self.z_feed.value())}")
+            lines.append(f";@SEG {index}")
         lines.extend(["M84", "; End"])
         return "\n".join(lines) + "\n"
 
@@ -1954,10 +2199,123 @@ class MainWindow(QMainWindow):
             return bool(self.current_gerber and self.selected_pad_ids and self.gcode_preview.toPlainText().strip())
         return bool(self.current_file and self.selected_ids and self.gcode_preview.toPlainText().strip())
 
+    def _build_settings_dialog(self) -> None:
+        """右上角“设置”对话框：传输存储/路径、无线设置、命令行入口、显示选项。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("设置")
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+
+        transfer_group = QGroupBox("G-code 传输")
+        form = QFormLayout(transfer_group)
+        self.storage_combo = QComboBox()
+        self.storage_combo.addItems(["/flash", "/sd"])
+        # 默认 SD 卡：/flash 写扇区需整页读-擦-重编且关中断，无线实测仅 ~48 B/s。
+        self.storage_combo.setCurrentText("/sd")
+        self.remote_path_edit = QLineEdit("/sd/pcb_solder_paste.gcode")
+        form.addRow("存储", self.storage_combo)
+        form.addRow("远程路径", self.remote_path_edit)
+        layout.addWidget(transfer_group)
+
+        display_group = QGroupBox("显示")
+        display = QFormLayout(display_group)
+        self.show_trajectory_check = QCheckBox("显示轨迹线（规划路径）")
+        self.show_trajectory_check.setChecked(False)
+        self.highlight_color_button = QPushButton("选择高亮色")
+        self._set_highlight_button_color(self.preview.highlight_color)
+        display.addRow(self.show_trajectory_check)
+        display.addRow("已完成焊盘高亮色", self.highlight_color_button)
+        layout.addWidget(display_group)
+
+        tools_group = QGroupBox("工具")
+        tools = QVBoxLayout(tools_group)
+        self.wireless_settings_button = QPushButton("无线设置…")
+        self.terminal_button = QPushButton("打开命令行…")
+        tools.addWidget(self.wireless_settings_button)
+        tools.addWidget(self.terminal_button)
+        layout.addWidget(tools_group)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        self.settings_dialog = dialog
+        self.show_trajectory_check.toggled.connect(self._on_trajectory_toggled)
+        self.highlight_color_button.clicked.connect(self._choose_highlight_color)
+        self.wireless_settings_button.clicked.connect(self.show_wireless_settings)
+        self.terminal_button.clicked.connect(self.show_bridge_terminal)
+
+    def _set_highlight_button_color(self, color: QColor) -> None:
+        self.highlight_color_button.setStyleSheet(
+            f"background-color: {color.name()}; color: #ffffff;")
+
+    def _on_trajectory_toggled(self, on: bool) -> None:
+        self.preview.show_trajectory = bool(on)
+        self.preview.update()
+
+    def _choose_highlight_color(self) -> None:
+        color = QColorDialog.getColor(self.preview.highlight_color, self, "已完成焊盘高亮色")
+        if color.isValid():
+            self.preview.highlight_color = color
+            self._set_highlight_button_color(color)
+            self.preview.update()
+
+    def open_settings_dialog(self) -> None:
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def start_job(self) -> None:
+        """开始：集成“传输 + 执行”。弹窗显示传输进度，传输完毕自动进入执行。"""
+        if not self.has_prepared_job():
+            QMessageBox.information(self, "还不能开始", "请先导入并选择需要铺膏的对象 / 焊盘。")
+            self.update_start_enabled()
+            return
+        if not self.bridge_socket:
+            QMessageBox.information(self, "未连接", self._conn_hint())
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("传输中")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        box = QVBoxLayout(dialog)
+        label = QLabel("正在传输 G-code 到设备…")
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        box.addWidget(label)
+        box.addWidget(bar)
+        self._transfer_dialog = (dialog, label, bar)
+        dialog.show()
+        QApplication.processEvents()
+        ok = self.upload_gcode_to_device()
+        dialog.close()
+        self._transfer_dialog = None
+        if not ok:
+            return
+        self.execute_remote_gcode()
+
+    def _set_executing(self, on: bool) -> None:
+        """执行态：显示预览下方执行控制条，灰化各控制区，仅保留缩放/暂停/停止。"""
+        self.preview.allow_drag = not on
+        self.exec_bar.setVisible(on)
+        for widget in (self._left_scroll, self.bottom_tabs,
+                       self._conn_group, self._manual_console):
+            widget.setEnabled(not on)
+        connected = self.bridge_socket is not None
+        self.estop_button.setEnabled(on and connected)
+        self.pause_resume_button.setEnabled(on and connected)
+        # 工具栏“开始”执行期间变为“执行中…”状态并禁用；结束后恢复。
+        self.start_action.setText("执行中…" if on else "开始")
+        self._paused = False
+        if on:
+            self.start_action.setEnabled(False)
+            self.pause_resume_button.setText("暂停")
+            self.exec_progress_bar.setValue(0)
+        else:
+            self.update_start_enabled()
+
     def update_start_enabled(self) -> None:
         enabled = self.has_prepared_job()
         self.start_action.setEnabled(enabled)
-        self.go_start_button.setEnabled(enabled)
         self.update_device_actions()
 
     def set_device_state(self, state: str, detail: str = "") -> None:
@@ -1977,22 +2335,14 @@ class MainWindow(QMainWindow):
 
     def update_device_actions(self) -> None:
         online = self.bridge_socket is not None
-        prepared = self.has_prepared_job() if hasattr(self, "gcode_preview") else False
         busy = getattr(self, "_transfer_busy", False)
-        if hasattr(self, "upload_button"):
-            self.upload_button.setEnabled(online and prepared and not busy)
-            self.execute_button.setEnabled(online and prepared and not busy)
+        executing = getattr(self, "_executing", False)
+        if hasattr(self, "estop_button"):
+            self.estop_button.setEnabled(online and executing)
+        if hasattr(self, "pause_resume_button"):
+            self.pause_resume_button.setEnabled(online and executing)
         for button in getattr(self, "manual_buttons", []):
             button.setEnabled(online and not busy)
-
-    def show_start_page(self) -> None:
-        if not self.has_prepared_job():
-            QMessageBox.information(self, "还不能开始", "请先导入 Gerber 并选择需要铺膏的焊盘。")
-            self.update_start_enabled()
-            return
-        self.pages.setCurrentWidget(self.start_page)
-        self.statusBar().showMessage("设备会自动连接，在线后即可传输或手动操作", 2500)
-        self.poll_device_status()
 
     def update_remote_path_root(self, root: str) -> None:
         current = self.remote_path_edit.text().strip()
@@ -2229,10 +2579,15 @@ class MainWindow(QMainWindow):
         if self.bridge_socket:
             alive = False
             try:
-                self.bridge_socket.sendall(b"@BPC PING\r\n")
-                response = self.read_bridge_response(0.6)
-                if "@BPC PONG" in response or "@BPC OK" in response:
-                    alive = True
+                # 心跳给两次机会：模块可能正忙于转发下位机数据（gcode 输出/回显），
+                # PONG 迟到很常见，单次 0.6s 收不到就判掉线会造成"连上又断"的抖动。
+                for attempt in range(2):
+                    self.bridge_socket.sendall(b"@BPC PING\r\n")
+                    response = self.read_bridge_response(0.6 if attempt == 0 else 1.2)
+                    if "@BPC PONG" in response or "@BPC OK" in response:
+                        alive = True
+                        break
+                if alive:
                     # 先捕获本地引用：query_bridge_info() 耗时约 0.8s，期间
                     # self.connected_device 可能被其他线程置 None（掉线/重连），
                     # 直接把 self.connected_device 传下去会在 mark_connected 里崩。
@@ -3270,9 +3625,12 @@ class MainWindow(QMainWindow):
                 widget.setVisible(serial_mode)
         if hasattr(self, "first_setup_button"):
             self.first_setup_button.setVisible(not serial_mode)
-        # 无线设置（配网/OTA）只对无线模式有意义
+        # “设置”入口在无线/串口两种模式下都可用（含传输路径/显示/命令行）；
+        # 仅无线设置子项对无线模式有意义，串口模式下禁用该子项。
         if hasattr(self, "settings_action"):
-            self.settings_action.setEnabled(not serial_mode)
+            self.settings_action.setEnabled(True)
+        if hasattr(self, "wireless_settings_button"):
+            self.wireless_settings_button.setEnabled(not serial_mode)
 
     def _disconnect_current_transport(self) -> None:
         """关闭当前传输（无论串口还是无线 socket），不弹提示。"""
@@ -3453,7 +3811,26 @@ class MainWindow(QMainWindow):
         except (OSError, AttributeError):
             pass
 
-    def read_bridge_response(self, timeout_s: float = 2.0) -> str:
+    def read_bridge_response(self, timeout_s: float = 2.0,
+                             stop_on_control: bool = True,
+                             echo: str = "") -> str:
+        """读一条响应。
+
+        stop_on_control=True（默认）：收到模块的 @BPC PONG/OK 控制应答即返回，
+          用于握手/心跳这类"模块直接回控制行、没有 shell 提示符"的场景。
+        stop_on_control=False：只认 shell 提示符 "banux$ " 与 "Error:" 结束，
+          用于 shell 命令。必须如此，否则模块迟到的 @BPC PONG（例如终端保活
+          定时器发的 PING 的应答）会插在 "OK block N 288" 之前，导致本函数提前
+          返回、块校验失败、传输被当成掉线中断（进度条卡住 + 反复重连）。
+        echo：本次命令的回显锚点（固件逐字节回显整条命令）。传入后只认 echo 之后出现
+          的提示符才结束，忽略 echo 之前那个迟到残留的提示符——无线提速后节奏紧凑，
+          上一条命令的结束提示符常因 WiFi 延迟滞留到本次响应开头，若据此提前返回就会
+          漏掉本次 OK block、误判失败并连锁错位（响应以 “banux$ recv -b …” 开头、
+          卡在某个百分比）。必须传“完整命令”而非前缀：recv -b 各块前缀相同（路径一致、
+          offset 落在后面），前缀锚点会命中上一条迟到残留的回显、误读旧 OK block 使
+          offset 对不上而反复重试错位；完整命令含 offset+base64 全局唯一。留空则维持
+          “见提示符即返回”的旧行为（握手/心跳等无回显场景）。
+        """
         sock = self.bridge_socket
         if sock is None:
             return ""
@@ -3479,10 +3856,41 @@ class MainWindow(QMainWindow):
             # 不再用 "OK block"/"OK clear" 子串提前返回——那会在 "OK block <offset> <len>"
             # 尚未收全时就返回，既让 offset 校验失败，又把 "\r\nbanux$ " 残留在缓冲里，
             # 导致下一条命令读到上一帧的尾巴（错位，如串口侧只收到 "$ \r\nbanux$"）。
-            if ("banux$ " in text
-                    or "@BPC PONG" in text or "@BPC OK" in text or "Error:" in text):
+            if "Error:" in text:
                 return text.strip()
+            if stop_on_control and ("@BPC PONG" in text or "@BPC OK" in text):
+                return text.strip()
+            if "banux$ " in text:
+                # 无 echo 锚点：见提示符即返回（握手/心跳/空行冲刷等场景）。
+                if not echo:
+                    return text.strip()
+                # 有 echo 锚点：只认本次命令回显(echo)之后的提示符，跳过上一条
+                # 迟到残留在开头的提示符，避免无线提速后响应错位、连锁失败。
+                ai = text.find(echo)
+                if ai >= 0 and "banux$ " in text[ai + len(echo):]:
+                    return text.strip()
         return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+    def _write_command_line(self, sock: Any, data: bytes) -> None:
+        """写出一条命令行：分片限速，避免撑爆下位机 Shell 输入缓冲。
+
+        分片只改变到达节奏、不改变字节内容与顺序（TCP 是字节流），对两种模式都安全。
+        串口直连：下位机自己收，按 96 字节/片限速；
+        无线：固件已加背压（有效输入深度 5120），整条命令一次发出即可，切片放大到
+        512（>= 最长命令 500）不再分片阻塞 UI；仅未来超长数据才按 3ms 间隔分片。
+        """
+        if getattr(sock, "is_serial", False):
+            slice_size, gap = SERIAL_WRITE_SLICE, SERIAL_WRITE_GAP_S
+        else:
+            slice_size, gap = BRIDGE_WRITE_SLICE, BRIDGE_WRITE_GAP_S
+        if len(data) <= slice_size:
+            sock.sendall(data)
+            return
+        total = len(data)
+        for start in range(0, total, slice_size):
+            sock.sendall(data[start:start + slice_size])
+            if start + slice_size < total:      # 最后一片后面不用再等
+                time.sleep(gap)
 
     def send_bridge_command(self, command: str, timeout_s: float = 2.5) -> str:
         sock = self.bridge_socket
@@ -3496,8 +3904,18 @@ class MainWindow(QMainWindow):
         # 下第二个提示符迟到，_drain_input 清了个空、它随后才到，滞留在缓冲里被下一条
         # 命令的 read 误当响应（正是 "块 0 未确认写入，响应 'banux$'"）。单个 "\n" 让
         # 每条命令只回一个提示符，从源头消除残留。@BPC 控制行走 ESP 协议不经此函数。
-        sock.sendall(command.encode("ascii") + b"\n")
-        response = self.read_bridge_response(timeout_s)
+        self._write_command_line(sock, command.encode("ascii") + b"\n")
+        # shell 命令只认提示符结束：不能让迟到的 @BPC PONG 提前截断响应。
+        # echo 锚点必须取“整条命令”（固件 bg_shell.c Shell_ProcessChar 逐字节回显）。
+        # 早先用 command[:16] 前缀是错的：所有 recv -b 块前 16 字符都是 “recv -b /sd/xxx”
+        # （路径相同、offset 落在第 34 字符后被截掉），锚点对每块都一样，无法区分“上一条
+        # 因 WiFi 延迟几秒而整条滞留下来的响应”与“本次回显”——find 命中残留、误读上一条
+        # 的 OK block（offset 对不上）→ 判失败 → 重试 → 每块都错位 → 越传越慢（停几秒才
+        # 涨几个百分点），收尾 recv -e 也被错位干扰（f_close 未干净执行，传完设备端 ls
+        # 竟看不到文件、gcode -f 报 -5，但把卡插电脑能看到——数据其实已 f_sync 落盘）。
+        # 完整命令含 offset+base64、全局唯一，find 精确锚定本次回显，从根上消除错位。
+        response = self.read_bridge_response(
+            timeout_s, stop_on_control=False, echo=command)
         if response:
             self.log_connection(response)
         # "invalid" 用于捕获模块的 "recv: invalid base64" / "recv: invalid offset"，
@@ -3506,6 +3924,62 @@ class MainWindow(QMainWindow):
                 or "invalid" in response.lower()):
             raise OSError(response or "命令执行失败")
         return response
+
+    # 单块最多尝试次数。老固件 Shell 输入缓冲只有 256 字节，421 字节的 recv -b 行
+    # 会概率性丢掉尾部（含换行），表现为"随机某块无响应"。重发即可恢复，给几次机会
+    # 比整次传输直接失败划算；烧了带背压修复（有效输入深度 5120）的新固件后，正常
+    # 链路下基本走不到第二次，重试主要兜底 WiFi 抖动导致的偶发丢包/响应迟到。
+    BLOCK_MAX_ATTEMPTS = 4
+    # 单块响应超时。正常一块 ~100ms（含回显），只有 f_sync/慢卡才会到几百 ms。
+    # 串口直连链路稳定，3s 足够让失败块快进重试；无线经 WiFi + ESP 透传，偶发的
+    # WiFi 抖动/重传会把响应拖到数秒，故无线用更宽的 6s，避免“其实写成功了、只是
+    # OK 迟到”被误判超时 → 重发 → 与迟到响应串扰的级联失败。
+    BLOCK_TIMEOUT_S = 3.0
+    BLOCK_TIMEOUT_WIRELESS_S = 6.0
+
+    def _flush_partial_line(self) -> None:
+        """把下位机 Shell 里可能残留的半行作废。
+
+        丢换行时命令并没有执行，只是静静躺在 g_CmdLine 里等换行；此时直接重发，
+        新命令会拼接在半行后面变成乱码。单独发一个 '\n' 让那半行先执行（打一条
+        invalid base64 / unknown module 后回到提示符），再重发就是干净的一行。
+        """
+        sock = self.bridge_socket
+        if not sock:
+            return
+        try:
+            self._write_command_line(sock, b"\n")
+            self.read_bridge_response(1.0, stop_on_control=False)
+        except OSError:
+            pass
+
+    def _write_block_with_retry(self, path: str, offset: int, encoded: str) -> str:
+        """写一个 recv -b 块，未确认则冲刷半行后重试；返回最后一次响应。"""
+        last = ""
+        # 无线链路给更宽的响应超时（见 BLOCK_TIMEOUT_WIRELESS_S 注释）。
+        timeout_s = (self.BLOCK_TIMEOUT_S
+                     if getattr(self.bridge_socket, "is_serial", False)
+                     else self.BLOCK_TIMEOUT_WIRELESS_S)
+        for attempt in range(self.BLOCK_MAX_ATTEMPTS):
+            last = self.send_bridge_command(
+                f"recv -b {path} {offset} {encoded}", timeout_s)
+            # 逐块确认：模块必须回 "OK block <offset> <len>"。
+            # 注意末尾带空格：不带空格会误把 "OK block 48 ..." 当成 offset=4 的成功响应
+            if f"OK block {offset} " in last:
+                return last
+            if attempt + 1 < self.BLOCK_MAX_ATTEMPTS:
+                self.log_connection(
+                    f"块 {offset} 未确认，冲刷半行后重试"
+                    f"（{attempt + 1}/{self.BLOCK_MAX_ATTEMPTS - 1}）")
+                self._flush_partial_line()
+        hint = ""
+        if last.lstrip().startswith("recv -b"):
+            hint = ("\n\n响应只有命令回显：下位机多半没收到行尾换行"
+                    "（Shell 输入缓冲被灌满丢字节，见 app_bl.c 的 "
+                    "APP_BL_SHELL_RB_SIZE），命令行根本没被执行。")
+        raise OSError(
+            f"块 {offset} 未确认写入（已重试 {self.BLOCK_MAX_ATTEMPTS} 次，"
+            f"最后响应 {len(last)} 字节：{last.strip()[:160]!r}）{hint}")
 
     def _transfer_ready(self) -> bool:
         if self.mode_combo.currentIndex() == 1 and not self.selected_pad_ids:
@@ -3519,13 +3993,13 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def upload_gcode_to_device(self) -> None:
+    def upload_gcode_to_device(self) -> bool:
         if not self._transfer_ready():
-            return
+            return False
         path = self.remote_path_edit.text().strip()
         if not path.startswith(("/flash/", "/sd/")) or " " in path:
             QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
-            return
+            return False
         payload = self.generate_gcode().encode("ascii")
         # 模块命令行缓冲为 512 字节（SHELL_CMD_MAX_LEN），超长会被静默截断导致
         # base64 残缺，这里提前算一次最长行并拦截。留 12 字节余量。
@@ -3536,7 +4010,7 @@ class MainWindow(QMainWindow):
                 self, "路径过长",
                 f"按此路径生成的命令行约 {longest_cmd} 字节，接近模块 512 字节上限。\n"
                 "请改用更短的文件名或更浅的目录。")
-            return
+            return False
         self._transfer_busy = True
         self.update_device_actions()
         try:
@@ -3551,23 +4025,21 @@ class MainWindow(QMainWindow):
             for offset in range(0, len(payload), UPLOAD_CHUNK_SIZE):
                 chunk = payload[offset:offset + UPLOAD_CHUNK_SIZE]
                 encoded = base64.b64encode(chunk).decode("ascii")
-                response = self.send_bridge_command(
-                    f"recv -b {path} {offset} {encoded}", 5.0)
-                # 逐块确认：模块必须回 "OK block <offset>"，否则视为丢块/写失败。
-                # 之前只看有没有 "Error:"/"failed"，导致 invalid base64 这类
-                # 错误被忽略，最后照样提示传输成功但文件是坏的。
-                # 注意末尾带空格：模块回的是 "OK block <offset> <len>"，
-                # 不带空格会误把 "OK block 48 ..." 当成 offset=4 的成功响应
-                if f"OK block {offset} " not in response:
-                    raise OSError(
-                        f"块 {offset} 未确认写入（响应：{response.strip()!r}）")
+                # 自动重试：老固件（Shell 输入缓冲 256 字节）会概率性丢掉行尾换行，
+                # 整块作废。重试前先冲刷下位机残留的半行，否则新命令会接在半行后面
+                # 变成乱码，永远对不上。
+                response = self._write_block_with_retry(path, offset, encoded)
                 percent = int(((offset + len(chunk)) * 100) / max(1, len(payload)))
                 self.transfer_progress.setText(f"{percent}%  {offset + len(chunk)} / {len(payload)} bytes")
+                if self._transfer_dialog:
+                    self._transfer_dialog[2].setValue(percent)
+                    self._transfer_dialog[1].setText(
+                        f"正在传输 G-code 到设备… {offset + len(chunk)} / {len(payload)} bytes")
                 QApplication.processEvents()
         except OSError as exc:
             self.mark_offline("设备连接中断")
             QMessageBox.warning(self, "传输失败", str(exc))
-            return
+            return False
         finally:
             # 收尾：关闭模块侧接收会话。失败也要发，避免模块句柄悬挂。
             try:
@@ -3577,24 +4049,169 @@ class MainWindow(QMainWindow):
             self._transfer_busy = False
             self.update_device_actions()
         self.statusBar().showMessage(f"已传输到 {path}", 3500)
+        return True
 
     def execute_remote_gcode(self) -> None:
+        """执行设备上的 gcode 文件：先回零到平面左下角 (0,0)，再发 'gcode -f <path> -p'
+        流式接收固件每段回报的 @PG 进度，在预览画布演示当前喷头位置与已走路径。
+        设备端执行是阻塞过程，不能用 send_bridge_command（读到 banux$ 即返回），改为
+        直接对 bridge_socket 流式收发；期间可点“停止”发 '!'、“暂停/恢复”发 '%'/'~'，
+        固件在段边界轮询到后中止/暂停/继续。"""
         if not self.bridge_socket:
             QMessageBox.information(self, "未连接", self._conn_hint())
             return
         path = self.remote_path_edit.text().strip()
+        if not path.startswith(("/flash/", "/sd/")) or " " in path:
+            QMessageBox.warning(self, "路径无效", "路径必须是 /flash/... 或 /sd/...，且不能包含空格。")
+            return
+        total = self.gcode_preview.toPlainText().count(";@SEG")
+        sock = self.bridge_socket
         self._transfer_busy = True
+        self._executing = True
         self.update_device_actions()
+        self._set_executing(True)
+        self.preview.clear_execution()
         try:
-            self.send_bridge_command(f"gcode -f {path}", 4.0)
+            self.transfer_progress.setText("回零中…")
+            self.send_bridge_command("echo /driver/gpio/stepper_x/enable 1", 2.0)
+            for ax in ("x", "y", "z"):
+                self.transfer_progress.setText(f"回零 {ax.upper()} 轴…")
+                QApplication.processEvents()
+                resp = self.send_bridge_command(f"home {ax}", 20.0)
+                if "ok" not in resp:
+                    raise OSError(resp.strip() or f"home {ax} 无响应")
+            self.transfer_progress.setText("执行中…")
+            self._drain_input(sock)
+            self.log_connection(f"> gcode -f {path} -p")
+            sock.sendall(f"gcode -f {path} -p\n".encode("ascii"))
+            self._stream_execution(sock, total)
         except OSError as exc:
-            self.mark_offline("设备连接中断")
-            QMessageBox.warning(self, "执行失败", str(exc))
+            msg = str(exc)
+            if msg.startswith("执行中断"):
+                self.mark_offline("设备连接中断")
+            QMessageBox.warning(self, "执行失败", msg)
             return
         finally:
             self._transfer_busy = False
+            self._executing = False
             self.update_device_actions()
-        self.statusBar().showMessage(f"已发送执行命令：{path}", 3000)
+            self._set_executing(False)
+
+    def _stream_execution(self, sock: Any, total: int) -> None:
+        """流式读取执行输出：逐行解析 @PG 刷新画布，遇完成/中止/错误结束。
+        无进度看门狗 30s、总时长上限 20min，防设备卡死或断连时 UI 永久阻塞。"""
+        buf = ""
+        watchdog = time.monotonic() + 30.0
+        deadline = time.monotonic() + 20 * 60
+        completed = False
+        aborted = False
+        try:
+            sock.settimeout(0.5)
+        except OSError:
+            pass
+        while True:
+            if self._paused:
+                # 暂停期间设备停在段边界不回报进度，顺延看门狗与总上限，避免误判超时。
+                watchdog = time.monotonic() + 30.0
+                deadline = time.monotonic() + 20 * 60
+            if time.monotonic() > deadline:
+                raise OSError("执行超时（超过 20 分钟总上限）")
+            try:
+                data = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                data = b""
+            except OSError as exc:
+                raise OSError(f"执行中断：{exc}") from exc
+            if data:
+                watchdog = time.monotonic() + 30.0
+                buf += data.decode("utf-8", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("@PG "):
+                        self._handle_progress_line(line, total)
+                    elif "gcode: paused" in line:
+                        self._paused = True
+                        self.pause_resume_button.setText("恢复")
+                        self.transfer_progress.setText("已暂停（停在段边界，喷嘴在安全 Z）")
+                    elif "gcode: resumed" in line:
+                        self._paused = False
+                        self.pause_resume_button.setText("暂停")
+                        self.transfer_progress.setText("执行中…")
+                    elif "gcode: file complete" in line:
+                        completed = True
+                    elif "gcode: aborted" in line:
+                        aborted = True
+                        completed = True
+                    elif "gcode: line" in line and "failed" in line:
+                        raise OSError(line)
+                    elif line.startswith("Error:"):
+                        raise OSError(line)
+                if completed:
+                    break
+            elif time.monotonic() > watchdog:
+                raise OSError("执行无响应（30 秒未收到进度）")
+            QApplication.processEvents()
+        if aborted:
+            self.transfer_progress.setText("已停止中止")
+            self.statusBar().showMessage("gcode 执行已停止中止", 4000)
+        else:
+            self.exec_progress_bar.setValue(100)
+            self.transfer_progress.setText("执行完成 100%")
+            self.statusBar().showMessage("gcode 执行完成", 4000)
+
+    def _handle_progress_line(self, line: str, total: int) -> None:
+        """解析 '@PG <segIdx> <x_milli> <y_milli> <z_milli>'：坐标 ÷1000 得平面 mm，
+        更新画布当前喷头位置、已走轨迹与进度文本。"""
+        parts = line.split()
+        if len(parts) < 4:
+            return
+        try:
+            idx = int(parts[1])
+            x = int(parts[2]) / 1000.0
+            y = int(parts[3]) / 1000.0
+        except ValueError:
+            return
+        eff_total = total if total > 0 else max(idx, 1)
+        self.preview.set_execution_state(x, y, idx, eff_total)
+        pct = min(100, int(idx * 100 / eff_total)) if eff_total else 0
+        self.exec_progress_bar.setValue(pct)
+        self.transfer_progress.setText(
+            f"执行 {idx}/{eff_total} 段  X{x:.1f} Y{y:.1f}  {pct}%")
+
+    def emergency_stop(self) -> None:
+        """停止：向设备发送 '!'，固件在段标记（或暂停轮询）处检测到后停脉冲、断使能并中止。
+        执行阻塞期间 shell 不处理命令，这里直接对 socket 写、不走 send_bridge_command。"""
+        sock = self.bridge_socket
+        if not sock or not getattr(self, "_executing", False):
+            return
+        try:
+            sock.sendall(b"!\r\n")
+            self.transfer_progress.setText("停止已发送，等待设备停止…")
+        except OSError:
+            pass
+
+    def toggle_pause_resume(self) -> None:
+        """暂停/恢复二合一：执行中按当前状态向设备发送 '%'(暂停) 或 '~'(恢复)。
+        固件在段边界轮询到后停在安全 Z（暂停）或继续执行（恢复）。"""
+        sock = self.bridge_socket
+        if not sock or not getattr(self, "_executing", False):
+            return
+        try:
+            if self._paused:
+                sock.sendall(b"~\r\n")
+                self._paused = False
+                self.pause_resume_button.setText("暂停")
+                self.transfer_progress.setText("恢复已发送，等待设备继续…")
+            else:
+                sock.sendall(b"%\r\n")
+                self._paused = True
+                self.pause_resume_button.setText("恢复")
+                self.transfer_progress.setText("暂停已发送，等待设备停在段边界…")
+        except OSError:
+            pass
 
     def send_manual_command(self, command: str, timeout_s: float = 2.5) -> bool:
         if not self.bridge_socket:
@@ -3948,6 +4565,10 @@ class MainWindow(QMainWindow):
         timer.timeout.connect(pump)
         # 终端打开时心跳被 _terminal_busy 挡掉（poll_device_status 提前返回），
         # 这里用独立的保活定时器继续发 @BPC PING，避免模块侧 TCP 空闲超时掉线。
+        # 注意：dialog 以主窗口为父对象、关闭后并不销毁，所以这个定时器必须在
+        # finally 里显式 stop()——否则终端关掉后它仍会每 2.5s 往这条连接发 PING，
+        # PONG 插进 shell 响应里，把传输/心跳全部搞乱（反复掉线、进度条卡住）。
+        ka_timer: QTimer | None = None
         if not is_serial:
             ka_timer = QTimer(dialog)
             ka_timer.setInterval(2500)
@@ -3975,6 +4596,9 @@ class MainWindow(QMainWindow):
             dialog.exec()
         finally:
             timer.stop()
+            if ka_timer is not None:
+                ka_timer.stop()
+                ka_timer.deleteLater()
             state["alive"] = False
             self._terminal_busy = False
             # 关闭后立刻刷新一次设备状态，不必等下一个 3 秒周期

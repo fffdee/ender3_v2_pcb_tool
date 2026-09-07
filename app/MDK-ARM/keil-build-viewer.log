@@ -38,10 +38,10 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 
 [region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00015C90 [memory type] 2 [memory ID] 3
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00016928 [memory type] 2 [memory ID] 3
 
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000DF10 [memory type] 1 [memory ID] 2
-		[ZI block] addr: 0x20000448, size: 0x0000DAC8 (56008)
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E560 [memory type] 1 [memory ID] 2
+		[ZI block] addr: 0x20000498, size: 0x0000E0C8 (57544)
 
 
 [object name max length] 28
@@ -65,6 +65,7 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 [object name] drv_device.o                  [path] ../Banux/02_system_components/driver_framework/core/drv_device.c
 [object name] drv_eeprom.o                  [path] ../Banux/01_driver/eeprom/drv_eeprom.c
 [object name] drv_fs.o                      [path] ../Banux/02_system_components/driver_framework/core/drv_fs.c
+[object name] drv_hc245.o                   [path] ../Banux/01_driver/hc245/drv_hc245.c
 [object name] drv_init.o                    [path] ../Banux/02_system_components/driver_framework/drv_init.c
 [object name] drv_sdio.o                    [path] ../Banux/01_driver/sd/drv_sdio.c
 [object name] drv_stepper.o                 [path] ../Banux/01_driver/stepper/drv_stepper.c
@@ -131,6 +132,7 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 [old name] drv_uart.c                    [type] 1   [path] ../Banux/01_driver/uart/drv_uart.c
 [old name] drv_eeprom.c                  [type] 1   [path] ../Banux/01_driver/eeprom/drv_eeprom.c
 [old name] drv_stepper.c                 [type] 1   [path] ../Banux/01_driver/stepper/drv_stepper.c
+[old name] drv_hc245.c                   [type] 1   [path] ../Banux/01_driver/hc245/drv_hc245.c
 [old name] event_component_manifest.c    [type] 1   [path] ../Banux/02_system_components/event/component_manifest.c
 [old name] bg_event.c                    [type] 1   [path] ../Banux/02_system_components/event/bg_event.c
 [old name] upgrade_component_manifest.c  [type] 1   [path] ../Banux/03_application_components/firmware_upgrade/component_manifest.c
@@ -168,31 +170,32 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 
 [record region info]
 [load region] LR_IROM1
-	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00015714 [type] 2 [ID] 3
-	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000DF10 [type] 1 [ID] 2
+	[execution region] ER_IROM1, 0x08008000, 0x00070000, 0x00016928 [type] 2 [ID] 3
+	[execution region] RW_IRAM1, 0x20000000, 0x00010000, 0x0000E560 [type] 1 [ID] 2
 ------------------------------------------------------------------------------------------------------------------------------------
                                    FILE(s)                                   |         RAM (byte)       |       FLASH (byte)       |
 ------------------------------------------------------------------------------------------------------------------------------------
-../Core/Src/app_bl.c():                                                      |         608              |        2031              |
+../Core/Src/app_bl.c():                                                      |        2152              |        2239              |
 ../Banux/00_core/Banux.c():                                                  |          16              |         316              |
 ../Banux/00_core/banux_component.c():                                        |         129              |         485              |
 ../Banux/00_core/banux_debug.c():                                            |           4              |          64              |
 ../Banux/02_system_components/file_io/banux_io.c():                          |           0              |         458              |
 ../Banux/00_core/banux_scheduler.c():                                        |           0              |          14              |
 ../Banux/02_system_components/event/bg_event.c():                            |         387              |        2231              |
-../Banux/02_system_components/command_line/bg_shell.c():                     |        3020              |        4358              |
+../Banux/02_system_components/command_line/bg_shell.c():                     |        3020              |        4414              |
 ../Banux/02_system_components/command_line/bg_shell_commands.c():            |        2636              |        9068              |
 ../Banux/02_system_components/fatfs/target/bsp_driver_sd.c():                |         512              |         410              |
 ../Banux/02_system_components/fatfs/src/option/ccsbcs.c():                   |           0              |        1308              |
 ../Banux/02_system_components/command_parser/command_parser.c():             |        1352              |        2013              |
 ../Banux/02_system_components/fatfs/src/diskio.c():                          |           0              |         160              |
-../Banux/01_driver/driver_init.c():                                          |           0              |         405              |
+../Banux/01_driver/driver_init.c():                                          |           0              |         473              |
 ../Banux/02_system_components/driver_framework/core/drv_device.c():          |         104              |        1911              |
-../Banux/01_driver/eeprom/drv_eeprom.c():                                    |          60              |        1953  [-12]       |
+../Banux/01_driver/eeprom/drv_eeprom.c():                                    |          60              |        1953              |
 ../Banux/02_system_components/driver_framework/core/drv_fs.c():              |          44              |         520              |
+../Banux/01_driver/hc245/drv_hc245.c():                                      |          68              |        1996              |
 ../Banux/02_system_components/driver_framework/drv_init.c():                 |           0              |         304              |
 ../Banux/01_driver/sd/drv_sdio.c():                                          |         616              |        1591              |
-../Banux/01_driver/stepper/drv_stepper.c():                                  |         512              |        4409  [+124]      |
+../Banux/01_driver/stepper/drv_stepper.c():                                  |         512              |        4845              |
 ../Banux/01_driver/timer/drv_timer1ms.c():                                   |          56              |         262              |
 ../Banux/01_driver/uart/drv_uart.c():                                        |         144              |         509              |
 ../Banux/02_system_components/event/component_manifest.c():                  |           0              |          78              |
@@ -200,12 +203,12 @@ Note: source file '../Banux/03_application_components/firmware_upgrade/component
 ../Banux/02_system_components/fatfs/src/ff.c():                              |         166              |        8628              |
 ../Banux/02_system_components/fatfs/src/ff_gen_drv.c():                      |          16              |          70              |
 ../Banux/01_driver/sd/fs_sd.c():                                             |        1820              |        3242              |
-../Banux/03_application_components/gcode/gcode.c():                          |          24              |        2639              |
+../Banux/03_application_components/gcode/gcode.c():                          |          28              |        3061              |
 ../Core/Src/gpio.c():                                                        |           0              |         128              |
 ../Banux/01_driver/internal_flash/internal_flash_diskio.c():                 |        2049              |         873              |
 ../Banux/02_system_components/internal_flash_fs/internal_flash_fs.c():       |           0              |         350              |
 ../Core/Src/main.c():                                                        |           0              |         430              |
-../Banux/03_application_components/motion_control/motion_control.c():        |           0              |        2706  [+1291]     |
+../Banux/03_application_components/motion_control/motion_control.c():        |           0              |        2778              |
 ../Banux/02_system_components/fatfs/src/drivers/sd_diskio.c():               |         524              |         792              |
 ../Core/Src/sdio.c():                                                        |         132              |         192              |
 ../Banux/02_system_components/command_line/shell_io_uart.c():                |           0              |         242              |
@@ -232,15 +235,15 @@ startup_stm32f103xe.s():                                                     |  
 [memory print mode]: 0
 LR_IROM1
         RAM 1             [0x20000000 | 0x00010000 (65536)]
-                [zi start] 1   [zi end] 43
-                RW_IRAM1  [0x20000000]|¡ö¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ_______| (  55.7 KB /  64.0 KB )  87.1%  
+                [zi start] 1   [zi end] 44
+                RW_IRAM1  [0x20000000]|¡ö¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ¡õ______| (  57.3 KB /  64.0 KB )  89.6%  
  
         FLASH 1           [0x08008000 | 0x00070000 (458752)]
-                ER_IROM1  [0x08008000]|¡ö¡ö¡ö¡ö¡ö¡ö¡ö¡ö¡ö_________________________________________| (  87.1 KB / 448.0 KB )  19.5%  [+1404]
+                ER_IROM1  [0x08008000]|¡ö¡ö¡ö¡ö¡ö¡ö¡ö¡ö¡ö¡ö________________________________________| (  90.2 KB / 448.0 KB )  20.2%  
  
 [htm file path] E:\project_and_dataset\project\ender3_v2_pcb_tool\app\MDK-ARM\ender3 v2\ender3 v2.htm
 Maximum Stack Usage =       1440 bytes + Unknown(Functions without stacksize, Cycles, Untraceable Function Pointers)
  
 =============================================================================================================================
 
-run time: 0.274 s
+run time: 0.311 s

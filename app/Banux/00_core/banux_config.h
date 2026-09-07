@@ -97,6 +97,9 @@ extern "C" {
  *     min 限位默认在负端，故默认 0；若某轴实测朝限位反方向走，把该值改成 1。
  *   行程 HOME_MAX_MM_*：回零最大搜索距离(mm)，应略大于该轴实际行程；走满仍
  *     未触发限位即报 -4（方向配反或限位故障），不会无限移动。
+ *   速度 HOME_FAST_MM_S_* / HOME_SLOW_MM_S_*：按轴独立(mm/s)。三轴曾共用一个
+ *     值→线速度相同，但 Z 电机转速是 X/Y 的 5 倍(400 vs 80 steps/mm)看着更快，
+ *     且丝杆 Z 本就该慢；故拆开按轴配，Z 显著慢于 X/Y，数值越大越快越易丢步。
  *=========================================================================*/
 #ifndef HOME_DIR_X
 #define HOME_DIR_X                  0
@@ -116,11 +119,23 @@ extern "C" {
 #ifndef HOME_MAX_MM_Z
 #define HOME_MAX_MM_Z               255.0
 #endif
-#ifndef HOME_FAST_MM_S
-#define HOME_FAST_MM_S              35.0    /* 快速逼近速度 mm/s */
+#ifndef HOME_FAST_MM_S_X
+#define HOME_FAST_MM_S_X            20.0    /* X 快速逼近速度 mm/s */
 #endif
-#ifndef HOME_SLOW_MM_S
-#define HOME_SLOW_MM_S              6.0     /* 二次逼近速度 mm/s */
+#ifndef HOME_FAST_MM_S_Y
+#define HOME_FAST_MM_S_Y            20.0    /* Y 快速逼近速度 mm/s */
+#endif
+#ifndef HOME_FAST_MM_S_Z
+#define HOME_FAST_MM_S_Z            8.0     /* Z 快速逼近速度 mm/s（丝杆轴，慢） */
+#endif
+#ifndef HOME_SLOW_MM_S_X
+#define HOME_SLOW_MM_S_X            5.0     /* X 二次逼近速度 mm/s */
+#endif
+#ifndef HOME_SLOW_MM_S_Y
+#define HOME_SLOW_MM_S_Y            5.0     /* Y 二次逼近速度 mm/s */
+#endif
+#ifndef HOME_SLOW_MM_S_Z
+#define HOME_SLOW_MM_S_Z            2.0     /* Z 二次逼近速度 mm/s（丝杆轴，慢） */
 #endif
 #ifndef HOME_BACKOFF_MM
 #define HOME_BACKOFF_MM             3.0     /* 触发限位后回退距离 mm */

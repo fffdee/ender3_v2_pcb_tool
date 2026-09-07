@@ -154,6 +154,12 @@ static const uint8_t s_homeDir[DRV_STEPPER_COUNT] = {
 static const double s_homeMaxMm[DRV_STEPPER_COUNT] = {
     HOME_MAX_MM_X, HOME_MAX_MM_Y, HOME_MAX_MM_Z, 0.0
 };
+static const double s_homeFastMm[DRV_STEPPER_COUNT] = {
+    HOME_FAST_MM_S_X, HOME_FAST_MM_S_Y, HOME_FAST_MM_S_Z, 0.0
+};
+static const double s_homeSlowMm[DRV_STEPPER_COUNT] = {
+    HOME_SLOW_MM_S_X, HOME_SLOW_MM_S_Y, HOME_SLOW_MM_S_Z, 0.0
+};
 
 /* 由 mm/s 与 stepsPerMm 换算单拍半周期(us)：speed(steps/s) = mm/s * stepsPerMm */
 static uint32_t home_pulse_us(double mmPerSec, int32_t stepsPerMm)
@@ -209,8 +215,8 @@ int MotionControl_Home(DrvStepperAxis_t axis)
     if (backoff < 1) backoff = 1;
     if (fastChunk < 1) fastChunk = 1;
     if (slowChunk < 1) slowChunk = 1;
-    fastUs = home_pulse_us(HOME_FAST_MM_S, spm);
-    slowUs = home_pulse_us(HOME_SLOW_MM_S, spm);
+    fastUs = home_pulse_us(s_homeFastMm[axis], spm);
+    slowUs = home_pulse_us(s_homeSlowMm[axis], spm);
 
     /* ① 起点已压住限位：慢速退到限位松开为止（最多 backoff*4） */
     guard = backoff * 4;

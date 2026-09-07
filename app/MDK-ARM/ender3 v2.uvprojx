@@ -524,6 +524,11 @@
               <FilePath>../Banux/01_driver/stepper/drv_stepper.c</FilePath>
             </File>
             <File>
+              <FileName>drv_hc245.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Banux/01_driver/hc245/drv_hc245.c</FilePath>
+            </File>
+            <File>
               <FileName>event_component_manifest.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Banux/02_system_components/event/component_manifest.c</FilePath>

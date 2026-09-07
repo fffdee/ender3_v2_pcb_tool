@@ -9,10 +9,21 @@
 #include "bg_event.h"
 #include "bg_shell.h"
 #include "drv_stepper.h"
+#include "app_bl.h"   /* app_bl_poll：阻塞执行期主动泵 UART 环形缓冲到 Shell 镜像 */
 
 #define GCODE_LINE_MAX       96u
 #define GCODE_DEFAULT_FEED   1200000L
 #define GCODE_GROUP_PATH     "/driver/gpio/stepper_group"
+#define GCODE_AMAX_STEPS_PER_S2 40000u  /* 联动加速度 steps/s^2（梯形加减速，先统一默认，实测后按轴调） */
+
+/* 执行期控制字符（上位机按钮发送）：阻塞期间 shell 不解析命令，只按原始字节识别。
+ * 三者均非 ENTER_BOOT 帧头(0xAA)、也非 "boot" 文本，不会误触发 app_bl 升级复位。 */
+#define GCODE_CTRL_STOP     ((uint8_t)'!')  /* 停止（中止执行、停脉冲、断使能） */
+#define GCODE_CTRL_PAUSE    ((uint8_t)'%')  /* 暂停（停在段边界，喷嘴已抬到安全 Z） */
+#define GCODE_CTRL_RESUME   ((uint8_t)'~')  /* 恢复 */
+#define GCODE_ACT_STOP      1
+#define GCODE_ACT_PAUSE     2
+#define GCODE_ACT_RESUME    4
 
 typedef struct {
     int codeType;
@@ -32,6 +43,36 @@ static const char *const s_axisPaths[DRV_STEPPER_COUNT] = {
     "/driver/gpio/stepper_x", "/driver/gpio/stepper_y",
     "/driver/gpio/stepper_z", "/driver/gpio/stepper_e"
 };
+static uint32_t s_segIdx = 0u;
+
+/* 泵入 UART 环形缓冲并读取原始字节，返回检测到的控制动作位（STOP/PAUSE/RESUME）。
+ * 关键：Gcode_ExecuteFile 是阻塞执行，期间主循环 Banux_Process 停摆、app_bl_poll 不再
+ * 被调用，上位机发来的控制字符会滞留在 usart.c 环形缓冲里；而 Shell_RecvRaw 读的是
+ * app_bl 的镜像缓冲（shell1/shell3），镜像只有在 app_bl_poll 搬运后才有数据 —— 这正是
+ * “急停不管用”的根因。故此处每个段标记都先主动 app_bl_poll 把字节搬进镜像再读。 */
+static int gcode_poll_control(void)
+{
+    uint8_t rbuf[16];
+    uint16_t got;
+    uint16_t i;
+    int action = 0;
+
+    app_bl_poll();
+    got = Shell_RecvRaw(rbuf, sizeof(rbuf));
+    for (i = 0u; i < got; i++) {
+        if (rbuf[i] == GCODE_CTRL_STOP)         action |= GCODE_ACT_STOP;
+        else if (rbuf[i] == GCODE_CTRL_PAUSE)   action |= GCODE_ACT_PAUSE;
+        else if (rbuf[i] == GCODE_CTRL_RESUME)  action |= GCODE_ACT_RESUME;
+    }
+    return action;
+}
+
+/* 停脉冲并断使能（停止/中止共用）。 */
+static void gcode_halt(void)
+{
+    (void)banux_ioctl(GCODE_GROUP_PATH, DRV_STEPPER_IOCTL_STOP, NULL);
+    s_state.motorsEnabled = 0u;
+}
 
 static int32_t div_round64(int64_t numerator, int32_t denominator)
 {
@@ -152,7 +193,6 @@ static int execute_move(const ParsedGcode_t *parsed)
     uint32_t maxSteps = 0u;
     uint32_t axis;
     uint64_t durationUs;
-    uint64_t pulseUs;
 
     memset(&command, 0, sizeof(command));
     if (parsed->hasFeed) {
@@ -175,12 +215,15 @@ static int execute_move(const ParsedGcode_t *parsed)
         if (delta > maxDistance) maxDistance = delta;
     }
     if (!maxSteps) return GCODE_OK;
+    /* 由 feed 与主轴位移估算主轴最大速度(steps/s)：durationUs = maxDistance*60e6/feed(milli)，
+     * vMax = maxSteps*1e6/durationUs。加速度用统一默认；驱动侧 stepper_move_group 据此做
+     * 梯形加减速多轴联动（不再受 5 秒时长上限约束，长移动不会被拒为 -5）。 */
     durationUs = ((uint64_t)(uint32_t)maxDistance * 60000000ULL) /
                  (uint32_t)s_state.feedMilliMmPerMin;
-    pulseUs = durationUs / (2u * maxSteps);
-    if (pulseUs < 2u) pulseUs = 2u;
-    if (pulseUs > 100000u) pulseUs = 100000u;
-    command.pulseUs = (uint32_t)pulseUs;
+    if (durationUs == 0u) durationUs = 1u;
+    command.vMaxStepsPerSec = (uint32_t)(((uint64_t)maxSteps * 1000000ULL) / durationUs);
+    command.aMaxStepsPerSec2 = GCODE_AMAX_STEPS_PER_S2;
+    command.pulseUs = 0u;
     if (banux_write(GCODE_GROUP_PATH, &command, sizeof(command)) < 0) {
         return GCODE_ERR_DRIVER;
     }
@@ -249,7 +292,7 @@ int Gcode_ExecuteLine(const char *line)
     return result;
 }
 
-int Gcode_ExecuteFile(const char *path)
+int Gcode_ExecuteFile(const char *path, int reportProgress)
 {
     char chunk[64];
     char line[GCODE_LINE_MAX];
@@ -260,6 +303,12 @@ int Gcode_ExecuteFile(const char *path)
     int i;
 
     if (!path) return GCODE_ERR_INVALID;
+    if (reportProgress) {
+        s_segIdx = 0u;
+        (void)refresh_position();
+        Shell_Printf("@PG 0 %ld %ld %ld\r\n", (long)s_state.positionMilliMm[0],
+                     (long)s_state.positionMilliMm[1], (long)s_state.positionMilliMm[2]);
+    }
     for (;;) {
         count = banux_read_at(path, chunk, sizeof(chunk), offset);
         if (count < 0) return GCODE_ERR_DRIVER;
@@ -278,6 +327,40 @@ int Gcode_ExecuteFile(const char *path)
                 if (lineLength) {
                     int result;
                     line[lineLength] = '\0';
+                    /* 段标记 ;@SEG：此处上一段运动已阻塞走完、位置已刷新，坐标为真实平面位置，
+                     * 且喷嘴已抬到安全 Z —— 是检测停止/暂停的最安全时机。先泵入并轮询控制字符，
+                     * 再回报进度（走 shell 输出行，串口直连与无线透传都通用）。 */
+                    if (reportProgress && strncmp(line, ";@SEG", 5) == 0) {
+                        int action = gcode_poll_control();
+                        if (action & GCODE_ACT_STOP) {
+                            gcode_halt();
+                            Shell_Print("gcode: aborted\r\n");
+                            return GCODE_ERR_ABORTED;
+                        }
+                        if (action & GCODE_ACT_PAUSE) {
+                            /* 暂停：保持电机使能以锁定位置，持续泵入轮询直到恢复('~')或停止('!')。
+                             * 期间不回报 @PG；上位机侧相应挂起无响应看门狗。 */
+                            Shell_Print("gcode: paused\r\n");
+                            for (;;) {
+                                int held = gcode_poll_control();
+                                if (held & GCODE_ACT_STOP) {
+                                    gcode_halt();
+                                    Shell_Print("gcode: aborted\r\n");
+                                    return GCODE_ERR_ABORTED;
+                                }
+                                if (held & GCODE_ACT_RESUME) {
+                                    Shell_Print("gcode: resumed\r\n");
+                                    break;
+                                }
+                                HAL_Delay(20);
+                            }
+                        }
+                        s_segIdx++;
+                        Shell_Printf("@PG %lu %ld %ld %ld\r\n", (unsigned long)s_segIdx,
+                                     (long)s_state.positionMilliMm[0],
+                                     (long)s_state.positionMilliMm[1],
+                                     (long)s_state.positionMilliMm[2]);
+                    }
                     result = Gcode_ExecuteLine(line);
                     if (result != GCODE_OK) {
                         Shell_Printf("gcode: line %lu failed (%d)\r\n",
@@ -357,8 +440,13 @@ static int shell_gcode_line(int argc, char *argv[])
 static int shell_gcode_file(int argc, char *argv[])
 {
     int result;
-    if (argc != 1) return GCODE_ERR_INVALID;
-    result = Gcode_ExecuteFile(argv[0]);
+    int reportProgress = 0;
+    int i;
+    if (argc < 1) return GCODE_ERR_INVALID;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0) reportProgress = 1;
+    }
+    result = Gcode_ExecuteFile(argv[0], reportProgress);
     if (result == GCODE_OK) Shell_Print("gcode: file complete\r\n");
     return result;
 }

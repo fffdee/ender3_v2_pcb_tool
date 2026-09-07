@@ -60,6 +60,13 @@ static char     g_SavedInput[SHELL_HISTORY_LEN]; /* 浏览历史时暂存当前�
 /* ESC序列状态机: 0=正常, 1=收到ESC, 2=收到ESC[ */
 static uint8_t  g_EscState = 0;
 
+/* Shell_Process() 每轮主循环从 IO 取的最大字节数。
+ * 由 64 提高到 256：下位机 2M 波特下上位机是"整条命令一口气发过来"的（recv -b
+ * 的行最长 512 字节），而消费一侧每字节还要阻塞回显，64 字节/轮意味着一条 421
+ * 字节的命令要 7 轮才能取完，输入镜像缓冲长时间处于高水位，极易在下一包到达时
+ * 溢出丢掉行尾。一次取 256 字节可让整条命令在一两轮内取空，水位快速回落。 */
+#define SHELL_IO_CHUNK  256u
+
 static const char *g_CatNames[MOD_CAT_MAX] = {
     "System", "Hardware", "Parameter", "Debug"
 };
@@ -215,7 +222,7 @@ void Shell_Process(void)
     }
     
     // Read data from IO interface
-    uint8_t buf[64];
+    uint8_t buf[SHELL_IO_CHUNK];
     uint16_t len = 0;
     uint16_t i;
     if(g_IO->available)

@@ -23,6 +23,7 @@ uint16_t app_bl_shell1_available(void); /* Shell 镜像缓冲（UART1）可读�
 uint16_t app_bl_shell1_pop(uint8_t *data, uint16_t maxLen); /* 从 Shell 镜像缓冲（UART1）取数据 */
 uint16_t app_bl_shell3_available(void); /* UART3 镜像缓冲可读字节数（/driver/uart/uart3 read 用） */
 uint16_t app_bl_shell3_pop(uint8_t *data, uint16_t maxLen); /* 从 UART3 镜像缓冲取数据 */
+uint32_t app_bl_shell_drops(uint8_t port); /* 镜像缓冲满而丢弃的字节数（port=1 或 3），非 0 即输入过速 */
 void app_log(const char *s); /* 调试打印（双 UART 输出） */
 void app_log_u32(const char *prefix, uint32_t value); /* 打印 prefix+0xXXXXXXXX */
 
